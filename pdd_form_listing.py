@@ -6,7 +6,7 @@ publish method: the common runner retains the final write gate.
 
 from __future__ import annotations
 
-from field_policies import without_color_attributes
+from field_policies import listing_date_text_value, positional_listing_date_value, without_color_attributes
 
 import asyncio
 import re
@@ -587,7 +587,19 @@ class PddFormListing(TaobaoListing):
                 if match_index is None:
                     break
                 current_matches.append(remaining.pop(match_index))
-            if len(current_matches) == len(groups) and not remaining:
+            date_group_or = (
+                listing_date_text_value(page_label, expected)
+                != str(expected).strip()
+            )
+            preferred_date_selected = (
+                not date_group_or
+                or all(
+                    normalize_option(current_value)
+                    == normalize_option(group[0])
+                    for group, current_value in zip(groups, current_matches)
+                )
+            )
+            if len(current_matches) == len(groups) and not remaining and preferred_date_selected:
                 await self._resolve_learning_groups(
                     page_label,
                     select,
@@ -613,7 +625,7 @@ class PddFormListing(TaobaoListing):
             raise PddFormListingError(
                 "拼多多属性“{0}”不是唯一的下拉或文本输入控件".format(page_label)
             )
-        expected_text = str(expected).strip()
+        expected_text = listing_date_text_value(page_label, expected)
         input_box = visible_inputs[0]
         if (await input_box.input_value()).strip() != expected_text:
             await input_box.fill(expected_text)
@@ -749,7 +761,11 @@ class PddFormListing(TaobaoListing):
                         )
                     )
             if sources:
-                assignments[normalized_page] = (page_label, sources[0][1])
+                source_key, source_value = sources[0]
+                paired = positional_listing_date_value(page_label, source_key, source_value)
+                assignments[normalized_page] = (
+                    page_label, paired if paired is not None else source_value
+                )
         return assignments
 
     async def fill_category_attributes(self, fields: PddFields) -> Mapping[str, Any]:

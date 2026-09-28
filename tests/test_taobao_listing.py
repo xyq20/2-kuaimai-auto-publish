@@ -429,6 +429,9 @@ class TaobaoPureFunctionTests(unittest.TestCase):
         self.assertIn(normalize_label("安全类别"), excel_aliases("安全等级"))
 
     def test_value_aliases_are_explicit_and_keep_original_first(self):
+        self.assertEqual(value_candidates("款式", "直筒裤"), ("直筒裤", "直筒"))
+        self.assertEqual(value_candidates("裤型", "阔腿裤"), ("阔腿裤", "阔腿"))
+        self.assertEqual(value_candidates("材质", "牛仔裤"), ("牛仔裤",))
         self.assertEqual(value_candidates("风格", "休闲风"), ("休闲风", "休闲"))
         self.assertEqual(
             value_candidates("风格", "休闲风/时尚都市"),
@@ -543,6 +546,14 @@ class TaobaoPureFunctionTests(unittest.TestCase):
 
 
 class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_style_suffix_selects_page_option_and_reads_it_back(self):
+        await self.listing.apply_recommended_category()
+        item = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('裤型'))"
+        ).first
+        actual = await self.listing.fill_attribute("裤型", "直筒裤", item=item)
+        self.assertEqual(actual, ("直筒",))
+
     async def test_fabric_fallback_accepts_other_spelling(self):
         calls = []
 

@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 import signal
 import shutil
 import subprocess
@@ -373,7 +374,7 @@ def create_learning_context(
             "category_json": {"hints": list(getattr(product, "category_hints", ()))},
         },
     )
-    run_id = uuid.uuid4().hex
+    run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
     client: Optional[CloudLearningClient] = None
     runtime: Optional[AttributeRuntime] = None
     if str(getattr(args, "learning_api_url", "")).strip():
@@ -2361,7 +2362,14 @@ async def wait_for_image_uploads(
     retried = False
     last_count = -1
     while time.monotonic() < deadline:
-        count = await scope.locator(".sc-upload .file-img").count()
+        if label == "小红书3:4主图":
+            # XHS keeps the next empty upload slot as `.file-img`; wrapper
+            # count can say 5/5 with only four actual thumbnails.
+            count = await scope.locator(
+                '.sc-upload .file-img img.originImg[src]'
+            ).count()
+        else:
+            count = await scope.locator(".sc-upload .file-img").count()
         if count != last_count:
             logging.getLogger("kuaimai_erp").info("%s上传进度：%s/%s", label, count, expected)
             last_count = count
@@ -2833,13 +2841,40 @@ async def sync_base_color_spec_values(
     *,
     timeout_seconds: float = 5.0,
 ) -> Dict[str, Any]:
-    """Backward-compatible wrapper for the generic specification reconciler."""
+    """Set colors from Excel when creating a new product."""
     return await sync_base_specification_values(
         drawer,
         "颜色",
         expected_colors,
         timeout_seconds=timeout_seconds,
     )
+
+
+def validate_base_size_spec_values(
+    page_sizes: Sequence[str], image_sizes: Sequence[str]
+) -> Dict[str, Any]:
+    """Require the page and size chart to contain the same sizes without editing either."""
+    page = tuple(str(value).strip() for value in page_sizes)
+    image = tuple(str(value).strip() for value in image_sizes)
+    normalize = lambda value: re.sub(r"\s+", "", value).casefold()
+    page_keys = tuple(map(normalize, page))
+    image_keys = tuple(map(normalize, image))
+    if (not page or not image or "" in page_keys or "" in image_keys
+            or len(set(page_keys)) != len(page_keys)
+            or len(set(image_keys)) != len(image_keys)
+            or set(page_keys) != set(image_keys)):
+        raise AutomationError(
+            "基础资料尺码与尺码表不一致："
+            f"页面 {' / '.join(page) or '空'}；尺码表 {' / '.join(image) or '空'}；"
+            "未修改尺码，也未保存"
+        )
+    return {
+        "before": page,
+        "after": page,
+        "changed": 0,
+        "added": 0,
+        "removed": 0,
+    }
 
 
 async def _delete_base_specification_value(
@@ -3037,6 +3072,35 @@ async def sync_base_specification_values(
     }
 
 
+def match_sku_images_by_name(
+    paths: Sequence[Path], spec_values: Sequence[str]
+) -> Tuple[Path, ...]:
+    """Bind named images to specification values before any upload occurs."""
+    def normalize(value: str) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value)).casefold()
+
+    names = tuple(normalize(value) for value in spec_values)
+    if not names or any(not name for name in names) or len(set(names)) != len(names):
+        raise AutomationError("SKU 图片匹配失败：页面颜色规格为空或重复")
+    if paths and all(re.fullmatch(r"\d+", path.stem) for path in paths):
+        if len(paths) == len(names) == 1:
+            return tuple(paths)
+        raise AutomationError(
+            "多颜色商品不能按图片编号猜测 SKU 图归属；"
+            "请将 SKU 图片按页面颜色命名，例如“棕色.png、灰色.png”"
+        )
+    matched = []
+    for value, name in zip(spec_values, names):
+        matches = [path for path in paths if normalize(path.stem) == name]
+        if len(matches) != 1:
+            raise AutomationError(
+                f"SKU 图片按名称匹配失败：颜色“{value}”找到 {len(matches)} 张同名图片；"
+                f"现有图片：{'、'.join(path.name for path in paths)}"
+            )
+        matched.append(matches[0])
+    return tuple(matched)
+
+
 async def replace_sku_images(
     page: Any,
     item: Any,
@@ -3045,19 +3109,33 @@ async def replace_sku_images(
 ) -> int:
     """Upload only missing SKU images and preserve images already on the page."""
     await item.scroll_into_view_if_needed()
-    first_spec = item.locator(".block-specification .specification-value").first
-    slots = first_spec.locator(".specification-value-flex_img")
-    slot_count = await slots.count()
-    if slot_count == 0:
-        raise AutomationError("商品规格中找不到 SKU 图上传位")
-    if slot_count != len(paths):
-        raise AutomationError(
-            f"SKU 图数量（{len(paths)}）与第一规格值数量（{slot_count}）不一致，"
-            "为避免图片和颜色错配，程序已停止。"
+    color_group = await base_specification_value_group(item, "颜色")
+    value_items = color_group.locator(".specification-value-flex_item")
+    spec_values = []
+    slots = []
+    for index in range(await value_items.count()):
+        value_item = value_items.nth(index)
+        inputs = value_item.locator(
+            ".specification-value-flex_input input:not([type=checkbox])"
         )
+        images = value_item.locator(".specification-value-flex_img")
+        if await inputs.count() == 0 and await images.count() == 0:
+            continue
+        if await inputs.count() != 1 or await images.count() != 1:
+            raise AutomationError(
+                f"第 {index + 1} 个颜色规格没有唯一对应的 SKU 图位，未上传图片"
+            )
+        spec_values.append((await inputs.first.input_value()).strip())
+        slots.append(images.first)
+    if not slots:
+        raise AutomationError("商品规格中找不到可配对的颜色与 SKU 图位")
+    paths = match_sku_images_by_name(paths, spec_values)
     uploaded_count = 0
     for index, path in enumerate(paths):
-        slot = slots.nth(index)
+        logging.getLogger("kuaimai_erp").info(
+            "SKU 图片匹配：%s → %s", spec_values[index], path.name
+        )
+        slot = slots[index]
         if await slot.locator(".sc-upload .file-img").count():
             if await sku_slot_has_real_image(page, slot):
                 logging.getLogger("kuaimai_erp").info(
@@ -3084,6 +3162,86 @@ async def replace_sku_images(
         await wait_for_image_uploads(slot, 1, f"SKU 图 {index + 1}", timeout_seconds)
         uploaded_count += 1
     return uploaded_count
+
+
+async def read_base_sku_color_code_rows(drawer: Any) -> List[Dict[str, str]]:
+    block = await first_visible(drawer.locator(".block-specification-list"))
+    if block is None:
+        raise AutomationError("基础资料没有可见的 SKU 规格明细，无法校验商品编码")
+    result = await block.evaluate(
+        """
+        root => {
+          const visible = node => node.getClientRects().length > 0
+            && getComputedStyle(node).visibility !== 'hidden';
+          for (const table of root.querySelectorAll('.el-table')) {
+            if (!visible(table)) continue;
+            const header = table.querySelector('.el-table__main-wrapper .el-table__header-wrapper')
+              || table.querySelector('.el-table__header-wrapper');
+            const body = table.querySelector('.el-table__main-wrapper .el-table__body-wrapper')
+              || table.querySelector('.el-table__body-wrapper');
+            if (!header || !body) continue;
+            const labels = [...header.querySelectorAll('thead th')].map(th =>
+              (th.querySelector('.cell')?.getAttribute('title') || th.innerText || '')
+                .replace(/[\\s*：:]/g, ''));
+            const column = names => labels.findIndex(label =>
+              names.some(name => label === name || label.startsWith(name)));
+            const indexes = [
+              column(['颜色', '颜色分类']),
+              column(['尺码', '尺码大小']),
+              column(['商品编码', '基础资料商家编码']),
+            ];
+            if (indexes.some(index => index < 0)) continue;
+            const rows = [...body.querySelectorAll('tbody > tr')].filter(visible).map(row => {
+              const cells = [...row.querySelectorAll(':scope > td')];
+              return indexes.map(index => {
+                const cell = cells[index];
+                if (!cell) return '';
+                return (cell.querySelector('input')?.value || cell.innerText || '').trim();
+              });
+            });
+            return {found: true, rows};
+          }
+          return {found: false, rows: []};
+        }
+        """
+    )
+    if not result.get("found") or not result.get("rows"):
+        raise AutomationError("基础资料找不到颜色、尺码、商品编码三列及 SKU 行")
+    return [
+        {"颜色": row[0], "尺码": row[1], "商品编码": row[2]}
+        for row in result["rows"]
+    ]
+
+
+def validate_base_sku_color_codes(
+    rows: Sequence[Mapping[str, str]],
+    style_code: str,
+    known_colors: Sequence[str],
+) -> int:
+    colors = tuple(dict.fromkeys(str(color).strip() for color in known_colors if str(color).strip()))
+    if not colors:
+        raise AutomationError("没有可用于校验 SKU 商品编码的颜色规格")
+    for index, row in enumerate(rows, 1):
+        color = str(row.get("颜色") or "").strip()
+        size = str(row.get("尺码") or "").strip()
+        code = str(row.get("商品编码") or "").strip()
+        if not color or not code or not code.startswith(style_code):
+            raise AutomationError(
+                f"第 {index} 行 SKU 无法校验颜色：规格={color or '空'}，商品编码={code or '空'}"
+            )
+        suffix = code[len(style_code):].lstrip("-_/ ")
+        matches = [candidate for candidate in colors if suffix.startswith(candidate)]
+        if not matches:
+            raise AutomationError(
+                f"第 {index} 行 SKU 商品编码无法唯一识别颜色：规格={color}，编码={code}"
+            )
+        code_color = max(matches, key=len)
+        if code_color != color:
+            raise AutomationError(
+                f"第 {index} 行 SKU 颜色与商品编码不一致：规格={color}，"
+                f"编码={code}（编码颜色={code_color}，尺码={size or '空'}）；未保存"
+            )
+    return len(rows)
 
 
 async def set_base_price(drawer: Any, price: str) -> Any:
@@ -4724,6 +4882,15 @@ async def run_browser_automation(
             publish_mode = douyin_requested and product.douyin_fields is not None
             base_save_result = None
             if requires_base_save_before_platform(args.platform):
+                original_colors = await read_base_specification_values(drawer, "颜色")
+                original_sizes = await read_base_specification_values(drawer, "尺码")
+                size_report = (
+                    validate_base_size_spec_values(
+                        original_sizes, product.derived_size_names
+                    )
+                    if product.derived_size_names else None
+                )
+                match_sku_images_by_name(product.sku_images, original_colors)
                 title_item = await form_item(
                     drawer, "商品名称", timeout_seconds=args.timeout
                 )
@@ -4752,30 +4919,32 @@ async def run_browser_automation(
                     args.upload_timeout,
                 )
                 color_report: Optional[Dict[str, Any]] = None
-                size_report: Optional[Dict[str, Any]] = None
                 if product.colors:
-                    color_report = await sync_base_color_spec_values(
-                        drawer,
-                        product.colors,
-                    )
+                    color_report = {
+                        "before": original_colors,
+                        "after": original_colors,
+                        "changed": 0,
+                        "added": 0,
+                        "removed": 0,
+                        "excel": product.colors,
+                    }
                     logger.info(
-                        "基础资料颜色规格已按 Excel 顺序回读：%s",
-                        " / ".join(color_report["after"]),
+                        "基础资料颜色规格保持页面原值：%s（Excel：%s）",
+                        " / ".join(original_colors),
+                        " / ".join(product.colors),
                     )
                 else:
                     logger.info("Excel 未提供颜色字段，基础资料颜色规格保持页面原值")
-                if product.derived_size_names:
-                    size_report = await sync_base_specification_values(
-                        drawer,
-                        "尺码",
-                        product.derived_size_names,
-                    )
+                if size_report is not None:
                     logger.info(
-                        "基础资料尺码规格已按当前商品顺序回读：%s",
-                        " / ".join(size_report["after"]),
+                        "基础资料尺码与尺码表核对一致，保持页面原值：%s",
+                        " / ".join(original_sizes),
                     )
                 else:
-                    logger.info("当前商品未提取到尺码字段，基础资料尺码规格保持页面原值")
+                    logger.info(
+                        "基础资料尺码规格保持页面原值：%s",
+                        " / ".join(original_sizes),
+                    )
                 sku_count = await replace_sku_images(
                     page,
                     await form_item(drawer, "商品规格", timeout_seconds=args.timeout),
@@ -4789,6 +4958,18 @@ async def run_browser_automation(
 
                 price_input = await set_base_price(drawer, product.base_price)
                 logger.info("已将基本售价批量设置为 %s", product.base_price)
+
+                sku_color_rows = await read_base_sku_color_code_rows(drawer)
+                known_colors = original_colors
+                checked_skus = validate_base_sku_color_codes(
+                    sku_color_rows, product.style_code, known_colors
+                )
+                logger.info("基础资料 %s 行 SKU 颜色与商品编码核对通过", checked_skus)
+                if await read_base_specification_values(drawer, "颜色") != original_colors:
+                    raise AutomationError("基础资料颜色规格在填写过程中发生变化，未保存")
+                expected_sizes = original_sizes
+                if await read_base_specification_values(drawer, "尺码") != expected_sizes:
+                    raise AutomationError("基础资料尺码规格与预期不一致，未保存")
 
                 # 保存前做一次关键值复核。
                 if (await title_input.input_value()).strip() != product.title:
@@ -4825,31 +5006,29 @@ async def run_browser_automation(
                     product.title,
                     args.timeout,
                 )
-                if product.colors:
-                    persisted_colors = await read_base_specification_values(
-                        drawer,
-                        "颜色",
+                persisted_colors = await read_base_specification_values(drawer, "颜色")
+                if persisted_colors != original_colors:
+                    raise AutomationError(
+                        "基础资料保存后颜色规格回读不一致："
+                        f"页面 {persisted_colors}，保存前 {original_colors}"
                     )
-                    if persisted_colors != product.colors:
-                        raise AutomationError(
-                            "基础资料保存后颜色规格回读不一致："
-                            f"页面 {persisted_colors}，Excel {product.colors}"
-                        )
+                if color_report is not None:
                     base_save_result["color_specification"]["persisted"] = persisted_colors
                     (artifact_dir / "base-save-result.json").write_text(
                         json.dumps(base_save_result, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
-                if product.derived_size_names:
-                    persisted_sizes = await read_base_specification_values(
-                        drawer,
-                        "尺码",
+                persisted_sku_rows = await read_base_sku_color_code_rows(drawer)
+                validate_base_sku_color_codes(
+                    persisted_sku_rows, product.style_code, known_colors
+                )
+                persisted_sizes = await read_base_specification_values(drawer, "尺码")
+                if persisted_sizes != expected_sizes:
+                    raise AutomationError(
+                        "基础资料保存后尺码规格回读不一致："
+                        f"页面 {persisted_sizes}，目标 {expected_sizes}"
                     )
-                    if persisted_sizes != product.derived_size_names:
-                        raise AutomationError(
-                            "基础资料保存后尺码规格回读不一致："
-                            f"页面 {persisted_sizes}，目标 {product.derived_size_names}"
-                        )
+                if size_report is not None:
                     base_save_result["size_specification"]["persisted"] = (
                         persisted_sizes
                     )
@@ -5968,6 +6147,8 @@ async def run_browser_automation(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="从 Excel 和产品素材自动填写快麦基础/平台资料")
+    parser.add_argument("--run-id", help=argparse.SUPPRESS)
+    parser.add_argument("--output-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--excel-url", default=DEFAULT_EXCEL_URL, help="产品信息.xlsx 的 smb:// 或本地路径")
     parser.add_argument("--create-product", action="store_true", help="手工新增商品链接；与 --platform base 搭配，仅创建快麦商品，不铺货")
     parser.add_argument(
@@ -6166,6 +6347,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_execution_mode(args: argparse.Namespace) -> Tuple[PlatformSpec, ...]:
+    if getattr(args, "run_id", None) and not re.fullmatch(r"[0-9a-f]{32}", args.run_id):
+        raise SystemExit("run-id 必须是 32 位十六进制任务标识")
     try:
         args.platform = normalize_platform_selection(args.platform)
     except ValueError as exc:
@@ -6847,7 +7030,7 @@ def main() -> int:
         redactor: Optional[SensitiveLogRedactor] = SensitiveLogRedactor()
         logger = setup_logging(artifact_dir, redactor=redactor)
     else:
-        artifact_dir = SCRIPT_DIR / "output/kuaimai/runs" / timestamp
+        artifact_dir = args.output_dir or SCRIPT_DIR / "output/kuaimai/runs" / timestamp
         redactor = None
         logger = setup_logging(artifact_dir)
     if args.all_platform_one_shop_test:

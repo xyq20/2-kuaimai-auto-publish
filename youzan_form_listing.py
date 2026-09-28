@@ -6,7 +6,7 @@ remain owned by the common runner in ``kuaimai_erp.py``.
 
 from __future__ import annotations
 
-from field_policies import without_color_attributes
+from field_policies import listing_date_text_value, positional_listing_date_value, without_color_attributes
 
 from field_policies import clear_category_field, REQUIRED_SERVICES
 
@@ -833,7 +833,11 @@ class YouzanFormListing(TaobaoListing):
                         page_label, "、".join(key for key, _value in matches)
                     )
                 )
-            assignments[normalized_page] = (page_label, matches[0][1])
+            source_key, source_value = matches[0]
+            paired = positional_listing_date_value(page_label, source_key, source_value)
+            assignments[normalized_page] = (
+                page_label, paired if paired is not None else source_value
+            )
         return assignments
 
     @staticmethod
@@ -1016,7 +1020,15 @@ class YouzanFormListing(TaobaoListing):
                     normalize_option(option.label)
                     for option in tuple(records[0].get("options") or ())
                 }
-                if any(
+                date_group_or = (
+                    listing_date_text_value(page_label, expected)
+                    != str(expected).strip()
+                )
+                has_date_candidate = date_group_or and any(
+                    normalize_option(value) in api_labels
+                    for group in groups for value in group
+                )
+                if not has_date_candidate and any(
                     normalize_option(value) not in api_labels
                     for value in direct_values
                 ):
@@ -1069,7 +1081,7 @@ class YouzanFormListing(TaobaoListing):
         if await inputs.count() != 1:
             raise YouzanFormListingError("有赞属性“{0}”可填控件不是唯一项".format(page_label))
         input_box = inputs.first
-        expected_text = str(expected).strip()
+        expected_text = listing_date_text_value(page_label, expected)
         if (await input_box.input_value()).strip() != expected_text:
             await input_box.fill(expected_text)
             await input_box.press("Tab")

@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from field_policies import skip_color_attribute
+from field_policies import listing_date_text_value, positional_listing_date_value, skip_color_attribute
 
 import asyncio
 import re
@@ -176,7 +176,11 @@ def _field_source(
             f"天猫字段“{page_label}”匹配到多个 Excel 字段："
             + "、".join(key for key, _value in matches)
         )
-    return matches[0] if matches else None
+    if not matches:
+        return None
+    source_key, source_value = matches[0]
+    paired = positional_listing_date_value(page_label, source_key, source_value)
+    return source_key, paired if paired is not None else source_value
 
 
 def _required_source(
@@ -930,6 +934,7 @@ class TmallFormListing(TaobaoListing):
                 f"天猫字段“{page_label}”找不到唯一可填控件"
             )
         control = visible_inputs[0]
+        expected_text = listing_date_text_value(page_label, expected_text)
         actual = (await control.input_value()).strip()
         if not _tmall_values_equal(page_label, actual, expected_text):
             if await control.get_attribute("readonly") is not None:
@@ -1577,17 +1582,19 @@ class TmallFormListing(TaobaoListing):
                 ) from exc
 
             if materials:
-                # 天猫使用自己的普通 DOM 行组件；兼容性由 fill_materials
-                # 的行、下拉和百分比回读负责，不再要求淘宝旧版 Vue 结构。
+                # 空材质组件也必须有行容器，且“添加”属于该容器；
+                # 普通同名按钮不能证明它支持材质行。无需依赖 Vue 私有结构。
+                material_components = material_item.locator(".multi-complex-items")
                 material_compatible = (
-                    await material_item.get_by_role(
+                    await material_components.count() == 1
+                    and await material_components.get_by_role(
                         "button", name="添加", exact=True
                     ).count()
                     == 1
                 )
                 if not material_compatible:
                     raise TmallFormListingError(
-                        "天猫材质成分组件与淘宝结构化填写协议不兼容，"
+                        "天猫材质成分组件结构不兼容，缺少唯一材质行容器或添加按钮，"
                         "已在点击“添加”前停止"
                     )
             elif required:

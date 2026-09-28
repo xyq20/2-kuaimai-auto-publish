@@ -15,6 +15,38 @@ from local_review.service import analyze_product
 
 
 class LocalReviewApiTests(unittest.TestCase):
+    def test_unmapped_confirmed_review_is_learned_across_platforms_and_invalidation_removes_it(self):
+        self.product_and_snapshot()
+        for platform, snapshot, ident in [('jd', 'audience-jd', 'old-id'), ('douyin', 'audience-dy', 'new-id')]:
+            self.event(snapshot, 'snapshot.created', {
+                'snapshot_version': snapshot, 'platform_id': platform, 'category_leaf_id': 'pants',
+                'field_id': 'audience', 'field_label': '适用人群', 'canonical_field': None,
+                'schema_version': 's', 'custom_allowed': False, 'control_type': 'select',
+                'options': [{'value_id': ident, 'label': '青年', 'position': 0}],
+            })
+        self.event('audience-review', 'review.created', {
+            'id': 'audience-review', 'run_id': 'run', 'device_id': 'mac', 'product_version': 'pv-1',
+            'platform_id': 'jd', 'category_leaf_id': 'pants', 'field_id': 'audience',
+            'field_label': '适用人群', 'canonical_field': None, 'snapshot_version': 'audience-jd',
+            'reason_code': 'field_mapping_required', 'suggested_value_id': None,
+            'evidence_json': {'reuse_context': {'excel_candidates': ['通用'], 'control_type': 'select'}},
+        })
+        self.login()
+        headers = {'Origin': 'http://testserver'}
+        claimed = self.client.post('/api/reviews/audience-review/claim', headers=headers, json={'version': 1}).json()
+        confirmed = self.client.post('/api/reviews/audience-review/confirm', headers=headers,
+                                     json={'version': claimed['version'], 'final_value_id': 'old-id'})
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        request = dict(product_version='pv-1', platform_id='douyin', category_leaf_id='pants',
+                       field_id='audience', snapshot_version='audience-dy', excel_value='通用', control_type='select')
+        response = self.client.post('/api/device/review-learning', headers=self.device_headers, json=request)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['value_ids'], ['new-id'])
+        with transaction(self.settings) as c:
+            c.execute("UPDATE review_tasks SET status='invalidated' WHERE id='audience-review'")
+        response = self.client.post('/api/device/review-learning', headers=self.device_headers, json=request)
+        self.assertEqual(response.json()['status'], 'review_required')
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.settings = Settings(
@@ -99,7 +131,7 @@ class LocalReviewApiTests(unittest.TestCase):
 
     def test_review_page_contains_candidate_search(self):
         self.login()
-        page = self.client.get("/").text
+        page = self.client.get("/review").text
         script = self.client.get("/app.js").text
 
         self.assertIn('id="option-search"', page)
@@ -399,6 +431,23 @@ class LocalReviewApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["value_id"], "long")
         self.assertEqual(response.json()["source"], "explicit_text")
+
+    def test_failed_checkpoint_acknowledges_stale_updates_without_reviving_run(self):
+        self.event("stale-product", "product.upsert", {
+            "product_version": "pv-stale", "style_code": "ST", "title": "stale", "category_json": {}})
+        checkpoint = {"run_id": "run-stale", "product_version": "pv-stale",
+                      "device_id": "mac", "execution_mode": "save_only",
+                      "platform_order": ["douyin"], "current_index": 0,
+                      "status": "running", "pending_review_id": None,
+                      "version": 1, "image_version": "images"}
+        self.event("stale-start", "checkpoint.updated", checkpoint)
+        self.event("stale-stop", "checkpoint.updated", {**checkpoint, "status": "failed", "version": 6})
+        for version in (5, 6):
+            self.event("stale-late-" + str(version), "checkpoint.updated", {**checkpoint, "version": version})
+        with connect(self.settings) as connection:
+            row = connection.execute("SELECT status,version FROM run_checkpoints WHERE run_id='run-stale'").fetchone()
+            self.assertEqual((row["status"], row["version"]), ("failed", 6))
+        self.event("stale-final", "checkpoint.updated", {**checkpoint, "status": "failed", "version": 7})
 
     def test_legacy_checkpoint_id_is_normalized_before_idempotency_check(self):
         self.event(

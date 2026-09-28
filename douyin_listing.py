@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest, split_multi_choice
+from field_policies import listing_date_text_value, positional_listing_date_value
 from category_profile import choose_category_candidate
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
@@ -980,6 +981,7 @@ class DouyinListing:
                 )
                 if not await item.is_visible(timeout=1_000):
                     continue
+                await item.scroll_into_view_if_needed(timeout=2_000)
                 inputs = item.locator(
                     ":scope > .el-form-item__content input:not([type='hidden'])"
                 )
@@ -992,7 +994,29 @@ class DouyinListing:
                         controls.append((item, input_box))
             if controls:
                 return controls
-            await asyncio.sleep(0.05)
+            # Some category forms mount their inputs only after the inner
+            # editor is scrolled. Scroll real overflow containers, not window.
+            moved = await self.panel.evaluate("""panel => {
+              const nodes = [...panel.querySelectorAll('*'), panel];
+              for (let parent = panel.parentElement; parent; parent = parent.parentElement)
+                nodes.push(parent);
+              let moved = false;
+              for (const node of nodes) {
+                if (!node.getClientRects().length || node.clientHeight < 100 ||
+                    node.scrollHeight <= node.clientHeight + 2 ||
+                    !/auto|scroll/.test(getComputedStyle(node).overflowY) ||
+                    node.closest('.el-select-dropdown, .el-table')) continue;
+                const before = node.scrollTop;
+                node.scrollTop = Math.min(before + 100,
+                                          node.scrollHeight - node.clientHeight);
+                moved = moved || node.scrollTop !== before;
+                if (moved) return true;
+              }
+              return moved;
+            }""", timeout=2_000)
+            if moved and self.logger is not None:
+                self.logger.info("抖音字段“%s”未找到，已下滑编辑区域继续匹配", label)
+            await asyncio.sleep(0.6)
         raise DouyinListingError(f"抖音字段“{label}”找不到可见文本输入控件")
 
     async def read_plain_text_field(self, label: str) -> str:
@@ -1008,6 +1032,22 @@ class DouyinListing:
         )
 
     async def fill_text_field(self, label: str, value: object) -> str:
+        from playwright.async_api import Error as PlaywrightError
+        for attempt in range(3):
+            try:
+                return await asyncio.wait_for(
+                    self._fill_text_field_once(label, value), timeout=12
+                )
+            except (asyncio.TimeoutError, PlaywrightError, DouyinListingError) as exc:
+                if isinstance(exc, DouyinListingError) and "重绘后失效" not in str(exc):
+                    raise
+                if attempt == 2:
+                    raise DouyinListingError(f"抖音字段“{label}”重试后仍无法稳定读取或填写") from exc
+                if self.logger is not None:
+                    self.logger.info("抖音字段“%s”控件重绘或等待超时，重新定位（%s/2）", label, attempt + 1)
+                await asyncio.sleep(0.1)
+
+    async def _fill_text_field_once(self, label: str, value: object) -> str:
         """填写抖音页中不属于动态类目属性区的普通文本字段。"""
         expected = str(value)
         controls = await self._plain_text_field_controls(label)
@@ -1151,6 +1191,7 @@ class DouyinListing:
             for position, option in enumerate(api_options)
         )
 
+        multi = await select.locator(".el-select__tags").count() > 0
         try:
             if observed_values:
                 candidates = validate_observed_selection(
@@ -1158,7 +1199,6 @@ class DouyinListing:
                     observed_values,
                 )
             else:
-                multi = await select.locator(".el-select__tags").count() > 0
                 await self._open_select(select, multi=multi)
                 try:
                     _dropdown, dom_options = await self._visible_dom_options(select)
@@ -1215,6 +1255,7 @@ class DouyinListing:
             candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
             excel_value="/".join(str(v) for v in alternatives), evidence={},
             custom_allowed=False, schema_version=preflight_schema,
+            control_type="multi_select" if multi else "select",
         )) if callable(reuse) else None
         if not exact_alternatives and not direct_input_failed and reusable is None:
             # The initial API/DOM option list is not always complete. Keep the
@@ -1261,7 +1302,7 @@ class DouyinListing:
                 evidence={"excel": bool(excel_value.strip())},
                 custom_allowed=False,
                 schema_version=schema_version,
-                control_type="select",
+                control_type="multi_select" if multi else "select",
             )
         )
         if resolved is None:
@@ -1276,7 +1317,7 @@ class DouyinListing:
         *,
         excel_value: str,
     ) -> Optional[str]:
-        """让学习运行器决定文本框的 OR 候选；低置信度由运营审核。"""
+        """按 Excel 顺序匹配文本 OR 候选，并保留同商品审核优先级。"""
         runtime = self.attribute_runtime
         if runtime is None:
             raise DouyinListingError("抖音属性学习运行器未启用")
@@ -1313,8 +1354,7 @@ class DouyinListing:
                 field_id=field_id,
                 field_label=label,
                 candidates=candidates,
-                # 多个候选时保留原始斜杠值，避免运行器把第一项
-                # 误当成 Excel 唯一确定值。
+                # 保留完整顺序，由公共运行器选择第一个匹配的 OR 候选。
                 excel_value=excel_value,
                 evidence={"text": True, "excel": True},
                 custom_allowed=True,
@@ -1982,7 +2022,14 @@ class DouyinListing:
             # 此时无需重新比较可能分批加载的整份 API/DOM 候选列表，
             # 也不应重复触发学习审核。
             current = await self._read_select_values(select, multi=multi)
-            if matches_any(current, alternatives, normalize_option):
+            date_pair_is_preferred = (
+                listing_date_text_value(label, expected) != str(expected).strip()
+            )
+            if matches_any(
+                current,
+                alternatives[:1] if date_pair_is_preferred else alternatives,
+                normalize_option,
+            ):
                 if self.attribute_runtime is not None:
                     await self._resolve_learning_select_value(
                         label,
@@ -2120,7 +2167,9 @@ class DouyinListing:
                 )
             return (current,)
 
-        if len(alternatives) == 1:
+        if len(alternatives) == 1 or (
+            listing_date_text_value(label, expected) != str(expected).strip()
+        ):
             chosen = alternatives[0]
         elif self.attribute_runtime is not None:
             chosen = await self._resolve_learning_text_value(
@@ -2302,6 +2351,8 @@ class DouyinListing:
     async def apply_category_and_fields(self, fields: Any) -> Mapping[str, Any]:
         """应用类目、短标题和当前类目页面实际存在的 Excel 属性。"""
         category = await self.apply_first_recommended_category()
+        if self.logger is not None:
+            self.logger.info("抖音类目已应用，开始读取属性控件")
         page_items = without_color_attributes(await self._attribute_items())
 
         excel_attributes = list(fields.attributes.items())
@@ -2319,6 +2370,8 @@ class DouyinListing:
         goods_code = None
         if goods_code_sources:
             _key, goods_code_value = goods_code_sources[0]
+            if self.logger is not None:
+                self.logger.info("抖音开始校验货号：%s", goods_code_value)
             goods_code = await self.fill_text_field("货号", goods_code_value)
 
         target_sources: Dict[str, List[Tuple[object, object]]] = {}
@@ -2354,8 +2407,9 @@ class DouyinListing:
                 raise DouyinListingError(
                     f"抖音属性“{page_label}”匹配到多个 Excel 字段：{keys}"
                 )
-            _key, value = sources[0]
-            assignments.append((page_label, value))
+            source_key, source_value = sources[0]
+            paired = positional_listing_date_value(page_label, source_key, source_value)
+            assignments.append((page_label, paired if paired is not None else source_value))
 
         # Mapping is fully validated before any title/attribute value is written.
         short_title = await self.fill_short_title(fields.short_title)
@@ -3562,6 +3616,26 @@ class DouyinListing:
                 errors.append(rendered)
         if errors:
             if self.artifact_dir is not None:
+                if any("尺码" in message and "重复" in message for message in errors):
+                    try:
+                        table = await self._size_table()
+                        await table.scroll_into_view_if_needed(timeout=5_000)
+                        details = await table.evaluate("""root => ({
+                          headers: Array.from(root.querySelectorAll('thead th')).map(e => e.innerText.trim()),
+                          rows: Array.from(root.querySelectorAll('tbody tr')).map(row => ({
+                            text: row.innerText,
+                            cells: Array.from(row.querySelectorAll('td')).map(cell => ({
+                              text: cell.innerText,
+                              values: Array.from(cell.querySelectorAll('input')).map(input => input.value)
+                            }))
+                          }))
+                        })""", timeout=5_000)
+                        (self.artifact_dir / "size-validation-details.json").write_text(
+                            json.dumps(details, ensure_ascii=False, indent=2), encoding="utf-8")
+                        await table.screenshot(path=str(self.artifact_dir / "size-validation-error.png"), timeout=10_000)
+                    except Exception as exc:
+                        if self.logger is not None:
+                            self.logger.warning("尺码错误现场采集失败：%s", type(exc).__name__)
                 (self.artifact_dir / "validation-error-scope.html").write_text(
                     await self.panel.evaluate("element => element.outerHTML"),
                     encoding="utf-8",

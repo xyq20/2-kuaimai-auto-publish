@@ -9,7 +9,7 @@ if [[ ! -x ".venv/bin/python" ]]; then
   python3 -m venv .venv
 fi
 
-echo "正在检查审核中心依赖……"
+echo "正在检查商品工作台与审核中心依赖……"
 .venv/bin/python -m pip install --disable-pip-version-check -q -r requirements.txt
 
 KEYCHAIN_SERVICE="kuaimai-review-device-token"
@@ -32,7 +32,7 @@ fi
 
 .venv/bin/python -m local_review.cli backup
 REVIEW_PORT="${KUAIMAI_REVIEW_PORT:-8787}"
-echo "审核中心：http://127.0.0.1:${REVIEW_PORT}"
+echo "商品工作台与审核中心：http://127.0.0.1:${REVIEW_PORT}"
 echo "保持本窗口运行；关闭窗口后运营网页会暂时离线。"
 (sleep 2; open "http://127.0.0.1:${REVIEW_PORT}/") &
 exec .venv/bin/python -m uvicorn local_review.app:app \

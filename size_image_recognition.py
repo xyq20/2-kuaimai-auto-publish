@@ -464,7 +464,9 @@ def _center_y(token: OCRToken) -> float:
 
 
 def _normalize_size(text: str) -> Optional[str]:
-    normalized = re.sub(r"\s+", "", text).upper()
+    # Vision may read the X in a size label as × (for example, 2XL -> 2×L).
+    # Keep the whole-label check below so dimensions such as 20×30 stay invalid.
+    normalized = re.sub(r"\s+", "", text).upper().replace("×", "X")
     return normalized if _SIZE_NAME.fullmatch(normalized) else None
 
 

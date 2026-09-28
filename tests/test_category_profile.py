@@ -9,6 +9,17 @@ from category_profile import (
 
 
 class CategoryProfileTests(unittest.TestCase):
+    def test_category_alternatives_keep_excel_order(self):
+        hints = ("卫衣", "打底衫", "男士套头卫衣", "套头卫衣")
+        self.assertEqual(choose_category_candidate(
+            ("服装 > 男装 > 卫衣", "服装 > 男装 > 打底衫"), hints)[0],
+            "服装 > 男装 > 卫衣")
+        self.assertEqual(choose_category_candidate(
+            ("服装 > 男装 > 打底衫", "服装 > 男装 > 卫衣"), hints)[0],
+            "服装 > 男装 > 卫衣")
+        self.assertEqual(choose_category_candidate(
+            ("服装 > 男装 > 打底衫",), hints)[0], "服装 > 男装 > 打底衫")
+
     def test_classifies_existing_pants_and_new_outerwear_without_product_codes(self):
         self.assertEqual(
             category_profile(("男装", "男士休闲裤", "男士休闲直筒裤")).garment_kind,

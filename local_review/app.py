@@ -17,12 +17,14 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
 from .database import backup_if_due, canonical_json, connect, migrate, remove_expired_originals, transaction, utc_now
 from .security import hash_password, new_session, session_hash, verify_password
-from .service import ApiError, analyze_product, decide_attribute, ingest_event, require
+from .service import ApiError, analyze_product, decide_attribute, decide_review_learning, ingest_event, require
 from .ui import SCRIPT, STYLES, page
+from .launcher import Launcher, PLATFORMS
 
 
 SESSION_COOKIE = "km_session"
@@ -304,9 +306,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         migrate(configured)
         backup_if_due(configured)
         remove_expired_originals(configured)
+        app.state.launcher = Launcher(configured)
         yield
 
-    app = FastAPI(title="快麦审核中心", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app = FastAPI(title="快麦商品工作台", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.settings = configured
     app.state.login_failures = {}
 
@@ -324,15 +327,77 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.get("/")
     async def root(request: Request):
+        authenticated = _session_user(request) is not None
         return HTMLResponse(
-            page(_session_user(request) is not None),
+            (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8") if authenticated else page(False),
             headers={
                 "cache-control": "no-store",
-                "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+                "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
                 "referrer-policy": "no-referrer",
                 "x-content-type-options": "nosniff",
             },
         )
+
+    @app.get("/review")
+    async def review_page(request: Request):
+        return HTMLResponse(page(_session_user(request) is not None, embedded=request.query_params.get("embedded") == "1"), headers={
+            "cache-control": "no-store",
+            "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'",
+            "x-content-type-options": "nosniff",
+        })
+
+    @app.get("/workbench/{filename}")
+    def workbench_asset(filename: str):
+        require(filename in {"app.js", "styles.css", "favicon.svg", "theme.js", "theme.css"}, 404, "not_found")
+        return FileResponse(Path(__file__).parent / "static" / filename, headers={"cache-control": "no-cache", "x-content-type-options": "nosniff"})
+
+    @app.get("/api/launcher/config")
+    def launcher_config(request: Request):
+        user = _require_user(request)
+        return _response({"user": {"username": user["username"], "role": user["role"]},
+                          "platforms": PLATFORMS, "learning_available": bool(configured.device_token)})
+
+    @app.get("/api/launcher/products")
+    def launcher_products(request: Request):
+        _require_user(request)
+        return _response({"products": request.app.state.launcher.catalog.listing()})
+
+    @app.get("/api/launcher/products/{product_id}")
+    def launcher_product(product_id: str, request: Request):
+        _require_user(request)
+        return _response(request.app.state.launcher.catalog.detail(product_id))
+
+    @app.get("/api/launcher/products/{product_id}/image")
+    def launcher_image(product_id: str, request: Request):
+        _require_user(request)
+        path = request.app.state.launcher.catalog.image(product_id)
+        require(path is not None, 404, "image_not_found")
+        return FileResponse(path, headers={"cache-control": "private, max-age=60", "x-content-type-options": "nosniff"})
+
+    @app.get("/api/launcher/jobs")
+    def launcher_jobs(request: Request):
+        _require_user(request)
+        return _response({"jobs": request.app.state.launcher.history()})
+
+    @app.get("/api/launcher/jobs/{job_id}")
+    def launcher_job(job_id: str, request: Request):
+        _require_user(request)
+        return _response(request.app.state.launcher.get(job_id))
+
+    @app.post("/api/launcher/jobs")
+    async def launcher_start(request: Request):
+        _same_origin(request)
+        user = _require_user(request)
+        _require_admin(user)
+        payload = await _json_body(request)
+        result = await run_in_threadpool(request.app.state.launcher.start, payload, user["username"])
+        return _response(result, 201)
+
+    @app.post("/api/launcher/jobs/{job_id}/stop")
+    async def launcher_stop(job_id: str, request: Request):
+        _same_origin(request)
+        _require_admin(_require_user(request))
+        return _response(await run_in_threadpool(request.app.state.launcher.stop, job_id))
 
     @app.get("/app.css")
     async def css():
@@ -469,6 +534,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def decide(request: Request):
         _require_device(request)
         return _response(decide_attribute(configured, await _json_body(request)))
+
+    @app.post("/api/device/review-learning")
+    async def review_learning(request: Request):
+        _require_device(request)
+        return _response(decide_review_learning(configured, await _json_body(request)))
 
     @app.get("/api/device/resume")
     async def resume(request: Request, device_id: str, wait_seconds: int = 0):

@@ -1316,6 +1316,40 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["values"]["上市年份季节"], "2026年秋季")
         self.assertEqual(await self.page.locator("#season input").input_value(), "2026年秋季")
 
+    async def test_listing_date_select_prefers_pair_then_falls_back_to_excel_order(self):
+        listing = await self._listing(
+            """
+            <div class="el-form-item" id="season">
+              <label class="el-form-item__label">上市年份季节</label>
+              <div class="el-form-item__content"><div class="el-select">
+                <input class="el-input__inner" readonly onclick="this.parentElement.querySelector('.el-select-dropdown').style.display='block'">
+                <div class="el-select-dropdown" style="display:none"><ul>
+                  <li class="el-select-dropdown__item" onclick="choose(this)">2026</li>
+                  <li class="el-select-dropdown__item" onclick="choose(this)">2026年秋季</li>
+                </ul></div>
+              </div></div>
+            </div>
+            <script>
+              function choose(node) {
+                node.closest('.el-select').querySelector('input').value = node.textContent.trim();
+                node.closest('.el-select-dropdown').style.display = 'none';
+              }
+            </script>
+            """
+        )
+        item = self.page.locator("#season")
+        expected = "2026年秋季/2026"
+        self.assertEqual(
+            await listing._fill_exact_form_item("上市年份季节", item, expected),
+            "2026年秋季",
+        )
+        await self.page.locator("#season li").nth(1).evaluate("node => node.remove()")
+        await self.page.locator("#season input").evaluate("node => node.value = ''")
+        self.assertEqual(
+            await listing._fill_exact_form_item("上市年份季节", item, expected),
+            "2026",
+        )
+
     async def test_product_identity_waits_for_season_revealed_after_brand(self):
         listing = await self._listing(
             """

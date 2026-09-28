@@ -6,7 +6,7 @@ platform form and reads it back; publishing remains disabled by the registry.
 
 from __future__ import annotations
 
-from field_policies import without_color_attributes
+from field_policies import listing_date_text_value, positional_listing_date_value, without_color_attributes
 
 from store_freight import sync_store_freight
 
@@ -1051,7 +1051,11 @@ class WxsphFormListing(YouzanFormListing):
                         page_label, "、".join(key for key, _value in matches)
                     )
                 )
-            assignments[normalized_page] = (page_label, matches[0][1])
+            source_key, source_value = matches[0]
+            paired = positional_listing_date_value(page_label, source_key, source_value)
+            assignments[normalized_page] = (
+                page_label, paired if paired is not None else source_value
+            )
         return assignments
 
     @staticmethod
@@ -1134,7 +1138,7 @@ class WxsphFormListing(YouzanFormListing):
                 )
             )
         input_box = inputs[0]
-        expected_text = str(expected).strip()
+        expected_text = listing_date_text_value(page_label, expected)
         if (await input_box.input_value()).strip() != expected_text:
             await input_box.fill(expected_text)
             await input_box.press("Tab")

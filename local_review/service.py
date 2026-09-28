@@ -350,6 +350,15 @@ def _validate_checkpoint(connection: sqlite3.Connection, payload: dict[str, Any]
         )
         require(identity_matches, 409, "checkpoint_identity_conflict")
         version = int(payload["version"])
+        # The launcher can mark a stopped runner failed while its offline
+        # outbox still contains earlier progress. Acknowledge that history;
+        # the version-guarded UPSERT below cannot overwrite the failed state.
+        # Keep identity checks and reject forward progress/version conflicts.
+        if (prior["status"] == "failed"
+                and status in {"running", "waiting_review", "resume_pending", "failed"}
+                and version <= int(prior["version"])
+                and payload["current_index"] <= prior["current_index"]):
+            return
         require(version >= int(prior["version"]), 409, "checkpoint_version_conflict")
         same = (
             payload["current_index"] == prior["current_index"]
@@ -978,3 +987,70 @@ def analyze_product(settings: Settings, product_version: str) -> dict[str, Any]:
         ).fetchone()
     require(winner is not None, 409, "analysis_cache_conflict")
     return {"status": "ready", "facts": json.loads(winner["payload_json"]), "cached": False}
+
+
+def decide_review_learning(settings: Settings, data: Any) -> dict[str, Any]:
+    """Look up confirmed human reviews even when no canonical AI field exists."""
+    from review_learning import choose_review_learning
+    keys = {'product_version', 'platform_id', 'category_leaf_id', 'field_id',
+            'snapshot_version', 'excel_value', 'control_type'}
+    require(isinstance(data, dict) and set(data) == keys, 400, 'invalid_decision_request')
+    for key in keys - {'excel_value'}:
+        _text(data[key], key)
+    require(isinstance(data['excel_value'], str) and len(data['excel_value']) <= 10000,
+            400, 'invalid_excel_value')
+    with transaction(settings) as connection:
+        product = connection.execute('SELECT category_json FROM products WHERE product_version=? AND deleting=0',
+                                     (data['product_version'],)).fetchone()
+        require(product is not None, 404, 'product_missing')
+        snapshot = _snapshot(connection, data)
+        options = json.loads(snapshot['options_json'])
+        response = {'status': 'review_required', 'reason_code': 'review_learning_insufficient',
+                    'snapshot_version': data['snapshot_version'], 'source': 'review_learning'}
+        if data['field_id'].startswith('__') or data['control_type'] in {'shop', 'logistics', 'freight'}:
+            return response
+        records = []
+        rows = connection.execute(
+            "SELECT r.product_version,r.platform_id,r.field_label,r.evidence_json,"
+            "a.final_value_id,a.review_id,s.options_json,p.category_json "
+            "FROM review_actions a JOIN review_tasks r ON r.id=a.review_id "
+            "JOIN attribute_decisions d ON d.id=a.id "
+            "JOIN option_snapshots s ON s.snapshot_version=a.snapshot_version "
+            "JOIN products p ON p.product_version=r.product_version "
+            "WHERE r.status IN ('confirmed','resume_ready','consumed') "
+            "AND d.source='human' AND d.status='confirmed' AND p.deleting=0 "
+            "ORDER BY a.created_at DESC,a.rowid DESC"
+        ).fetchall()
+        for row in rows:
+            context = json.loads(row['evidence_json']).get('reuse_context', {})
+            if not isinstance(context, dict) or not isinstance(context.get('excel_candidates'), list):
+                continue
+            old_options = json.loads(row['options_json'])
+            final = row['final_value_id']
+            whole = [v for v in old_options if final in (v['value_id'], v['label'])]
+            parts = [final] if len(whole) == 1 else re.split(r'[,，、;；]', final)
+            labels = []
+            for part in parts:
+                matches = [v['label'] for v in old_options if part.strip() in (v['value_id'], v['label'])]
+                if len(matches) != 1:
+                    labels = []
+                    break
+                labels.append(matches[0])
+            if not labels:
+                continue
+            records.append({**dict(row), 'category': json.loads(row['category_json']),
+                            'excel_candidates': context['excel_candidates'], 'labels': labels})
+        decision = choose_review_learning(
+            {**data, 'field_label': snapshot['field_label'],
+             'category': json.loads(product['category_json']), 'options': options}, records)
+        response.update(decision)
+        if 'value_ids' in decision:
+            response.update(status='auto_fill_ready', value_id=','.join(decision['value_ids']),
+                            value_label=','.join(decision['value_labels']))
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO attribute_decisions(id,product_version,platform_id,category_leaf_id,field_id,canonical_field,snapshot_version,proposed_value_id,final_value_id,source,status,reason_code,evidence_json,created_at,updated_at) VALUES(?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?)",
+            (uuid.uuid4().hex, data['product_version'], data['platform_id'], data['category_leaf_id'],
+             data['field_id'], data['snapshot_version'], response.get('value_id'), response.get('value_id'),
+             'review_learning', response['status'], response['reason_code'], canonical_json(decision), now, now))
+        return response

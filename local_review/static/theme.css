@@ -1,0 +1,100 @@
+/* One theme preference for the workbench and review pages. */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #15181f;
+  --white: #1e222c;
+  --ink: #e6e9ef;
+  --muted: #a0a8b8;
+  --line: #343a47;
+  --orange: #ef855e;
+  --orange-dark: #f6a585;
+  --soft-orange: #362923;
+  --green: #7bc5a7;
+  --theme-raised: #272c38;
+  --theme-selected-border: #b87457;
+  color: var(--ink);
+  background: var(--paper);
+}
+.theme-toggle {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #626b79;
+  font: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.theme-toggle:hover { background: #f5f6f8; }
+.theme-toggle:focus-visible { outline: 3px solid #f0ad95; outline-offset: 3px; }
+.theme-icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.review-header-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 12px; }
+
+/* Workbench surfaces and text; brand marks and product photos retain their colors. */
+[data-theme="dark"] :is(.sidebar, .topbar, .panel, .plan-panel, .dialog, .platform-card, .secondary, .theme-toggle, .toast) {
+  background: var(--white); border-color: var(--line); color: var(--ink);
+}
+[data-theme="dark"] :is(.step, .nav-count, .preview-badge, .avatar, .plan-product, .queue-number, .search-box, .run-summary, .log-details pre, .help-note, .learning-icon, .future-action > [data-icon], .empty-plan, .product-image, .choice-image, .progress-track) {
+  background: var(--theme-raised); border-color: var(--line); color: var(--muted);
+}
+[data-theme="dark"] :is(.nav-item, .brand-sub, .nav-label, .sidebar-note strong, .sidebar-note p, .version, .breadcrumb, .breadcrumb span, .account, .eyebrow, .page-heading p, .section-caption, .product-code, .product-info > p, .product-meta, .small-badge, .inline-actions button, .section-description, .platform-footnote, .mode-card p, .mode-top > svg, .learning-row p, .page-footnote, .plan-label, .plan-description, .plan-product .label, .plan-section-title, .plan-section-title span:last-child, .plan-details dt, .plan-top > span[data-icon], .reorder button, .start-caption, footer, .dialog-subtitle, .icon-button, .choice-info p, .empty-message, .run-stage-status, .run-progress > div:first-child, .log-details, .guide-list p, .future-action p, .history-item p) {
+  color: var(--muted);
+}
+[data-theme="dark"] :is(.breadcrumb strong, .platform-name, .learning-row strong, .plan-product strong, .queue-name, .plan-details dd, .run-summary strong, .run-stage, .run-progress strong) { color: var(--ink); }
+[data-theme="dark"] :is(.platform-card, .mode-card, .small-badge, .select-check, .radio-mark, .learning-row, footer, .product-choice, .run-stage, .history-item, .plan-list li::before) { border-color: var(--line); }
+[data-theme="dark"] :is(.select-check, .radio-mark) { background: var(--paper); }
+[data-theme="dark"] :is(.nav-item.active, .platform-card[aria-pressed="true"], .mode-card[aria-checked="true"], .count-badge, .guide-list > div > span) {
+  background: var(--soft-orange); color: var(--orange-dark); border-color: var(--theme-selected-border);
+}
+[data-theme="dark"] .platform-card[aria-pressed="true"] .select-check { background: var(--orange); border-color: var(--orange); color: #211813; }
+[data-theme="dark"] .mode-card[aria-checked="true"] .radio-mark { border-color: var(--orange); }
+[data-theme="dark"] :is(.secondary:hover, .theme-toggle:hover, .nav-item:hover:not(.active), .reorder button:hover:not(:disabled), .icon-button:hover, .history-row:hover, .operation-choice:hover, .product-choice:hover) {
+  background: var(--theme-raised); color: var(--ink); border-color: #69758b;
+}
+[data-theme="dark"] :is(.platform-card:hover, .mode-card:hover, .product-choice.selected) { border-color: var(--theme-selected-border); }
+[data-theme="dark"] :is(.primary, .primary:hover:not(:disabled)) { background: #ee8258; color: #211710; box-shadow: none; }
+[data-theme="dark"] .mode-note { background: #21302b; border-color: #3e5149; color: #aed0be; }
+[data-theme="dark"] :is(.mode-note.publish, .notice, .active-job, .operation-banner, .run-stage.running) {
+  background: #352b24; border-color: #66503b; color: #efbf92;
+}
+[data-theme="dark"] .run-stage.running .run-stage-status { color: #efbf92; }
+[data-theme="dark"] :is(.run-stage.failed, .run-stage.interrupted) { background: #362528; border-color: #714349; }
+[data-theme="dark"] :is(.run-stage.failed .run-stage-status, .run-stage.interrupted .run-stage-status, .history-status.failed, .history-status.interrupted, #run-secondary.stop) { color: #f2a19b; }
+[data-theme="dark"] .history-status { color: #f4aa80; }
+[data-theme="dark"] :is(.history-status.completed, .run-stage.done .run-stage-status) { color: var(--green); }
+[data-theme="dark"] .dialog::backdrop { background: #06090db3; }
+[data-theme="dark"] .dialog { box-shadow: 0 25px 100px #0007; }
+[data-theme="dark"] .demo-art { background: #283630; color: #a4b7a8; }
+[data-theme="dark"] .switch > span { background: #525b6a; }
+[data-theme="dark"] .switch input:checked + span { background: #60866f; }
+[data-theme="dark"] :is(.topbar-divider, .meta-divider) { background: var(--line); }
+[data-theme="dark"] #review-frame { background: var(--paper); border-color: var(--line); }
+[data-theme="dark"] input::placeholder { color: #919bad; }
+
+/* Existing review form and login page, including native inputs and selected values. */
+[data-theme="dark"] :is(.card, #login) { background: var(--white); color: var(--ink); box-shadow: none; }
+[data-theme="dark"] .photo { background: var(--theme-raised); }
+[data-theme="dark"] :is(.label, header p, .option-search span, #empty, #image-note, details p) { color: var(--muted); }
+[data-theme="dark"] :is(.options button, .actions button:not(.primary), input, select),
+[data-theme="dark"] #refresh {
+  color: var(--ink); background: var(--theme-raised); border-color: #505b70;
+}
+[data-theme="dark"] .options button[aria-pressed="true"] { background: #1e3551; border-color: #72afff; color: #e1edff; }
+[data-theme="dark"] .actions { border-color: var(--line); }
+[data-theme="dark"] :is(.card .primary, #login .primary) { background: #8abbfa; border-color: #8abbfa; color: #101c2b; }
+[data-theme="dark"] .card summary { color: #95c2ff; }
+[data-theme="dark"] .status { color: #f2a491; }
+[data-theme="dark"] .search-box input { background: transparent; }
+@media (max-width: 650px) {
+  .theme-toggle { width: 32px; height: 32px; padding: 7px; margin-left: 8px; }
+  .review-header-actions { gap: 6px; }
+  .review-header-actions p { display: none; }
+}

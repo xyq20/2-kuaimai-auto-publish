@@ -7,6 +7,15 @@ from taobao_listing import TaobaoListing, TaobaoListingError
 
 
 class ExcelBeforeReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_style_suffix_uses_unique_api_candidate_before_custom_input_or_review(self):
+        listing = object.__new__(TaobaoListing)
+        candidates = (CandidateValue('straight', '直筒'), CandidateValue('loose', '宽松'))
+        with patch.object(TaobaoListing, '_select_values', new_callable=AsyncMock) as writer:
+            actual, value = await listing._excel_before_review(
+                MagicMock(), candidates, ('直筒裤', '直筒'), label='款式')
+        self.assertEqual((actual, value), (candidates, '直筒'))
+        writer.assert_not_awaited()
+
     async def test_verified_lining_history_prevents_excel_trial_across_platforms(self):
         from dataclasses import replace
         for platform in ('xhs', 'tb', 'tm', 'pdd', 'wxsph', 'yz'):

@@ -82,6 +82,12 @@ class CloudLearningClient:
         status, body = self._request("POST", "/api/device/decide", payload)
         return self._successful_json(status, body)
 
+    def review_learning(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        status, body = self._request("POST", "/api/device/review-learning", payload)
+        if status == 404:
+            return {"status": "review_required", "reason_code": "review_learning_unavailable"}
+        return self._successful_json(status, body)
+
     def analyze(self, product_version: str) -> Mapping[str, Any]:
         status, body = self._request(
             "POST", "/api/device/analyze", {"product_version": product_version}

@@ -7,7 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from attribute_runtime import AttributeRequest, ResolvedAttribute, ReviewRequired
+from attribute_runtime import AttributeRequest, AttributeRuntime, ResolvedAttribute, ReviewRequired
+from learning_store import LearningStore
 from douyin_data import MaterialComponent
 from douyin_listing import (
     DouyinListing,
@@ -640,6 +641,41 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             "服装 > 男装 > 休闲裤",
         )
 
+    async def test_text_field_recovers_when_input_detaches_after_lookup(self):
+        await self.listing.open()
+        original = self.listing._plain_text_field_controls
+        first = True
+        async def controls(label):
+            nonlocal first
+            found = await original(label)
+            if first:
+                first = False
+                handle = await found[0][1].element_handle()
+                await found[0][1].evaluate("el => el.replaceWith(el.cloneNode(true))")
+                return [(found[0][0], handle)]
+            return found
+        self.listing._plain_text_field_controls = controls
+        self.assertEqual(await self.listing.fill_text_field("货号", "NGBL-2022"), "NGBL-2022")
+        self.assertEqual(await self.listing.read_plain_text_field("货号"), "NGBL-2022")
+
+    async def test_text_field_scrolls_to_lazy_rendered_goods_code(self):
+        await self.listing.open()
+        await self.page.locator('[role="tabpanel"]').evaluate("""panel => {
+            const label = [...panel.querySelectorAll('.el-form-item__label')]
+                .find(el => el.textContent.trim() === '货号');
+            const item = label.closest('.el-form-item');
+            item.remove();
+            const scroll = document.createElement('div');
+            scroll.style.cssText = 'height:160px;overflow-y:auto';
+            scroll.innerHTML = '<div style="height:700px"></div>';
+            panel.prepend(scroll);
+            scroll.addEventListener('scroll', () => {
+                if (scroll.scrollTop > 50 && !item.isConnected) scroll.append(item);
+            });
+        }""")
+        actual = await asyncio.wait_for(self.listing.fill_text_field("货号", "SCROLL-2022"), timeout=8)
+        self.assertEqual(actual, "SCROLL-2022")
+
     async def test_text_field_locator_survives_form_item_index_shift(self):
         await self.listing.open()
         controls = await self.listing._plain_text_field_controls("货号")
@@ -1040,6 +1076,32 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             tuple(candidate.label for candidate in runtime.requests[0].candidates),
             ("2026", "动态选择当天", "2026年秋季"),
         )
+
+    async def test_text_or_real_runtime_fills_first_excel_alternative_without_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory) / "learning.sqlite3")
+            store.migrate()
+            client = Mock()
+            client.post_event.return_value = {"event_id": "test-event"}
+            client.decide.side_effect = AssertionError("Excel 已确定，不应请求学习决策")
+            runtime = AttributeRuntime(store, client, "run", "product")
+            self.listing.attribute_runtime = runtime
+            try:
+                await self.listing.open()
+                await self.listing.apply_first_recommended_category()
+                item = await self.listing._attribute_item("裤门襟")
+                await item.locator(":scope > .el-form-item__label").evaluate(
+                    "el => el.textContent = '上市时间'"
+                )
+                actual = await self.listing.fill_attribute(
+                    "上市时间", "2026/2026年秋季/动态选择当天"
+                )
+                self.assertEqual(actual, ("2026",))
+                self.assertEqual(await item.locator("input:not([readonly])").first.input_value(), "2026")
+                self.assertEqual(runtime.deferred_reviews, ())
+            finally:
+                await runtime.drain()
+                store.close()
 
     async def test_text_or_low_confidence_uses_review_runtime_not_raw_slash(self):
         class Runtime:

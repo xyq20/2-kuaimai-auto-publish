@@ -59,6 +59,110 @@ def make_length_request(**overrides):
 
 
 class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unmapped_field_consults_review_learning_and_validates_confidence(self):
+        class ReviewClient(FakeClient):
+            support = 3
+            calls = 0
+            def review_learning(self, data):
+                self.calls += 1
+                return {'status': 'auto_fill_ready', 'source': 'review_learning',
+                        'snapshot_version': data['snapshot_version'], 'support_count': self.support,
+                        'calibrated_acceptance_rate': 1.0, 'same_product': False,
+                        'value_ids': ['y','m'], 'value_labels': ['青年','中年']}
+        request = make_length_request(field_id='audience', field_label='适用人群',
+                                      excel_value='通用', control_type='multi_select',
+                                      candidates=(CandidateValue('y','青年'), CandidateValue('m','中年')))
+        client = ReviewClient()
+        runtime = AttributeRuntime(self.store, client, 'run', 'new-product')
+        result = await runtime.resolve(request)
+        self.assertEqual((result.label, result.source), ('青年,中年', 'review_learning'))
+        self.assertEqual(client.calls, 1)
+        await runtime.drain()
+        client.support = 1
+        with self.assertRaises(ReviewRequired):
+            await runtime.resolve(request)
+        calls = client.calls
+        result = await runtime.resolve(replace(request, excel_value='青年'))
+        self.assertEqual(result.label, '青年')
+        self.assertEqual(client.calls, calls)
+        await runtime.drain()
+
+    async def test_unique_garment_style_suffix_uses_excel_without_review(self):
+        for platform in ("taobao", "tmall", "jd", "xhs"):
+            with self.subTest(platform=platform):
+                client = FakeClient({"status": "review_required"})
+                runtime = AttributeRuntime(self.store, client, "run", f"new-{platform}")
+                result = await runtime.resolve(make_length_request(
+                    platform_id=platform, field_id="style", field_label="款式",
+                    excel_value="直筒裤", candidates=(
+                        CandidateValue("straight", "直筒"),
+                        CandidateValue("loose", "宽松"),
+                    ),
+                ))
+                self.assertEqual((result.value_id, result.label, result.source),
+                                 ("straight", "直筒", "explicit_text"))
+                await runtime.drain()
+                self.assertEqual(client.decide_calls, [])
+                self.assertFalse(any(event[1] == "review.created" for event in client.events))
+
+    async def test_style_suffix_does_not_override_exact_or_guess_ambiguous_labels(self):
+        from attribute_runtime import _matched_excel_variants
+        choices = (CandidateValue("exact", "直筒裤"), CandidateValue("bare", "直筒"))
+        self.assertEqual(
+            _matched_excel_variants("直筒裤", choices, control_type="select", field_label="款式"),
+            ((choices[0],),),
+        )
+        self.assertEqual(
+            _matched_excel_variants(
+                "直筒裤/宽松", (CandidateValue("bare", "直筒"), CandidateValue("later", "宽松")),
+                control_type="select", field_label="款式",
+            )[0][0].label,
+            "直筒",
+        )
+        ambiguous = (CandidateValue("a", "直筒型"), CandidateValue("b", "直筒版型"))
+        self.assertEqual(
+            _matched_excel_variants("直筒裤", ambiguous, control_type="select", field_label="版型"),
+            (),
+        )
+        self.assertEqual(
+            _matched_excel_variants("棉布", (CandidateValue("cotton", "棉"),),
+                                    control_type="select", field_label="材质"),
+            (),
+        )
+
+    async def test_excel_slash_uses_first_available_choice_across_platforms(self):
+        for platform in ("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "jd"):
+            for control in ("select", "text"):
+                for excel, expected in (
+                    ("2026/2026年秋季/动态选择当天", "2026"),
+                    ("不存在／2026年秋季／2026", "2026年秋季"),
+                ):
+                    with self.subTest(platform=platform, control=control, excel=excel):
+                        client = FakeClient({"status": "review_required"})
+                        runtime = AttributeRuntime(self.store, client, "run", "product")
+                        result = await runtime.resolve(make_length_request(
+                            platform_id=platform, field_id="680", field_label="上市时间",
+                            candidates=(CandidateValue("season", "2026年秋季"),
+                                        CandidateValue("year", "2026"),
+                                        CandidateValue("today", "动态选择当天")),
+                            excel_value=excel, control_type=control,
+                            custom_allowed=control == "text",
+                        ))
+                        self.assertEqual((result.label, result.source), (expected, "explicit_text"))
+                        await runtime.drain()
+                        self.assertEqual(client.decide_calls, [])
+                        self.assertFalse(any(event[1] == "review.created" for event in client.events))
+
+    async def test_single_choice_slash_preserves_comma_inside_candidate(self):
+        runtime = AttributeRuntime(self.store, FakeClient(), "run", "product")
+        result = await runtime.resolve(make_length_request(
+            excel_value="秋季，冬季/春季", control_type="select",
+            candidates=(CandidateValue("combined", "秋季，冬季"),
+                        CandidateValue("spring", "春季")),
+        ))
+        self.assertEqual((result.value_id, result.label), ("combined", "秋季，冬季"))
+        await runtime.drain()
+
     async def test_identical_names_with_different_ids_choose_first_without_review(self):
         client = FakeClient()
         runtime = AttributeRuntime(self.store, client, 'run', 'product')

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>快麦 · 商品工作台</title>
+  <link rel="icon" href="/workbench/favicon.svg" type="image/svg+xml">
+  <script src="/workbench/theme.js"></script>
+  <link rel="stylesheet" href="/workbench/styles.css">
+  <link rel="stylesheet" href="/workbench/theme.css">
+  <script src="/workbench/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#" aria-label="快麦工作台首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>快麦<span class="brand-sub">商品工作台</span></span></a>
+    <div class="nav-label">工作空间</div>
+    <nav aria-label="工作区导航">
+      <button class="nav-item active" id="nav-home"><span data-icon="grid"></span>商品运行<span class="nav-dot"></span></button>
+      <button class="nav-item" id="nav-history"><span data-icon="history"></span>运行记录<span id="history-count" class="nav-count">0</span></button>
+    <button class="nav-item" id="nav-review" aria-label="商品属性审核"><span data-icon="check"></span>商品属性审核<span id="review-count" class="nav-count">0</span></button></nav>
+    <div class="sidebar-note"><span data-icon="spark"></span><strong>让每次上新，少一点重复。</strong><p>选好商品与平台，<br>从一个地方开始。</p></div>
+    <div class="sidebar-bottom"><button class="nav-item" id="nav-help"><span data-icon="help"></span>使用说明</button><div class="version"><span class="status-dot"></span>本机工作台<span>V 1.0</span></div></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><div class="breadcrumb">工作空间<span>/</span><strong>商品运行</strong></div><div class="topbar-right"><span class="preview-badge"><span data-icon="lock"></span>本机运行</span><span class="topbar-divider"></span><span class="avatar">N</span><span class="account" id="account">正在连接</span><button class="theme-toggle" type="button" aria-label="切换到深色模式" title="切换到深色模式" data-theme-toggle><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 13.4A8.7 8.7 0 0 1 10.6 3.5 9 9 0 1 0 20.5 13.4Z"/></svg></button><button class="button secondary" id="logout">退出</button></div></header>
+    <main id="home-view">
+      <div class="page-heading"><div><div class="eyebrow">PRODUCT OPERATIONS</div><h1>新一次运行，从这里开始<span class="title-dot">.</span></h1><p>一件商品，多个平台。把重复的工作交给快麦。</p></div><button class="button secondary more-button" id="more-button"><span data-icon="more"></span>更多操作</button></div>
+      <div id="notice" class="notice" role="status" hidden></div><button id="active-job" class="active-job" hidden></button><div id="operation-banner" class="operation-banner" hidden><span id="operation-label"></span><button id="back-platforms" class="text-action">返回多平台运行</button></div><div class="work-grid">
+        <div class="config-column">
+          <section class="panel product-panel" aria-labelledby="product-heading">
+            <div class="section-heading"><h2 id="product-heading"><span class="step">01</span>选择商品</h2><span class="section-caption">本次处理 1 件商品</span></div>
+            <div class="product-content"><div class="product-image" id="product-image"></div><div class="product-info"><div class="product-code"><span id="product-code">待选择</span><span class="small-badge">Excel 资料</span></div><h3 id="product-title">正在读取商品列表…</h3><p id="product-category"></p><div class="product-meta"><span data-icon="sheet"></span>产品信息.xlsx<span class="meta-divider"></span><span data-icon="image"></span>主图与详情素材</div></div><button class="button secondary change-button" id="change-product">更换商品<span data-icon="chevron"></span></button></div>
+          </section>
+          <section id="platform-section" class="panel platform-panel" aria-labelledby="platform-heading">
+            <div class="section-heading"><h2 id="platform-heading"><span class="step">02</span>选择平台<span class="count-badge" id="selected-count">已选 3 个</span></h2><div class="inline-actions"><button id="select-all">全选</button><span></span><button id="clear-all">清空</button></div></div>
+            <p class="section-description">点选一个或多个平台，运行顺序可在右侧调整。</p>
+            <div class="platform-grid" id="platform-grid" role="group" aria-label="选择运行平台"></div>
+            <div class="platform-footnote"><span data-icon="info"></span>只处理选中的平台，沿用各平台已配置的店铺。</div>
+          </section>
+          <section class="panel mode-panel" aria-labelledby="mode-heading">
+            <div class="section-heading"><h2 id="mode-heading"><span class="step">03</span>执行到哪一步</h2></div>
+            <div class="mode-grid" id="mode-grid" role="radiogroup" aria-label="执行模式"></div>
+            <div class="learning-row"><span class="learning-icon" data-icon="spark"></span><div><strong>智能填充与人工审核</strong><p>遇到无法确定的属性，等待你确认后再继续。</p></div><label class="switch" title="智能填充与人工审核"><input id="learning-toggle" type="checkbox" checked aria-label="智能填充与人工审核"><span></span></label></div>
+          </section>
+          <div class="page-footnote"><span data-icon="lock"></span>与命令行共用执行程序和学习库 · 审核后自动继续当前任务</div>
+        </div>
+        <aside class="plan-panel" aria-label="本次运行计划">
+          <div class="plan-top"><span class="plan-label">RUN PLAN</span><span data-icon="route"></span></div><h2>本次运行</h2><p class="plan-description">开始前，再看一眼你的选择。</p>
+          <div class="plan-product"><span class="label">商品</span><strong id="plan-product">待选择</strong></div>
+          <div class="plan-section-title"><span>平台顺序</span><span id="plan-count">3 个平台</span></div>
+          <ol id="plan-list" class="plan-list" aria-label="平台运行顺序"></ol>
+          <div id="empty-plan" class="empty-plan" hidden><span data-icon="grid"></span><p>先选择一个平台<br><small>单选、多选都可以</small></p></div>
+          <div class="plan-divider"></div><dl class="plan-details"><div><dt>执行模式</dt><dd id="plan-mode">只保存</dd></div><div><dt>人工审核</dt><dd id="plan-learning"><i></i>已开启</dd></div></dl>
+          <div class="mode-note" id="mode-note"><span data-icon="shield"></span><p>资料保存后结束，不提交到店铺。</p></div>
+          <button id="preview-run" class="button primary start-button"><span data-icon="play"></span>开始运行<span data-icon="arrow"></span></button><p class="start-caption">默认只保存，可按需选择其他模式</p>
+        </aside>
+      </div>
+      <footer><span>快麦工作台</span><span>更清晰的操作，更从容的上新。</span></footer>
+    </main>
+    <main id="history-view" hidden><div class="page-heading"><div><div class="eyebrow">RUN HISTORY</div><h1>运行记录<span class="title-dot">.</span></h1><p>记录真实执行结果，点击任务查看进度与日志。</p></div></div><div id="history-list" class="panel"></div></main>
+    <main id="review-view" hidden><div class="page-heading"><div><div class="eyebrow">ATTRIBUTE REVIEW</div><h1>商品属性审核<span class="title-dot">.</span></h1><p>审核结果直接用于当前任务续跑，并保留到学习库。</p></div><button id="refresh-review" class="button secondary">刷新审核</button></div><iframe id="review-frame" title="商品属性审核" referrerpolicy="same-origin"></iframe></main>
+  </div>
+  <dialog id="product-dialog" class="dialog product-dialog"><div class="dialog-header"><div><span class="eyebrow">PRODUCT LIBRARY</span><h2>选择商品</h2></div><button class="icon-button" data-close="product-dialog" aria-label="关闭商品选择"><span data-icon="close"></span></button></div><p class="dialog-subtitle">按图片找款，也可以搜索商品简称、货号或颜色。<button class="text-action" id="refresh-products">刷新列表</button></p><div class="search-box"><span data-icon="search"></span><input id="product-search" type="search" placeholder="搜索商品名称或货号" aria-label="搜索商品" autocomplete="off"></div><div class="product-filters" role="group" aria-label="商品处理状态"><button data-product-filter="unprocessed" aria-pressed="true">未处理 <span id="unprocessed-count">0</span></button><button data-product-filter="processed" aria-pressed="false">已处理 <span id="processed-count">0</span></button><button data-product-filter="all" aria-pressed="false">全部 <span id="all-products-count">0</span></button></div><div class="library-meta"><span id="product-results" role="status" aria-live="polite"></span><span>有保存成功记录即归入已处理</span></div><div class="library-scroll"><div id="product-list" class="product-list"></div><p id="product-empty" class="empty-message" hidden>没有匹配的商品，试试商品简称、货号或颜色。</p></div></dialog>
+  <dialog id="run-dialog" class="dialog run-dialog"><div class="dialog-header"><div><span class="eyebrow">RUN DETAILS</span><h2 id="run-title">确认这次运行</h2></div><button class="icon-button" data-close="run-dialog" aria-label="关闭任务详情"><span data-icon="close"></span></button></div><p id="run-subtitle" class="dialog-subtitle"></p><div class="run-summary" id="run-summary"></div><div id="run-stages" class="run-stages"></div><details id="log-details" class="log-details" hidden open><summary>实时日志（最近 48 KB）</summary><pre id="run-log"></pre></details><p id="run-error" class="notice" role="alert" hidden></p><div class="dialog-actions"><button class="button secondary" id="run-secondary">返回调整</button><button class="button primary" id="run-review" hidden>去审核</button><button class="button primary" id="run-confirm">确认开始</button></div></dialog>
+  <dialog id="help-dialog" class="dialog"><div class="dialog-header"><div><span class="eyebrow">QUICK GUIDE</span><h2>三步，开始一次运行</h2></div><button class="icon-button" data-close="help-dialog" aria-label="关闭使用说明"><span data-icon="close"></span></button></div><div class="guide-list"><div><span>01</span><section><h3>选好商品</h3><p>点击“更换商品”，搜索并选择本次要处理的商品。</p></section></div><div><span>02</span><section><h3>勾选需要的平台</h3><p>只勾一个就是单选，多勾几个就是多选。在右侧用箭头调整执行顺序。</p></section></div><div><span>03</span><section><h3>选择执行模式</h3><p>仅填写、只保存、保存并铺货，按这次需要选择。点击“开始运行”核对计划，确认后执行。</p></section></div></div><div class="help-note">遇到待审核属性时，切换到左侧“商品属性审核”，确认后程序自动继续。命令行启动器仍然可用；同一时间只运行一项任务。基础资料和新建商品可在“更多操作”中使用。</div></dialog>
+  <dialog id="more-dialog" class="dialog"><div class="dialog-header"><div><span class="eyebrow">MORE ACTIONS</span><h2>更多操作</h2></div><button class="icon-button" data-close="more-dialog" aria-label="关闭更多操作"><span data-icon="close"></span></button></div><p class="dialog-subtitle">使用当前选定的商品资料；下面两项会保存快麦商品，不铺货。</p><button class="future-action operation-choice" data-operation="base"><span data-icon="box"></span><div><h3>基础资料</h3><p>完善现有商品的信息、图片和规格。</p></div><span data-icon="chevron"></span></button><button class="future-action operation-choice" data-operation="create"><span data-icon="plus"></span><div><h3>新建商品</h3><p>从产品资料创建新的快麦商品。</p></div><span data-icon="chevron"></span></button></dialog>
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

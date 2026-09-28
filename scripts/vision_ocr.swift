@@ -107,6 +107,13 @@ func overlapRatio(_ left: OCRToken, _ right: OCRToken) -> Double {
         return 0
     }
     let intersection = intersectionWidth * intersectionHeight
+    // The same text can get a tight box at one scale and a much larger box
+    // at another. A contained duplicate has low IoU despite covering the
+    // same glyphs; require matching text and near-total containment.
+    let smallerArea = min(left.width * left.height, right.width * right.height)
+    if left.text == right.text && smallerArea > 0 && intersection / smallerArea >= 0.9 {
+        return 1.0
+    }
     let union = left.width * left.height + right.width * right.height - intersection
     guard union > 0 else {
         return 0
@@ -150,11 +157,16 @@ func recognize(
             return nil
         }
         let box = observation.boundingBox
+        let top = 1.0 - box.origin.y - box.height
+        // Vision's top-edge boxes can exceed 1 by floating-point roundoff
+        // (observed: top = -6.87e-12). Correct only that subpixel residue;
+        // genuine out-of-bounds coordinates still reach the strict validator.
+        let normalizedTop = top < 0 && top >= -1e-9 ? 0.0 : top
         return OCRToken(
             text: candidate.string,
             confidence: candidate.confidence,
             x: box.origin.x,
-            y: 1.0 - box.origin.y - box.height,
+            y: normalizedTop,
             width: box.width,
             height: box.height
         )

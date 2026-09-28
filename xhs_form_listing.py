@@ -6,7 +6,7 @@ no save or publish method; the common runner owns the final write gate.
 
 from __future__ import annotations
 
-from field_policies import without_color_attributes
+from field_policies import positional_listing_date_value, without_color_attributes
 
 from store_freight import sync_store_freight
 
@@ -1016,7 +1016,11 @@ class XhsFormListing(TaobaoListing):
                         page_label, "、".join(key for key, _value in matches)
                     )
                 )
-            assignments[normalized_page] = (page_label, matches[0][1])
+            source_key, source_value = matches[0]
+            paired = positional_listing_date_value(page_label, source_key, source_value)
+            assignments[normalized_page] = (
+                page_label, paired if paired is not None else source_value
+            )
         return assignments
 
     @staticmethod
@@ -1766,7 +1770,12 @@ class XhsFormListing(TaobaoListing):
                 root = root.locator("xpath=..")
         if len(matches) != 1:
             raise XhsFormListingError("小红书主图上传区域不是唯一项：{0}".format(len(matches)))
-        return matches[0]
+        # 清空图片后，校验摘要也可能显示“主图”。不能继续用文字匹配的
+        # first()/父节点定位，否则悬停后会指向摘要，永远等不到文件控件。
+        await matches[0].evaluate(
+            "element => element.setAttribute('data-xhs-image-group', 'main')"
+        )
+        return self.panel.locator('[data-xhs-image-group="main"]:visible')
 
     async def sync_main_images(
         self,
@@ -1789,6 +1798,40 @@ class XhsFormListing(TaobaoListing):
             force_replace=True,
         )
         return {"source": "3:4主图", "count": len(paths), "action": action}
+
+    async def _wait_for_main_image_validation(self) -> None:
+        """Let the form finish validating imageList after the upload callback."""
+        if self.panel is None:
+            return
+        image_group = self.panel.locator('[data-xhs-image-group="main"]:visible').first
+        if not await image_group.count():
+            return
+        deadline = asyncio.get_running_loop().time() + 15
+        while True:
+            state = await image_group.evaluate("""node => {
+              const item = node.closest('.el-form-item');
+              const field = item?.__vue__;
+              return {
+                prop: field?.prop || '',
+                state: field?.validateState || '',
+                message: field?.validateMessage || '',
+                count: Array.isArray(field?.fieldValue) ? field.fieldValue.length : 0,
+                visibleError: Boolean(item?.querySelector('.el-form-item__error'))
+              };
+            }""")
+            if state["prop"] != "imageList":
+                return
+            if state["state"] != "validating" and not (
+                state["state"] == "success" and state["visibleError"]
+            ):
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise XhsFormListingError(
+                    "小红书主图校验未完成：imageList={0}，状态={1}，消息={2}".format(
+                        state["count"], state["state"], state["message"]
+                    )
+                )
+            await asyncio.sleep(0.1)
 
     async def _verify_persisted_identity(
         self, title: str, style_code: str
@@ -1961,6 +2004,7 @@ class XhsFormListing(TaobaoListing):
         images = await self.sync_main_images(
             portrait_paths, timeout_seconds=timeout_seconds, uploader=uploader
         )
+        await self._wait_for_main_image_validation()
         try:
             errors = await self._visible_validation_errors()
         except TaobaoListingError as exc:

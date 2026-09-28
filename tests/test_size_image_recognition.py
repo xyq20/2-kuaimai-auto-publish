@@ -456,6 +456,49 @@ class SwiftBridgeCompilationTests(unittest.TestCase):
 
 
 class SizeRecommendationParserTests(unittest.TestCase):
+    def test_size_labels_accept_ocr_multiplication_sign_without_accepting_dimensions(self):
+        for text, expected in (("2×L", "2XL"), ("×L", "XL"), (" 2 × l ", "2XL"), ("2XL", "2XL")):
+            with self.subTest(text=text):
+                self.assertEqual(size_image_recognition._normalize_size(text), expected)
+        for text in ("2×4", "2×L推荐", "2×", "20×30CM"):
+            with self.subTest(text=text):
+                self.assertIsNone(size_image_recognition._normalize_size(text))
+
+    def test_measurement_table_matches_ocr_cross_label_to_excel_size(self):
+        actual = parse_measurement_table(
+            _measurement_tokens(sizes=("XL", "2×L")),
+            ("XL", "2XL"),
+        )
+        self.assertEqual(
+            actual,
+            {
+                "XL": size_image_recognition.SizeMeasurements(80, 106, 104),
+                "2XL": size_image_recognition.SizeMeasurements(84, 110, 106),
+            },
+        )
+
+    @unittest.skipUnless(
+        Path("/Volumes/共享文件/谭/products/救援队+NGBL-2035").is_dir(),
+        "需要漏识别 2XL 的原始商品图片",
+    )
+    def test_rescue_product_2xl_range_and_measurements_are_recognized(self):
+        product = Path("/Volumes/共享文件/谭/products/救援队+NGBL-2035")
+        result = recognize_recommendations(
+            product / "尺码信息表/1_08.jpg",
+            product / "身高体重推荐表/1_09.jpg",
+            ("S", "M", "L", "XL", "2XL"),
+        )
+        self.assertEqual(
+            result,
+            (
+                SkuRecommendation("S", 155, 160, 50, 60, 77, 112, 49),
+                SkuRecommendation("M", 160, 170, 60, 70, 81, 116, 50),
+                SkuRecommendation("L", 170, 180, 70, 80, 85, 120, 51),
+                SkuRecommendation("XL", 180, 190, 80, 90, 89, 124, 52),
+                SkuRecommendation("2XL", 190, 200, 90, 100, 93, 128, 53),
+            ),
+        )
+
     def test_measurement_aliases_do_not_confuse_shipping_text_with_hip(self):
         for text in ("HIPLINE", "臀围", "臀围/HIPLINE"):
             with self.subTest(text=text):
@@ -554,6 +597,19 @@ class SizeRecommendationParserTests(unittest.TestCase):
     "需要 macOS Vision 和 xcrun 才能运行本地 OCR 集成测试",
 )
 class VisionOCRIntegrationTests(unittest.TestCase):
+    def test_top_edge_roundoff_does_not_reject_valid_size_chart(self):
+        image = FIXTURE_IMAGE.with_name("vision_ocr_top_edge.jpg")
+        tokens = vision_ocr(image)
+        rows = parse_measurement_table(tokens, ("S", "M", "L", "XL", "2XL"))
+        self.assertEqual(
+            {size: (row.waist, row.hip, row.length) for size, row in rows.items()},
+            {
+                "S": (76, 102, 102), "M": (80, 106, 104),
+                "L": (84, 110, 106), "XL": (88, 114, 108),
+                "2XL": (92, 118, 110),
+            },
+        )
+
     def test_oriented_fixture_recognizes_labels_and_top_left_y_coordinates(self):
         tokens = vision_ocr(FIXTURE_IMAGE)
         recognized = " ".join(token.text.upper() for token in tokens)

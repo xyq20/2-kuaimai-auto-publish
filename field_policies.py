@@ -5,7 +5,8 @@ from a previous style or a coarse garment category.
 """
 import re
 import unicodedata
-from typing import Mapping, Sequence, Tuple
+from datetime import date
+from typing import Mapping, Optional, Sequence, Tuple
 
 
 CLEARED_CATEGORY_FIELDS = {"yz": frozenset({"尺码"})}
@@ -31,6 +32,65 @@ FREIGHT_TEMPLATE_SHOPS = {
     "wxsph": ("NEIGBORL钊叔制鞋服",),
     "xhs": ("钊叔的店", "啊亮製NEIGBORL的店", "钊叔制NEIGBORL的店"),
 }
+
+
+LISTING_DATE_FIELDS = ("上市时间", "上市年份季节", "上市时节")
+
+
+def positional_listing_date_value(
+    page_label: str, source_key: str, source_value: object, *, today: Optional[date] = None
+) -> Optional[str]:
+    """Try the paired listing-date value, then the Excel values left to right.
+
+    The returned slash-separated values are ordered OR candidates, not values
+    to paste together into a text input.  Only the exact three-field Excel row
+    uses this policy; other fields keep their existing slash semantics.
+    """
+    def clean(value: str) -> str:
+        text = unicodedata.normalize("NFKC", str(value))
+        return re.sub(r"[\s*:：]+", "", text)
+
+    names = tuple(
+        clean(part) for part in re.split(r"[/／]", str(source_key)) if clean(part)
+    )
+    if len(names) != 3 or set(names) != set(LISTING_DATE_FIELDS):
+        return None
+    values = tuple(part.strip() for part in re.split(r"[/／]", str(source_value)))
+    if len(values) != 3 or any(not part for part in values):
+        raise ValueError("Excel 上市时间三字段必须按位置填写三个非空值")
+    label = clean(page_label)
+    label = {
+        "年份": "上市时间",
+        "上市年份": "上市时间",
+        "上市季节": "上市年份季节",
+    }.get(label, label)
+    if label not in names:
+        return None
+    current = today or date.today()
+
+    def materialize(value: str) -> str:
+        if value != "动态选择当天":
+            return value
+        if label in {"上市年份季节", "上市时节"}:
+            season = (
+                "春季" if current.month in (3, 4, 5)
+                else "夏季" if current.month in (6, 7, 8)
+                else "秋季" if current.month in (9, 10, 11)
+                else "冬季"
+            )
+            return f"{current.year}年{season}"
+        return current.strftime("%Y.%m.%d")
+
+    ordered = (values[names.index(label)], *values)
+    return "/".join(dict.fromkeys(materialize(value) for value in ordered))
+
+
+def listing_date_text_value(page_label: str, value: object) -> str:
+    """A free-text date field has no option list; enter only its paired value."""
+    normalized = re.sub(r"[\s*:：]+", "", unicodedata.normalize("NFKC", str(page_label)))
+    if normalized in {*LISTING_DATE_FIELDS, "年份", "上市年份", "上市季节"}:
+        return str(value).split("/", 1)[0].strip()
+    return str(value).strip()
 
 
 def clear_category_field(platform: str, label: str) -> bool:
@@ -89,6 +149,52 @@ def _normalized_parts(value: object) -> frozenset:
 # here so JD's numeric-ID writer and other platforms' DOM writers agree.
 # Do not strip arbitrary fabric suffixes: 棉麻/珠地棉/牛仔布 add distinct facts.
 MATERIAL_OPTION_EQUIVALENTS = (frozenset({"棉", "棉布"}),)
+
+
+STYLE_OPTION_FIELDS = frozenset({"款式", "裤型", "版型", "服饰版型", "服装版型", "裤脚款式", "裤脚口款式"})
+STYLE_OPTION_SUFFIXES = ("裤型", "版型", "裤", "型")
+
+
+def _style_stem(value: object) -> str:
+    text = _normalize_option_text(value)
+    for suffix in STYLE_OPTION_SUFFIXES:
+        if text.endswith(suffix) and len(text) - len(suffix) >= 2:
+            return text[:-len(suffix)]
+    return text
+
+
+def style_option_aliases(field_label: object, value: object) -> Tuple[str, ...]:
+    """Compact garment style wording, e.g. 直筒裤 -> 直筒."""
+    field = _normalize_option_text(field_label)
+    text = str(value).strip()
+    if field not in STYLE_OPTION_FIELDS or not text:
+        return ()
+    stem = _style_stem(text)
+    return (stem,) if stem != _normalize_option_text(text) else ()
+
+
+def match_style_option_candidates(
+    field_label: object, desired: object, candidate_labels: Sequence[str]
+) -> Tuple[int, ...]:
+    """Match a style's removable garment suffix only when the tier is unique.
+
+    The caller tries exact labels first.  Prefer the bare stem over another
+    suffixed form; a tie is left for the ordinary review path.
+    """
+    if _normalize_option_text(field_label) not in STYLE_OPTION_FIELDS:
+        return ()
+    wanted = _normalize_option_text(desired)
+    if not wanted:
+        return ()
+    stem = _style_stem(wanted)
+    normalized = tuple(_normalize_option_text(label) for label in candidate_labels)
+    bare = tuple(i for i, label in enumerate(normalized)
+                 if label == stem and label != wanted)
+    if bare:
+        return bare
+    return tuple(i for i, label in enumerate(normalized)
+                 if label != wanted and _style_stem(label) == stem
+                 and (stem != wanted or _style_stem(label) != label))
 
 
 def match_option_candidates(

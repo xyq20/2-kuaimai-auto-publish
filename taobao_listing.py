@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from field_policies import match_option_candidates, without_color_attributes
+from field_policies import (
+    listing_date_text_value,
+    match_option_candidates,
+    match_style_option_candidates,
+    positional_listing_date_value,
+    style_option_aliases,
+    without_color_attributes,
+)
 
 import asyncio
 import json
@@ -143,6 +150,9 @@ def value_candidates(label: object, value: object) -> Tuple[str, ...]:
             (),
         )
         for candidate in mapped:
+            if candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in style_option_aliases(label, source_candidate):
             if candidate not in candidates:
                 candidates.append(candidate)
         if is_material_field_label(label):
@@ -1928,9 +1938,14 @@ class TaobaoListing:
                 # Keep the original request so runtime records the genuine
                 # history/approval source, not a fabricated Excel match.
                 return values, '/'.join(group)
-        exact = preferred_exact_candidate_label(tuple(value.label for value in values), group)
-        if exact is not None:
-            return values, exact
+        labels = tuple(value.label for value in values)
+        for alias in group:
+            exact = preferred_exact_candidate_label(labels, (alias,))
+            if exact is not None:
+                return values, exact
+            style_matches = match_style_option_candidates(label, alias, labels)
+            if len(style_matches) == 1:
+                return values, labels[style_matches[0]]
         try:
             multi = await select.locator('.el-select__tags').count() > 0
             actual = await TaobaoListing._select_values(
@@ -2257,7 +2272,7 @@ class TaobaoListing:
             raise TaobaoListingError(
                 f"淘宝属性“{page_label}”不是唯一的下拉或文本输入控件"
             )
-        expected_text = str(expected).strip()
+        expected_text = listing_date_text_value(page_label, expected)
         input_box = visible_inputs[0]
         if (await input_box.input_value()).strip() != expected_text:
             await input_box.fill(expected_text)
@@ -2821,7 +2836,11 @@ class TaobaoListing:
                     f"淘宝属性“{page_label}”匹配到多个 Excel 字段：{keys}"
                 )
             if sources:
-                assignments[normalized_page] = (page_label, sources[0][1])
+                source_key, source_value = sources[0]
+                paired = positional_listing_date_value(page_label, source_key, source_value)
+                assignments[normalized_page] = (
+                    page_label, paired if paired is not None else source_value
+                )
         return assignments
 
     async def apply_excel_attributes(

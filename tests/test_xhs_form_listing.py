@@ -1,8 +1,10 @@
 import unittest
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from attribute_runtime import ResolvedAttribute
+from kuaimai_erp import AutomationError, sync_image_group, wait_for_image_uploads
 from xhs_data import XhsFields, parse_xhs_fields
 from xhs_form_listing import XhsFormListing, title_without_neigborl
 
@@ -30,6 +32,100 @@ class XhsDataTests(unittest.TestCase):
 
 
 class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_main_upload_survives_new_validation_label_after_hover(self):
+        listing = await self._listing()
+        await listing.panel.evaluate('''panel => {
+          panel.innerHTML = `<div id="main-upload">
+            <label>主图：</label>
+            <div class="sc-upload" style="width:100px;height:100px">
+              <div class="file-img"><button class="del-btn" onclick="this.parentElement.remove()">删除</button></div>
+              <input type="file" multiple accept="image/*">
+            </div>
+          </div><div id="transparent"><label>透明素材图：</label><input type="file"></div>`;
+          const root = panel.querySelector('#main-upload');
+          root.querySelector('.sc-upload').addEventListener('mousemove', () => {
+            if (!root.querySelector('.file-img') && !panel.querySelector('#validation-summary')) {
+              const summary = document.createElement('div');
+              summary.id = 'validation-summary';
+              summary.innerHTML = '<span>主图</span>';
+              panel.prepend(summary);
+            }
+          });
+          root.querySelector('input').addEventListener('change', event => {
+            window.uploadedNames = Array.from(event.target.files).map(file => file.name);
+            for (const file of event.target.files) {
+              const image = document.createElement('div');
+              image.className = 'file-img';
+              image.innerHTML = '<img class="originImg" src="data:image/png;base64,AA==">';
+              root.querySelector('.sc-upload').append(image);
+            }
+          });
+        }''')
+        self.page.set_default_timeout(700)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = (Path(directory) / "portrait-1.jpg", Path(directory) / "portrait-2.jpg")
+            for path in paths:
+                path.write_bytes(b"fixture-image")
+            result = await listing.sync_main_images(paths, timeout_seconds=2, uploader=sync_image_group)
+        self.assertEqual(result["action"], "replaced")
+        self.assertEqual(await self.page.evaluate("window.uploadedNames"), ["portrait-1.jpg", "portrait-2.jpg"])
+        self.assertEqual(await listing.panel.locator('#main-upload .file-img').count(), 2)
+        self.assertEqual(await listing.panel.locator('#transparent input').evaluate('e => e.files.length'), 0)
+
+    async def test_main_upload_does_not_count_empty_drop_slot_as_uploaded_image(self):
+        await self.page.set_content('''
+          <div id="main"><div class="sc-upload">
+            <div class="file-img"><img class="originImg" src="one.png"></div>
+            <div class="file-img"><img class="originImg" src="two.png"></div>
+            <div class="file-img"><img class="originImg" src="three.png"></div>
+            <div class="file-img"><img class="originImg" src="four.png"></div>
+            <div class="file-img empty-slot"></div>
+          </div>
+          </div>
+        ''')
+        with self.assertRaisesRegex(AutomationError, "4/5"):
+            await wait_for_image_uploads(
+                self.page.locator("#main"), 5, "小红书3:4主图", 1
+            )
+
+    async def test_main_image_validation_waits_for_pending_result(self):
+        listing = await self._listing()
+        await listing.panel.evaluate('''panel => {
+          panel.innerHTML = `<div class="el-form-item">
+            <label class="el-form-item__label">主图：</label>
+            <div data-xhs-image-group="main" class="sc-upload" style="width:100px;height:100px">
+              <div class="file-img"><img class="originImg" src="one.png"></div>
+            </div>
+            <div class="el-form-item__error">至少选择1张图片</div>
+          </div>`;
+          const item = panel.querySelector('.el-form-item');
+          item.__vue__ = {
+            prop: 'imageList', fieldValue: [{url: 'one.png'}],
+            validateState: 'validating', validateMessage: '至少选择1张图片'
+          };
+          setTimeout(() => {
+            item.__vue__.validateState = 'success';
+            item.__vue__.validateMessage = '';
+            item.querySelector('.el-form-item__error').remove();
+          }, 150);
+        }''')
+        for name, result in (
+            ("apply_category", {}), ("fill_identity", {}),
+            ("fill_category_attributes", {}), ("apply_full_payment_presale", {}),
+            ("fill_price_inventory_batch", {}),
+            ("sync_main_images", {"source": "3:4主图", "count": 1}),
+        ):
+            setattr(listing, name, AsyncMock(return_value=result))
+        with patch("xhs_form_listing.sync_store_freight", new_callable=AsyncMock) as freight:
+            freight.return_value = {}
+            result = await listing.apply_excel_fields(
+                XhsFields(fields={}, category_path=()), title="商品", style_code="SKU",
+                portrait_paths=(Path("one.png"),), timeout_seconds=5,
+                uploader=AsyncMock(),
+            )
+        self.assertEqual(result["deferred_validation_errors"], ())
+        self.assertEqual(result["main_images"]["count"], 1)
+
     def test_category_hints_accept_one_exact_outerwear_leaf(self):
         self.assertEqual(
             XhsFormListing._choose_category_text(

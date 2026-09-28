@@ -15,6 +15,8 @@ class Settings:
     model_api_url: str = ""
     model_api_key: str = ""
     ai_model: str = "gpt-5.1"
+    products_root: Path = Path("/Volumes/共享文件/谭/products")
+    review_port: int = 8787
 
     @property
     def database_path(self) -> Path:
@@ -44,4 +46,6 @@ class Settings:
             model_api_url=os.environ.get("KUAIMAI_MODEL_API_URL", ""),
             model_api_key=os.environ.get("KUAIMAI_MODEL_API_KEY", ""),
             ai_model=os.environ.get("KUAIMAI_AI_MODEL", "gpt-5.1"),
+            products_root=Path(os.environ.get("KUAIMAI_PRODUCTS_ROOT", "/Volumes/共享文件/谭/products")).expanduser(),
+            review_port=int(os.environ.get("KUAIMAI_REVIEW_PORT", "8787")),
         )

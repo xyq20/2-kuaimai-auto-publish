@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from field_policies import (
     is_single_material_expression,
+    listing_date_text_value,
     match_option_candidates,
+    positional_listing_date_value,
     skip_color_attribute,
     without_color_attributes,
 )
@@ -1964,7 +1966,11 @@ class JdFormListing(YouzanFormListing):
                         page_label, "、".join(key for key, _value in matches)
                     )
                 )
-            assignments[page_key] = (page_label, matches[0][1])
+            source_key, source_value = matches[0]
+            paired = positional_listing_date_value(page_label, source_key, source_value)
+            assignments[page_key] = (
+                page_label, paired if paired is not None else source_value
+            )
         return assignments
 
     @staticmethod
@@ -2230,7 +2236,7 @@ class JdFormListing(YouzanFormListing):
                     return None
             elif not is_readonly:
                 # 普通可编辑输入框
-                expected_text = str(desired).strip()
+                expected_text = listing_date_text_value(page_label, desired)
                 if (await inputs[0].input_value()).strip() != expected_text:
                     await self._enter_as_user(inputs[0], expected_text)
                 actual = ((await inputs[0].input_value()).strip(),)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -10,6 +12,7 @@ import uuid
 
 from attribute_decision import DecisionInput, DecisionStatus, validate_decision
 from canonical_fields import FieldMappingError, map_platform_field
+from field_policies import match_style_option_candidates
 from historical_readbacks import (
     VerifiedAttributeHistory,
     normalize_history_field_label,
@@ -63,13 +66,15 @@ def _matched_excel_variants(
     candidates: Tuple[CandidateValue, ...],
     *,
     control_type: str,
+    field_label: str = "",
 ) -> Tuple[Tuple[CandidateValue, ...], ...]:
     """Resolve ordered Excel alternatives against live platform candidates.
 
     For a proven multi-select control, slash separates alternative plans and
     commas separate the values required by one plan.  Thus
     ``秋季，冬季/春秋冬/春秋`` means ``[秋季 + 冬季]`` first, then either
-    one-value fallback.  Single-select controls keep commas inside the label.
+    one-value fallback. Single-select and text controls also try slash-separated
+    alternatives in Excel order, while keeping commas inside each label.
     """
 
     text = str(excel_value or "").strip()
@@ -86,7 +91,11 @@ def _matched_excel_variants(
             if alternative.strip()
         )
     else:
-        raw_variants = ((text,),)
+        raw_variants = tuple(
+            (part.strip(),)
+            for part in re.split(r"[/／]", text)
+            if part.strip()
+        )
 
     matched_variants = []
     for variant in raw_variants:
@@ -97,6 +106,11 @@ def _matched_excel_variants(
                 for candidate in candidates
                 if part in {candidate.value_id, candidate.label}
             )
+            if not found:
+                style_matches = match_style_option_candidates(
+                    field_label, part, tuple(candidate.label for candidate in candidates)
+                )
+                found = tuple(candidates[index] for index in style_matches)
             if len(found) != 1 or found[0] in matched:
                 matched = []
                 break
@@ -331,6 +345,7 @@ class AttributeRuntime:
             request.excel_value,
             request.candidates,
             control_type=request.control_type,
+            field_label=request.field_label,
         )
         exact = matched_excel[0] if matched_excel else ()
         labels = self.verified_history.get((canonical_platform_name(request.platform_id),
@@ -524,6 +539,7 @@ class AttributeRuntime:
             request.excel_value,
             requested_candidates,
             control_type=request.control_type,
+            field_label=request.field_label,
         )
         exact_excel = matched_excel_variants[0] if matched_excel_variants else ()
         historical_labels = self.verified_history.get(
@@ -791,6 +807,51 @@ class AttributeRuntime:
                     snapshot.snapshot_version,
                 ),
             )
+        learning_reason = None
+        learn = getattr(self.client, "review_learning", None)
+        if callable(learn):
+            await self._flush()
+            learned = await asyncio.to_thread(learn, {
+                "product_version": self.product_version, "platform_id": request.platform_id,
+                "category_leaf_id": request.category_leaf_id, "field_id": request.field_id,
+                "snapshot_version": snapshot.snapshot_version,
+                "excel_value": request.excel_value, "control_type": request.control_type,
+            })
+            learning_reason = learned.get("reason_code")
+            if learned.get("status") == "auto_fill_ready":
+                ids = learned.get("value_ids", [])
+                labels = learned.get("value_labels", [])
+                support = learned.get("support_count", 0)
+                rate = learned.get("calibrated_acceptance_rate", 0)
+                valid = (
+                    learned.get("snapshot_version") == snapshot.snapshot_version
+                    and learned.get("source") == "review_learning"
+                    and type(support) is int and support >= (1 if learned.get("same_product") is True else 3)
+                    and type(rate) in (int, float) and math.isfinite(rate) and .95 <= rate <= 1
+                    and isinstance(ids, list) and isinstance(labels, list) and len(ids) == len(labels) > 0
+                    and all(isinstance(v, str) for v in ids + labels)
+                    and len(set(ids)) == len(ids)
+                    and (len(ids) == 1 or request.control_type.casefold() in MULTI_SELECT_CONTROL_TYPES)
+                    and all(sum(c.value_id == ident and c.label == label for c in requested_candidates) == 1
+                            for ident, label in zip(ids, labels))
+                )
+                if valid:
+                    logging.getLogger("kuaimai_erp").info(
+                        "属性“%s”：审核学习命中 %s；独立商品样本 %s，历史一致率 %.1f%%，同商品=%s",
+                        request.field_label, "、".join(labels), support, rate * 100,
+                        learned.get("same_product") is True,
+                    )
+                    return self._remember_resolved(request, ResolvedAttribute(
+                        ",".join(ids), ",".join(labels), "review_learning", snapshot.snapshot_version))
+                learning_reason = "review_learning_invalid_response"
+            logging.getLogger("kuaimai_erp").info(
+                "属性“%s”：审核学习暂不自动填写，原因=%s，独立商品样本=%s，历史一致率=%s",
+                request.field_label, learning_reason, learned.get("support_count", 0),
+                learned.get("calibrated_acceptance_rate", 0),
+            )
+            if learning_reason in {"review_learning_conflict", "review_learning_invalid_response"}:
+                await self._raise_review(request, snapshot, canonical_field, learning_reason)
+                return None
         if canonical_field is None:
             # A platform pass owns an ordered local outbox.  While collecting a
             # batch, enqueue every unmapped field first and drain once at the
@@ -800,7 +861,7 @@ class AttributeRuntime:
             if not self._collecting_platform_id:
                 await self._flush()
             await self._raise_review(
-                request, snapshot, None, "field_mapping_required"
+                request, snapshot, None, learning_reason or "field_mapping_required"
             )
             return None
         await self._flush()

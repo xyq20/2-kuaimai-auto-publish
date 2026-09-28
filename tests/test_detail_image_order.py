@@ -14,7 +14,7 @@ class DetailImageOrderTests(unittest.TestCase):
             "未标题-1-恢复的_10.jpg",
         ]
 
-        ordered = [name for name in sorted(map(Path, names), key=natural_key)]
+        ordered = [path.name for path in sorted(map(Path, names), key=natural_key)]
 
         self.assertEqual(
             ordered,

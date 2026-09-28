@@ -152,6 +152,19 @@ def choose_category_candidate(
     if len(complete) > 1:
         return "", "ambiguous_full_path"
 
+    # Excel slash alternatives keep their authored priority. An exact leaf
+    # match must not lose to a later, longer alternative's specificity score.
+    for wanted in expected:
+        matching = [text for text in paths
+                    if has_gender_root(category_path_parts(text))
+                    and category_path_parts(text)[-1] == wanted]
+        if matching:
+            shortest = min(len(category_path_parts(text)) for text in matching)
+            winners = [text for text in matching if len(category_path_parts(text)) == shortest]
+            if len(winners) == 1:
+                return winners[0], "excel_hint_exact"
+            return "", "ambiguous_hint"
+
     scored = []
     for text in paths:
         parts = category_path_parts(text)
