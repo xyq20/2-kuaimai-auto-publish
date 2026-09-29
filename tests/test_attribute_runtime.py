@@ -8,6 +8,7 @@ from pathlib import Path
 from attribute_runtime import (
     AttributeRequest,
     AttributeRuntime,
+    NO_FILL_VALUE_ID,
     ReviewBatchRequired,
     ReviewRequired,
 )
@@ -59,6 +60,29 @@ def make_length_request(**overrides):
 
 
 class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_fill_is_scoped_to_product_and_platform(self):
+        request = make_length_request()
+        snapshot = CandidateSnapshot(
+            request.platform_id, request.category_leaf_id, request.field_id,
+            request.field_label, request.candidates, request.schema_version,
+            request.custom_allowed,
+        )
+        self.store.save_candidate_snapshot(snapshot)
+        self.store.save_review_resolution(
+            product_version="chosen-product", platform_id=request.platform_id,
+            snapshot_version=snapshot.snapshot_version, review_id="skip-field",
+            final_value_id=NO_FILL_VALUE_ID,
+        )
+        runtime = AttributeRuntime(self.store, FakeClient(), "run", "chosen-product")
+        self.assertTrue(runtime.confirmed_choice(request).is_no_fill)
+        self.assertTrue((await runtime.resolve(request)).is_no_fill)
+        self.assertEqual(runtime.record_verified_readbacks(request.platform_id, {"裤长": "长裤"}), 0)
+        other_product = AttributeRuntime(self.store, FakeClient(), "run", "other-product")
+        self.assertIsNone(other_product.confirmed_choice(request))
+        self.assertIsNone(other_product.reusable_choice(request))
+        other_platform = AttributeRuntime(self.store, FakeClient(), "run", "chosen-product")
+        self.assertIsNone(other_platform.confirmed_choice(replace(request, platform_id="jd")))
+
     async def test_unmapped_field_consults_review_learning_and_validates_confidence(self):
         class ReviewClient(FakeClient):
             support = 3

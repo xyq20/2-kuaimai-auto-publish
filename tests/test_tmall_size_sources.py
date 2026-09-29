@@ -92,6 +92,22 @@ class TmallOptionalImageTests(unittest.TestCase):
 
 
 class TmallSizeSourceResolutionTests(unittest.TestCase):
+    def test_footwear_with_chart_uses_shared_foot_lengths(self):
+        from shoe_size import ShoeMeasurement
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / 'size.png'
+            image.write_bytes(b'fixture')
+            with patch('tmall_size_sources.recognize_shoe_measurements', return_value=(
+                ShoeMeasurement('39', '26.1-26.6'),
+                ShoeMeasurement('40', '26.6-27.1'),
+            )) as recognize:
+                result = tmall_size_sources.resolve_tmall_size_sources(
+                    self._fields('39码/40码'), '鞋靴 > 男鞋 > 皮鞋',
+                    product_dir=Path(directory), size_chart_image=image,
+                )
+            recognize.assert_called_once_with(image, ('39', '40'))
+            self.assertEqual(result.rows[0], {'尺码': '39', '脚长(cm)': '26.1-26.6'})
+
     @staticmethod
     def _fields(sizes: str = "S/M"):
         return parse_tmall_fields({"尺码": sizes})

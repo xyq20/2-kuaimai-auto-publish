@@ -10,6 +10,15 @@ from xhs_form_listing import XhsFormListing, title_without_neigborl
 
 
 class XhsDataTests(unittest.TestCase):
+    def test_shoe_category_rejects_root_only_search_result(self):
+        from xhs_form_listing import XhsFormListingError
+        path = ('流行男鞋', '时尚单鞋', '休闲皮鞋', '正装皮鞋', '男士德比鞋', '皮鞋')
+        with self.assertRaises(XhsFormListingError):
+            XhsFormListing._choose_category_text(('流行男鞋',), path)
+        chosen, _ = XhsFormListing._choose_category_text(
+            ('流行男鞋', '流行男鞋 > 时尚单鞋 > 休闲皮鞋'), path)
+        self.assertEqual(chosen, '流行男鞋 > 时尚单鞋 > 休闲皮鞋')
+
     def test_category_slashes_are_an_ordered_route(self):
         fields = parse_xhs_fields(
             {

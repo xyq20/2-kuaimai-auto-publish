@@ -30,6 +30,11 @@ MULTI_CHOICE_SEPARATORS = r"[,，、;；]"
 EXCEL_ALTERNATIVE_SEPARATORS = r"[,，、;；/／]"
 MULTI_SELECT_CONTROL_TYPES = frozenset({"multi_select", "multi-select", "multiselect"})
 
+# Stored in review_resolutions.final_value_id because that column is NOT NULL.
+# It is scoped by product/platform/snapshot when read back.
+NO_FILL_VALUE_ID = "__NO_FILL__"
+NO_FILL_LABEL = "不填写"
+
 
 def _normalize_choice_text(value: object) -> str:
     return re.sub(r"\s+", "", str(value or "")).casefold()
@@ -140,6 +145,10 @@ class ResolvedAttribute:
     label: str
     source: str
     snapshot_version: str
+
+    @property
+    def is_no_fill(self) -> bool:
+        return self.value_id == NO_FILL_VALUE_ID
 
 
 class ReviewRequired(RuntimeError):
@@ -316,6 +325,10 @@ class AttributeRuntime:
         )
         if value is None:
             return None
+        if value == NO_FILL_VALUE_ID:
+            return ResolvedAttribute(
+                NO_FILL_VALUE_ID, "", "human_no_fill", snapshot.snapshot_version
+            )
         matches = [candidate for candidate in request.candidates
                    if value in (candidate.value_id, candidate.label)]
         if len(matches) == 1:
@@ -396,6 +409,10 @@ class AttributeRuntime:
             canonical_field,
             self.product_version if same_product_only else None,
         )
+        if label == NO_FILL_LABEL or label == NO_FILL_VALUE_ID:
+            return ResolvedAttribute(
+                NO_FILL_VALUE_ID, "", "human_no_fill", snapshot.snapshot_version
+            )
         parts = split_multi_choice(label)
         matches = []
         for part in parts:
@@ -475,6 +492,9 @@ class AttributeRuntime:
             if remembered is None:
                 continue
             request, resolved = remembered
+            if resolved.is_no_fill:
+                # An intentional omission is not a verified platform value.
+                continue
             resolved_ids = split_multi_choice(resolved.value_id)
             is_multi_choice = len(resolved_ids) > 1 and all(
                 sum(
@@ -620,6 +640,13 @@ class AttributeRuntime:
             snapshot_version=snapshot.snapshot_version,
         )
         if confirmed_value is not None:
+            if confirmed_value == NO_FILL_VALUE_ID:
+                return self._remember_resolved(
+                    request,
+                    ResolvedAttribute(
+                        NO_FILL_VALUE_ID, "", "human_no_fill", snapshot.snapshot_version
+                    ),
+                )
             # 审核确认兼容多选：确认值可用逗号分隔多个 valueId/label
             # （如“101,102”或“男,女”）。全部唯一命中候选后按 Excel 同款
             # 逗号语法组合返回，消费端 selection_value_groups 会拆组全选。
@@ -930,6 +957,8 @@ class AttributeRuntime:
 __all__ = [
     "AttributeRequest",
     "AttributeRuntime",
+    "NO_FILL_LABEL",
+    "NO_FILL_VALUE_ID",
     "ResolvedAttribute",
     "ReviewBatchRequired",
     "ReviewRequired",

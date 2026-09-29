@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from local_review.app import create_app
+from attribute_runtime import NO_FILL_VALUE_ID
 from local_review.config import Settings
 from local_review.database import connect, migrate, transaction
 from local_review.security import create_user
@@ -15,6 +16,38 @@ from local_review.service import analyze_product
 
 
 class LocalReviewApiTests(unittest.TestCase):
+    def test_no_fill_requires_claim_and_resumes_only_current_review(self):
+        self.product_and_snapshot()
+        self.event("no-fill-review", "review.created", {
+            "id": "no-fill-review", "run_id": "run-no-fill", "device_id": "mac-1",
+            "product_version": "pv-1", "platform_id": "jd",
+            "category_leaf_id": "straight-pants", "field_id": "length",
+            "field_label": "裤长", "canonical_field": "pant_length",
+            "snapshot_version": "sv-1", "reason_code": "candidate_missing",
+            "evidence_json": {"summary": "manual"},
+        })
+        self.login()
+        headers = {"Origin": "http://testserver"}
+        unclaimed = self.client.post("/api/reviews/no-fill-review/no_fill", headers=headers,
+                                     json={"version": 1})
+        self.assertEqual(unclaimed.status_code, 409)
+        claimed = self.client.post("/api/reviews/no-fill-review/claim", headers=headers,
+                                   json={"version": 1}).json()
+        spoofed = self.client.post("/api/reviews/no-fill-review/confirm", headers=headers,
+                                   json={"version": claimed["version"], "final_value_id": NO_FILL_VALUE_ID})
+        self.assertEqual(spoofed.status_code, 400)
+        accepted = self.client.post("/api/reviews/no-fill-review/no_fill", headers=headers,
+                                    json={"version": claimed["version"]})
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        with connect(self.settings) as connection:
+            decision = connection.execute(
+                "SELECT product_version,platform_id,final_value_id FROM attribute_decisions "
+                "WHERE id IN (SELECT id FROM review_actions WHERE review_id='no-fill-review')"
+            ).fetchone()
+        self.assertEqual(tuple(decision), ("pv-1", "jd", NO_FILL_VALUE_ID))
+        events = self.client.get("/api/device/resume?device_id=mac-1", headers=self.device_headers).json()["events"]
+        self.assertEqual(events[0]["payload"]["final_value_id"], NO_FILL_VALUE_ID)
+
     def test_unmapped_confirmed_review_is_learned_across_platforms_and_invalidation_removes_it(self):
         self.product_and_snapshot()
         for platform, snapshot, ident in [('jd', 'audience-jd', 'old-id'), ('douyin', 'audience-dy', 'new-id')]:

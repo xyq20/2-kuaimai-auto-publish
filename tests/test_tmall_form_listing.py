@@ -57,6 +57,34 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(callable(method), f"TmallFormListing 缺少 {name}")
         return method
 
+    async def test_leather_shoe_top_listing_date_uses_today_not_excel(self):
+        listing = await self._listing("""
+          <div class="el-form-item" id="top-date">
+            <label class="el-form-item__label">* 上市时间</label>
+            <div class="el-form-item__content"><input value="2020-01-01"></div>
+          </div>
+          <div class="sku-batch-item"><div class="el-form-item" id="sku-date">
+            <label class="el-form-item__label">上市时间</label>
+            <div class="el-form-item__content"><input value="2026-08-01"></div>
+          </div></div>
+        """)
+        with patch("tmall_form_listing.shanghai_today", return_value=date(2026, 9, 29)):
+            self.assertIsNone(
+                await listing.fill_leather_shoe_listing_date("男鞋 > 运动鞋")
+            )
+            self.assertEqual(
+                await listing.fill_leather_shoe_listing_date("男鞋 > 休闲皮鞋"),
+                "2026-09-29",
+            )
+        self.assertEqual(
+            await self.page.locator("#top-date input").input_value(),
+            "2026-09-29",
+        )
+        self.assertEqual(
+            await self.page.locator("#sku-date input").input_value(),
+            "2026-08-01",
+        )
+
     async def test_api_field_id_locates_dom_control_before_label_scan(self):
         api_index = SimpleNamespace(
             settle=AsyncMock(),
@@ -974,8 +1002,8 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
                 const values = {
                   price: document.querySelector('#batch-price').value,
                   stock: document.querySelector('#batch-stock').value,
-                  date: document.querySelector('#batch-date').value,
-                  code: document.querySelector('#batch-code').value
+                  date: document.querySelector('#batch-date')?.value,
+                  code: document.querySelector('#batch-code')?.value
                 };
                 for (const input of document.querySelectorAll('tbody input')) {
                   input.value = values[input.dataset.field];
@@ -1004,6 +1032,30 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             report["platform_codes"], ("PLATFORM-S", "PLATFORM-M")
         )
+        await self.page.evaluate('''() => {
+          document.querySelector('[role=tabpanel]').insertAdjacentHTML('afterbegin',
+            '<div class="platform-category-input">流行男鞋 > 休闲皮鞋</div>');
+          document.querySelector('#batch-date').parentElement.remove();
+          document.querySelectorAll('tr').forEach(row => row.children[4].remove());
+          document.querySelector('#batch-code').parentElement.remove();
+          document.querySelectorAll('tr').forEach(row => row.children[4].remove());
+          document.querySelector('.sku-batch-row').insertAdjacentHTML('beforeend',
+            '<div class="sku-batch-item"><span class="sku-batch-item_label">鞋跟高度（cm）</span><input class="el-input__inner" id="heel"></div>');
+          document.querySelector('thead tr').insertAdjacentHTML('beforeend', '<th>鞋跟高度（cm）</th>');
+          document.querySelectorAll('tbody tr').forEach(row => row.insertAdjacentHTML('beforeend','<td><input data-field="heel"></td>'));
+          const previous = window.applyBatch;
+          window.applyBatch = () => {
+            previous();
+            document.querySelectorAll('input[data-field="heel"]').forEach(input => input.value=document.querySelector('#heel').value);
+          };
+        }''')
+        shoe_report = await listing.fill_sku_batch(
+            {"价格": "980", "数量": "100", "货号": "MY018-11", "鞋跟高度（cm）": "5cm/中跟（3.1-5.5cm）"})
+        self.assertTrue(shoe_report['batch_clicked'])
+        self.assertNotIn('上市时间', shoe_report['values'])
+        self.assertNotIn('货号', shoe_report['values'])
+        self.assertEqual(shoe_report['values']['鞋跟高度（cm）'], '5')
+        self.assertEqual(shoe_report['platform_codes'], ('PLATFORM-S', 'PLATFORM-M'))
 
     async def test_shoe_size_cleanup_only_changes_numeric_size_dimension(self):
         listing = await self._listing(
@@ -1070,6 +1122,15 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             ),
             ["38码", "39码"],
         )
+
+    async def test_shoe_identity_does_not_require_clothing_season(self):
+        listing = await self._listing('''
+          <div class="platform-category-input">流行男鞋 > 时尚单鞋 > 休闲皮鞋</div>
+          <div class="el-form-item"><label class="el-form-item__label">货号</label><input></div>
+          <div class="el-form-item"><label class="el-form-item__label">品牌</label><input></div>
+        ''')
+        report = await listing.fill_product_identity({'货号': 'MY018-11', '品牌': 'NEIGBORL'})
+        self.assertEqual(report['values'], {'货号': 'MY018-11', '品牌': 'NEIGBORL'})
 
     async def test_product_identity_preflights_and_fills_exact_excel_values(self):
         listing = await self._listing(
@@ -2006,6 +2067,28 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             await self.page.locator("#real-height").input_value(), "170"
         )
 
+    async def test_shoe_chart_matches_numeric_size_without_changing_page_label(self):
+        listing = await self._listing('''
+          <div class="platform-category-input">流行男鞋 > 休闲皮鞋</div>
+          <div class="wrap-item"><div class="wrap-item_label">尺码表</div>
+            <div class="block-std-size-extends"><div class="el-table">
+              <div class="el-table__header-wrapper"><table><thead><tr>
+                <th>“欧码”尺码</th><th>* 脚长（cm）</th>
+              </tr></thead></table></div>
+              <div class="el-table__body-wrapper"><table><tbody><tr>
+                <td>39码</td><td><input><input></td>
+              </tr></tbody></table></div>
+            </div></div>
+          </div>
+        ''')
+        report = await listing.fill_size_chart(({"尺码": "39", "脚长(cm)": "26.1-26.6"},))
+        self.assertEqual(report['row_count'], 1)
+        self.assertEqual(await self.page.locator('tbody td').first.inner_text(), '39码')
+        self.assertEqual(await self.page.locator('tbody input').evaluate_all('xs=>xs.map(x=>x.value)'), ['26.1', '26.6'])
+        await self.page.locator('tbody input').last.evaluate('node=>node.remove()')
+        report = await listing.fill_size_chart(({"尺码": "39", "脚长(cm)": "26.1-26.6"},))
+        self.assertEqual(await self.page.locator('tbody input').input_value(), '26.1')
+
     async def test_size_chart_matches_required_value_suffix_to_excel_labels(self):
         listing = await self._listing(
             """
@@ -2439,6 +2522,21 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(set(report), {"商品竖图", "透明素材图", "产品参数图片"})
 
+        # Shoe categories have no vertical-image requirement or upload control.
+        await self.page.locator("#vertical").evaluate("node => node.remove()")
+        calls.clear()
+        assets.vertical_image = None
+        report = await listing.sync_required_images(assets, timeout_seconds=2, uploader=uploader)
+        self.assertEqual([call[0] for call in calls], ["transparent", "parameter"])
+        self.assertEqual(set(report), {"透明素材图", "产品参数图片"})
+        await self.page.locator("#parameter").evaluate("node => node.remove()")
+        await self.page.locator('[role=tabpanel]').evaluate('''node => node.insertAdjacentHTML(
+            'afterbegin', '<div class="platform-category-input">流行男鞋 > 休闲皮鞋</div>')''')
+        calls.clear()
+        report = await listing.sync_required_images(assets, timeout_seconds=2, uploader=uploader)
+        self.assertEqual([call[0] for call in calls], ["transparent"])
+        self.assertEqual(set(report), {"透明素材图"})
+
     async def test_inherited_main_images_swap_first_and_third_for_both_tmall_rows(self):
         listing = await self._listing(
             """
@@ -2802,6 +2900,21 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             tuple(value.label for value in runtime.requests[0].candidates),
             ("候选A", "候选B"),
         )
+
+    async def test_new_product_declaration_supports_select(self):
+        listing = await self._listing('''
+          <div class="el-form-item"><label class="el-form-item__label">是否申报新品</label>
+            <div class="el-select"><input class="el-input__inner" readonly onclick="this.nextElementSibling.style.display='block'">
+              <div class="el-select-dropdown" style="display:none"><ul>
+                <li class="el-select-dropdown__item" onclick="choose(this)">否</li>
+                <li class="el-select-dropdown__item" onclick="choose(this)">是</li>
+              </ul></div>
+            </div>
+          </div>
+          <script>function choose(el){const root=el.closest('.el-select');root.querySelector('input').value=el.textContent;root.querySelector('.el-select-dropdown').style.display='none';}</script>
+        ''')
+        self.assertEqual(await listing.fill_new_product_declaration(), '是')
+        self.assertEqual(await self.page.locator('.el-select input').input_value(), '是')
 
     async def test_new_product_declaration_is_yes_only_when_field_exists(self):
         listing = await self._listing(

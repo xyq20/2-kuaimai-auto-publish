@@ -4,11 +4,53 @@ from category_profile import (
     category_profile,
     category_search_terms,
     choose_category_candidate,
+    is_footwear_category,
+    is_leather_shoe_category,
     preferred_category_leaf,
 )
 
 
 class CategoryProfileTests(unittest.TestCase):
+    def test_shoe_family_and_leather_leaf_are_distinct(self):
+        for path in ('鞋靴 > 男鞋 > 皮鞋', '流行男鞋 > 时尚单鞋 > 正装皮鞋'):
+            self.assertTrue(is_footwear_category(path))
+            self.assertTrue(is_leather_shoe_category(path))
+        self.assertTrue(is_footwear_category('男鞋 > 运动鞋'))
+        self.assertFalse(is_leather_shoe_category('男鞋 > 运动鞋'))
+        self.assertFalse(is_footwear_category('鞋类配件 > 鞋垫'))
+
+    def test_shoe_full_path_alternative_matches_taobao_male_shoe_root(self):
+        self.assertEqual(choose_category_candidate(
+            ('流行男鞋 > 时尚单鞋 > 休闲皮鞋', '女鞋 > 休闲皮鞋'),
+            ('流行男鞋 > 时尚单鞋 >休闲皮鞋', '正装皮鞋', '男士德比鞋', '皮鞋'),
+        )[0], '流行男鞋 > 时尚单鞋 > 休闲皮鞋')
+    def test_leather_shoe_matches_current_excel_and_douyin_predictions(self):
+        hints = (
+            "流行男鞋 > 时尚单鞋 >休闲皮鞋", "正装皮鞋", "男士德比鞋", "皮鞋"
+        )
+        candidates = (
+            "鞋靴 > 男鞋 > 皮鞋", "鞋靴 > 男鞋 > 单鞋", "鞋靴 > 男鞋 > 休闲鞋"
+        )
+        self.assertEqual(
+            choose_category_candidate(candidates, hints),
+            (candidates[0], "excel_hint_exact"),
+        )
+
+    def test_shoe_gender_matches_and_rejects_opposite_branch(self):
+        for gender, opposite, person in (("男鞋", "女鞋", "男士"),):
+            correct = f"鞋靴 > {gender} > 皮鞋"
+            wrong = f"鞋靴 > {opposite} > 皮鞋"
+            for hint in (gender, person):
+                with self.subTest(gender=gender, hint=hint):
+                    self.assertEqual(
+                        choose_category_candidate((wrong, correct), (hint, "皮鞋"))[0],
+                        correct,
+                    )
+                    self.assertEqual(
+                        choose_category_candidate((wrong,), (hint, "皮鞋")),
+                        ("", ""),
+                    )
+
     def test_category_alternatives_keep_excel_order(self):
         hints = ("卫衣", "打底衫", "男士套头卫衣", "套头卫衣")
         self.assertEqual(choose_category_candidate(

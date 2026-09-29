@@ -20,6 +20,7 @@ from size_image_recognition import (
 )
 from tmall_data import IMAGE_SUFFIXES, TmallFields
 from tmall_rules import TmallRuleError, normalize_tmall_spec_values
+from shoe_size import recognize_shoe_measurements
 
 
 CATEGORY_PANTS = "pants"
@@ -259,7 +260,15 @@ def resolve_tmall_size_sources(
         except TmallRuleError as error:
             raise TmallSizeSourceError(str(error)) from error
 
-    if category_kind == CATEGORY_PANTS:
+    if category_kind == CATEGORY_FOOTWEAR and size_chart_image is not None:
+        try:
+            recognized = recognize_shoe_measurements(_required_size_chart(size_chart_image), sizes)
+        except RecognitionError as error:
+            raise TmallSizeSourceError(str(error)) from error
+        headers = ("尺码", "脚长(cm)")
+        rows = tuple({"尺码": item.size, "脚长(cm)": item.foot_length} for item in recognized)
+        evidence = ("excel:尺码", "ocr:尺码信息表")
+    elif category_kind == CATEGORY_PANTS:
         size_chart = _required_size_chart(size_chart_image)
         height_weight = discover_height_weight_image(product_dir)
         if height_weight is None:

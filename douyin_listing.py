@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest, split_multi_choice
 from field_policies import listing_date_text_value, positional_listing_date_value
-from category_profile import choose_category_candidate
+from category_profile import choose_category_candidate, is_leather_shoe_category
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from platform_candidate_source import (
@@ -1305,7 +1305,7 @@ class DouyinListing:
                 control_type="multi_select" if multi else "select",
             )
         )
-        if resolved is None:
+        if resolved is None or getattr(resolved, "is_no_fill", False):
             return None
         return resolved.label, api_options
 
@@ -1362,7 +1362,7 @@ class DouyinListing:
                 control_type="text",
             )
         )
-        if resolved is None:
+        if resolved is None or getattr(resolved, "is_no_fill", False):
             return None
         return resolved.label
 
@@ -1437,7 +1437,15 @@ class DouyinListing:
                 "' el-form-item__label ')]"
             )
             if await label.count():
-                await label.first.click(force=True, timeout=2000)
+                # 下拉浮层可能盖住标签。force 坐标点击会落到浮层候选上，
+                # 把刚选中的多选值再次点击取消；直接向标签发送外部点击链。
+                await label.first.evaluate("""element => {
+                  for (const type of ['mousedown', 'mouseup', 'click']) {
+                    element.dispatchEvent(new MouseEvent(type, {
+                      bubbles: true, cancelable: true, view: window
+                    }));
+                  }
+                }""")
         if await self.page.locator(".el-select-dropdown:visible").count():
             # Element UI 的可搜索多选在输入组合事件后偶尔不响应
             # Escape；向 body 派发一次真实的外部点击事件链，只收起
@@ -1944,6 +1952,8 @@ class DouyinListing:
             if self.logger is not None:
                 self.logger.info("抖音属性“%s”：候选点击完成", label)
 
+        if multi:
+            await self._dismiss_select_dropdown(select)
         actual = await self._read_select_values(select, multi=multi)
         expected_counter = Counter(
             normalize_option(value)
@@ -1954,8 +1964,6 @@ class DouyinListing:
             raise DouyinListingError(
                 f"属性选择后校验失败：期望 {list(expected_values)!r}，页面为 {list(actual)!r}"
             )
-        if multi:
-            await self._dismiss_select_dropdown(select)
         if self.logger is not None:
             self.logger.info("抖音属性“%s”：回读完成", label)
         return actual
@@ -2472,6 +2480,32 @@ class DouyinListing:
                 continue
         raise DouyinListingError("面料材质行中找不到百分比输入框")
 
+    async def apply_materials_if_present(
+        self,
+        materials: Sequence[Any],
+        wash_label_paths: Sequence[Path],
+        source_text: Optional[str] = None,
+    ) -> Tuple[Tuple[str, int], ...]:
+        if self.panel is None:
+            raise DouyinListingError("抖音资料面板尚未打开")
+        labels = self.panel.locator(".el-form-item__label")
+        visible = []
+        for index in range(await labels.count()):
+            label = labels.nth(index)
+            if await label.is_visible() and _normalize_label(
+                await label.inner_text()
+            ) == _normalize_label("面料材质"):
+                visible.append(label)
+        if not visible:
+            if self.logger is not None:
+                self.logger.info("当前抖音类目无面料材质组件，跳过面料材质和水洗标填写")
+            return ()
+        if len(visible) != 1:
+            raise DouyinListingError(f"抖音面料材质字段匹配数为 {len(visible)}")
+        if not materials:
+            raise DouyinListingError("当前抖音类目有面料材质组件，但 Excel 缺少面料材质")
+        return await self.apply_materials(materials, wash_label_paths, source_text)
+
     async def apply_materials(
         self,
         materials: Sequence[Any],
@@ -2933,6 +2967,145 @@ class DouyinListing:
             raise DouyinListingError(f"尺码识别结果缺少页面字段“{label}”")
         return _form_number(getattr(item, attribute))
 
+    async def _remove_empty_renamed_shoe_rows(self, table: Any, expected: Mapping[str, str]) -> None:
+        """仅清理有对应纯数字行的空白旧“码”行，不删除商品规格。"""
+        from shoe_size import shoe_size
+
+        rows = table.locator(':scope > .el-table__body-wrapper tbody > tr')
+        groups = {}
+        for index in range(await rows.count()):
+            cells = rows.nth(index).locator(':scope > td')
+            size_input = cells.first.locator('input')
+            raw = (await size_input.first.input_value() if await size_input.count()
+                   else await cells.first.inner_text()).strip()
+            size = shoe_size(raw)
+            inputs = rows.nth(index).locator('td:not(:first-child) input')
+            values = [await inputs.nth(i).input_value() for i in range(await inputs.count())]
+            groups.setdefault(size, []).append((index, raw, values))
+        if set(groups) != set(expected):
+            raise DouyinListingError(f"鞋类尺码表与图片不一致：页面 {list(groups)}，图片 {list(expected)}")
+        stale = []
+        for size, entries in groups.items():
+            if len(entries) == 1:
+                continue
+            old = [e for e in entries if e[1] == size + '码']
+            new = [e for e in entries if e[1] == size]
+            if len(entries) != 2 or len(old) != 1 or len(new) != 1:
+                raise DouyinListingError(f"鞋码 {size} 的脚长行重复，不能自动清理")
+            if not old[0][2] or any(v.strip() for v in old[0][2]):
+                raise DouyinListingError(f"旧鞋码 {size}码 行含测量数据，不能自动删除")
+            stale.append(old[0])
+        # 预检整张表后倒序删除，避免行索引随删除漂移。
+        for index, raw, _values in sorted(stale, reverse=True):
+            button = rows.nth(index).get_by_role('button', name='删除', exact=True)
+            if await button.count() != 1 or not await button.is_visible():
+                fixed_rows = table.locator(':scope > .el-table__fixed-right .el-table__fixed-body-wrapper tbody > tr')
+                button = fixed_rows.nth(index).get_by_role('button', name='删除', exact=True)
+            if await button.count() != 1 or not await button.is_enabled():
+                raise DouyinListingError(f"旧鞋码 {raw} 找不到可用的删除按钮")
+            count = await rows.count()
+            await button.click()
+            deadline = asyncio.get_running_loop().time() + 3
+            while await rows.count() != count - 1:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise DouyinListingError(f"旧鞋码 {raw} 删除后行数未更新")
+                await asyncio.sleep(.05)
+            if self.logger is not None:
+                self.logger.info("已清理鞋码改名产生的空白旧尺码表行：%s", raw)
+
+    async def fill_shoe_sizes(self, measurements: Sequence[Any]) -> Mapping[str, str]:
+        """先提交纯数字鞋码候选，再按鞋码填写脚长；不增删规格。"""
+        from shoe_size import shoe_size
+
+        if self.panel is None:
+            raise DouyinListingError("抖音资料面板尚未打开")
+        expected = {shoe_size(item.size): item.foot_length for item in measurements}
+        if not expected or len(expected) != len(measurements):
+            raise DouyinListingError("鞋类尺码图为空或有重复鞋码")
+        titles = self.panel.locator('.block-specification .title-bg')
+        matches = []
+        for index in range(await titles.count()):
+            title = titles.nth(index)
+            if not await title.is_visible():
+                continue
+            name = title.locator('input').first
+            if await name.count() and (await name.input_value()).strip() in {"鞋码大小", "鞋码", "尺码"}:
+                # 一个 block-specification 内可同时包含颜色、鞋码等多组；
+                # 只取当前标题同级的规格值区域，不能取整个外层容器。
+                values = title.locator('xpath=..').locator(':scope > .specification-value')
+                if await values.count() != 1:
+                    raise DouyinListingError("鞋码规格标题旁找不到唯一规格值区域")
+                matches.append(values)
+        if len(matches) != 1:
+            raise DouyinListingError(f"鞋码规格区域匹配数为 {len(matches)}")
+        selects = matches[0].locator('.specification-value-flex_item .el-select')
+        current = [shoe_size(await selects.nth(i).locator('input.el-input__inner').input_value())
+                   for i in range(await selects.count())]
+        if len(set(current)) != len(current) or set(current) != set(expected):
+            raise DouyinListingError(f"鞋码规格与尺码图不一致：页面 {current}，图片 {list(expected)}")
+        for index, size in enumerate(current):
+            select = selects.nth(index)
+            await select.scroll_into_view_if_needed()
+            input_box = select.locator('input.el-input__inner').first
+            await input_box.click()
+            # 规格搜索依赖键盘事件，fill 只改变文本时可能仍显示旧候选。
+            await input_box.press('ControlOrMeta+A')
+            await input_box.press('Backspace')
+            await input_box.press_sequentially(size, delay=120)
+            deadline = asyncio.get_running_loop().time() + 10
+            while True:
+                dropdown = await self._active_select_dropdown(select)
+                options = dropdown.locator('.el-select-dropdown__item').filter(
+                    has_text=re.compile(rf'^\s*{re.escape(size)}\s*$')
+                ) if dropdown is not None else None
+                if options is not None and await options.count() == 1 and await options.first.is_visible():
+                    await options.first.click()
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise DouyinListingError(f"鞋码 {size} 搜索后没有唯一的纯数字候选")
+                await asyncio.sleep(.1)
+            await input_box.press('Tab')
+            if (await input_box.input_value()).strip() != size:
+                raise DouyinListingError(f"鞋码 {size} 选择后回读不一致")
+            if self.logger is not None:
+                self.logger.info("抖音鞋码规格已搜索并选择纯数字候选：%s", size)
+        # 规格更新可能重绘尺码表，等待整张表的鞋码和控件都就绪。
+        deadline = asyncio.get_running_loop().time() + 10
+        while True:
+            tables = self.panel.locator('.el-table').filter(has_text='脚长(cm)')
+            visible = [tables.nth(i) for i in range(await tables.count()) if await tables.nth(i).is_visible()]
+            controls = {}
+            if len(visible) == 1:
+                table = visible[0]
+                await self._remove_empty_renamed_shoe_rows(table, expected)
+                headers = table.locator(':scope > .el-table__header-wrapper thead th')
+                columns = [i for i in range(await headers.count()) if '脚长(cm)' in await headers.nth(i).inner_text()]
+                rows = table.locator(':scope > .el-table__body-wrapper tbody > tr')
+                if len(columns) == 1:
+                    for i in range(await rows.count()):
+                        cells = rows.nth(i).locator(':scope > td')
+                        first = cells.first
+                        size_input = first.locator('input')
+                        raw = await size_input.first.input_value() if await size_input.count() else await first.inner_text()
+                        size = shoe_size(raw)
+                        control = cells.nth(columns[0]).locator('input')
+                        if size in controls or await control.count() != 1:
+                            raise DouyinListingError(f"鞋码 {size} 的脚长行重复或控件不唯一")
+                        controls[size] = control.first
+            if set(controls) == set(expected):
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise DouyinListingError(f"鞋类尺码表与图片不一致：页面 {list(controls)}，图片 {list(expected)}")
+            await asyncio.sleep(.1)
+        for size, control in controls.items():
+            await control.fill(expected[size])
+            await control.press('Tab')
+            if (await control.input_value()).strip() != expected[size]:
+                raise DouyinListingError(f"鞋码 {size} 的脚长填写后回读失败")
+            if self.logger is not None:
+                self.logger.info("抖音鞋码 %s 脚长已填写并回读：%s cm", size, expected[size])
+        return expected
+
     async def fill_size_recommendations(
         self,
         recommendations: Sequence[Any],
@@ -3133,6 +3306,35 @@ class DouyinListing:
         for value in values:
             await self._ensure_toggle_checked(section, value)
         return values
+
+    async def apply_leather_shoe_warranty(self, category: str) -> Optional[str]:
+        if not is_leather_shoe_category(category):
+            return None
+        if self.panel is None:
+            raise DouyinListingError("请先调用 open() 打开抖音资料")
+        await self._ensure_toggle_checked(self.panel, "保修期内提供维修（寄修）")
+
+        labels = self.panel.locator(".el-form-item > .el-form-item__label")
+        matches = []
+        for index in range(await labels.count()):
+            label = labels.nth(index)
+            if await label.is_visible() and _normalize_label(
+                await label.inner_text()
+            ) == _normalize_label("选择保修天数"):
+                matches.append(label.locator("xpath=.."))
+        if len(matches) != 1:
+            raise DouyinListingError(
+                f"抖音皮鞋“选择保修天数”字段匹配数为 {len(matches)}"
+            )
+        selects = matches[0].locator(".el-select")
+        if await selects.count() != 1:
+            raise DouyinListingError("抖音皮鞋保修天数下拉框不唯一")
+        actual = await self._select_values(
+            selects.first, ("90天",), label="选择保修天数", multi=False
+        )
+        if actual != ("90天",):
+            raise DouyinListingError(f"抖音皮鞋保修天数回读失败：{actual!r}")
+        return actual[0]
 
     async def _sku_header_label(self, header: Any) -> str:
         cell = header.locator(":scope > .cell")

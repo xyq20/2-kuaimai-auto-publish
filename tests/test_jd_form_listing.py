@@ -20,6 +20,7 @@ from jd_form_listing import (
     JdFormListing,
     JdFormListingError,
     _category_parts,
+    _jd_category_matches,
     classify_image_indices_by_color,
     _expand_cascader_candidates,
     _kilograms,
@@ -35,6 +36,13 @@ from taobao_listing import parse_taobao_materials, selection_value_groups
 
 
 class JdFormListingHelperTests(unittest.TestCase):
+    def test_mens_shoe_current_category_accepts_excel_alternative(self):
+        hints, target = jd_category_target({"商品分类": "流行男鞋 > 时尚单鞋 >休闲皮鞋/正装皮鞋/男士德比鞋/皮鞋"})
+        self.assertTrue(_jd_category_matches("鞋靴 > 流行男鞋 > 男士商务/正装皮鞋", hints, target))
+        self.assertFalse(_jd_category_matches("鞋靴 > 时尚女鞋 > 正装皮鞋", hints, target))
+        self.assertFalse(_jd_category_matches("鞋靴 > 流行男鞋 > 男士凉鞋", hints, target))
+        self.assertFalse(_jd_category_matches("鞋靴 > 流行男鞋", hints, target))
+
     def test_numeric_equal(self):
         self.assertTrue(_numeric_equal("100", "100"))
         self.assertTrue(_numeric_equal("100.00", "100"))
@@ -561,6 +569,25 @@ CATEGORY_POPOVER_FIXTURE = """
 
 
 class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
+    async def test_heel_height_uses_first_matching_excel_alternative(self):
+        await self.page.set_content('<div class="el-form-item"><div class="el-form-item__content"><div class="el-select"><input readonly></div></div></div>')
+        listing = JdFormListing(self.page, self.page.locator('body'), None)
+        listing._captured_api_field_definition = AsyncMock(return_value=SimpleNamespace(option_values=[SimpleNamespace(label=value) for value in ('低跟(1.1-3cm)', '中跟(3.1-5.5cm)', '高跟(5.6-8cm)')]))
+        listing._resolve_learning_select_value = AsyncMock(side_effect=lambda label, select, desired: desired)
+        listing._select_values = AsyncMock(return_value=('中跟(3.1-5.5cm)',))
+        actual = await listing._fill_attribute_item('鞋跟高度', self.page.locator('.el-form-item'), '中跟/中跟（3cm-5cm）', required=True)
+        self.assertEqual(actual, ('中跟(3.1-5.5cm)',))
+        self.assertEqual(listing._resolve_learning_select_value.await_args.args[2], '中跟(3.1-5.5cm)')
+
+    async def test_shoe_material_falls_back_to_other_after_excel_miss(self):
+        await self.page.set_content('<div class="el-form-item"><div class="el-form-item__content"><div class="el-select"><input readonly></div></div></div>')
+        listing = JdFormListing(self.page, self.page.locator('body'), None)
+        listing._resolve_learning_select_value = AsyncMock(return_value='反绒皮/反毛皮')
+        listing._select_values = AsyncMock(side_effect=[None, ('其他',)])
+        actual = await listing._fill_attribute_item('鞋面材质', self.page.locator('.el-form-item'), '反绒皮/反毛皮', required=True)
+        self.assertEqual(actual, ('其他',))
+        self.assertEqual(listing._select_values.await_args.args[1], (('其他', '其它'),))
+
     async def test_fabric_cotton_replaces_other_with_numeric_cotton_cloth(self):
         # Same competing cotton names and numeric IDs as the reported JD log.
         options = [
@@ -2024,6 +2051,20 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         report = await listing.apply_sku_thickness()
         self.assertEqual(report["厚度"], "常规")
         self.assertTrue(await self.page.evaluate("window.skuAttributesRefreshed"))
+
+    async def test_mens_shoe_sku_uses_lining_instead_of_clothing_thickness(self):
+        fixture = SKU_ATTRIBUTE_HEADER_FIXTURE.replace('>厚度<', '>内里材质<').replace('id="thickness-item" class="el-form-item" style="display:none"', 'id="thickness-item" class="el-form-item"')
+        listing = await self._open(fixture)
+        report = await listing.apply_sku_thickness({'商品分类': '流行男鞋/正装皮鞋', '鞋面内里材质': '马皮'})
+        self.assertEqual(report, {'内里材质': '马皮'})
+        self.assertFalse(await self.page.evaluate('window.skuAttributesRefreshed'))
+        self.assertFalse(await self.page.locator('#sku-dialog').is_visible())
+
+    async def test_mens_shoe_sku_refreshes_initially_empty_dialog(self):
+        listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE.replace('>厚度<', '>内里材质<'))
+        report = await listing.apply_sku_thickness({'商品分类': '流行男鞋/正装皮鞋', '鞋面内里材质': '马皮'})
+        self.assertEqual(report, {'内里材质': '马皮'})
+        self.assertTrue(await self.page.evaluate('window.skuAttributesRefreshed'))
 
     async def test_category_candidate_can_be_in_teleported_search_popover(self):
         await self.page.set_content(CATEGORY_POPOVER_FIXTURE)

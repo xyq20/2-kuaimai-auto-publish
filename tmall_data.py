@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 IMAGE_SUFFIXES = frozenset(
@@ -52,7 +52,7 @@ class TmallFields:
 
 @dataclass(frozen=True)
 class TmallAssets:
-    vertical_image: Path
+    vertical_image: Optional[Path]
     transparent_image: Path
     parameter_image: Path
 
@@ -107,9 +107,9 @@ def _first_asset_directory(
     )
 
 
-def read_tmall_assets(product_dir: Path) -> TmallAssets:
+def read_tmall_assets(product_dir: Path, *, garment_kind: str = "clothing") -> TmallAssets:
     product_dir = Path(product_dir)
-    vertical_dir = _first_asset_directory(
+    vertical_dir = None if garment_kind == "footwear" else _first_asset_directory(
         product_dir,
         ("2:3", "2：3", "2:3图", "2：3图"),
         "2:3",
@@ -122,7 +122,7 @@ def read_tmall_assets(product_dir: Path) -> TmallAssets:
             "1:1透明素材",
         )
     return TmallAssets(
-        vertical_image=_exactly_one_image(vertical_dir, "2:3"),
+        vertical_image=_exactly_one_image(vertical_dir, "2:3") if vertical_dir else None,
         transparent_image=_exactly_one_image(transparent_dir, "1:1透明素材"),
         parameter_image=_exactly_one_image(product_dir / "尺码信息表", "尺码信息表"),
     )

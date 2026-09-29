@@ -21,6 +21,10 @@ class YouzanDataTests(unittest.TestCase):
         self.assertEqual(parsed.fields["数量"], "100")
         self.assertEqual(parsed.garment_kind, "pants")
 
+    def test_classifies_shoes_separately_from_clothing(self):
+        parsed = parse_youzan_fields({"商品分类": "流行男鞋 > 时尚单鞋 > 休闲皮鞋/正装皮鞋"})
+        self.assertEqual(parsed.garment_kind, "footwear")
+
     def test_classifies_coat_and_preserves_unknown_kind(self):
         coat = parse_youzan_fields({"商品分类": "男装/外套/皮衣"})
         self.assertEqual(coat.garment_kind, "coat")

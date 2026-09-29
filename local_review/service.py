@@ -16,6 +16,7 @@ from platform_registry import platforms_equivalent
 
 from .config import Settings
 from .database import canonical_json, connect, transaction, utc_now
+from attribute_runtime import NO_FILL_VALUE_ID
 
 
 class ApiError(RuntimeError):
@@ -1027,6 +1028,10 @@ def decide_review_learning(settings: Settings, data: Any) -> dict[str, Any]:
                 continue
             old_options = json.loads(row['options_json'])
             final = row['final_value_id']
+            if final == NO_FILL_VALUE_ID:
+                # “不填写” is scoped to the reviewed product/platform and is
+                # never training evidence for another product.
+                continue
             whole = [v for v in old_options if final in (v['value_id'], v['label'])]
             parts = [final] if len(whole) == 1 else re.split(r'[,，、;；]', final)
             labels = []

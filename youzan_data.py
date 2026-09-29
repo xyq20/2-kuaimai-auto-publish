@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from category_profile import is_footwear_category
+
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -103,7 +105,9 @@ def parse_youzan_fields(fields: Mapping[str, Any]) -> YouzanFields:
     has_pants = "裤" in category_text
     has_coat = any(token in category_text for token in ("外套", "皮衣"))
     garment_kind = (
-        "pants"
+        "footwear"
+        if is_footwear_category(category_text)
+        else "pants"
         if has_pants and not has_coat
         else "coat"
         if has_coat and not has_pants

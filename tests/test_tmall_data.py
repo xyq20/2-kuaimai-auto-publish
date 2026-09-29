@@ -48,6 +48,16 @@ class TmallFieldsTests(unittest.TestCase):
 
 
 class TmallAssetsTests(unittest.TestCase):
+    def test_footwear_does_not_require_vertical_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._image(root / "透明素材图")
+            self._image(root / "尺码信息表")
+            result = tmall_data.read_tmall_assets(root, garment_kind="footwear")
+            self.assertIsNone(result.vertical_image)
+            with self.assertRaises(tmall_data.TmallDataError):
+                tmall_data.read_tmall_assets(root)
+
     @staticmethod
     def _image(directory: Path, name: str = "1.jpg") -> Path:
         directory.mkdir(parents=True, exist_ok=True)

@@ -113,6 +113,8 @@ async def _sync_store(adapter, shop, select, alternatives, read_only, verified=N
         )
         runtime = adapter.attribute_runtime
         confirmed = runtime.confirmed_choice(request) if runtime is not None else None
+        if confirmed is not None and getattr(confirmed, "is_no_fill", False):
+            return {"status": "no_fill", "schema_version": request.schema_version}
         if read_only and verified is not None:
             if verified.get("status") != "verified" or not verified.get("value"):
                 raise TaobaoListingError("保存前运费尚未确认，不应进入成功回读")

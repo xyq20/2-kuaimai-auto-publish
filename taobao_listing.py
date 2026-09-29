@@ -576,7 +576,12 @@ class TaobaoListing:
                   const text = clean(element.innerText || element.textContent);
                   const sameChild = text && Array.from(element.querySelectorAll('*'))
                     .some(child => clean(child.innerText || child.textContent) === text);
-                  return {index, text, sameChild};
+                  const containsPathRow = Array.from(element.querySelectorAll('*'))
+                    .some(child => {
+                      const part = clean(child.innerText || child.textContent);
+                      return part && part !== text && /[>＞]/.test(part);
+                    });
+                  return {index, text, sameChild, containsPathRow};
                 })"""
             )
         except Exception:
@@ -586,7 +591,7 @@ class TaobaoListing:
         for snapshot in snapshots:
             text = str(snapshot.get("text") or "")
             normalized = self._normalize_category_path(text)
-            if not text or not normalized or snapshot.get("sameChild") or normalized in seen:
+            if not text or not normalized or snapshot.get("sameChild") or snapshot.get("containsPathRow") or normalized in seen:
                 continue
             seen.add(normalized)
             result.append((text, nodes.nth(int(snapshot["index"]))))
@@ -2114,7 +2119,7 @@ class TaobaoListing:
                     control_type="select",
                 )
             )
-            if resolved is None:
+            if resolved is None or getattr(resolved, "is_no_fill", False):
                 return ()
             resolved_values.append(resolved.label)
         return tuple(resolved_values)
@@ -2854,8 +2859,11 @@ class TaobaoListing:
         page_items = without_color_attributes(await self._attribute_items())
         source_fields = fields.fields
         assignments = await self._build_assignments(source_fields, page_items)
-        materials = parse_taobao_materials(source_fields)
-        fabrics = parse_taobao_fabrics(source_fields)
+        page_labels = {label.split("#", 1)[0] for label in page_items}
+        materials = (parse_taobao_materials(source_fields)
+                     if normalize_label("材质成分") in page_labels else ())
+        fabrics = (parse_taobao_fabrics(source_fields)
+                   if normalize_label("面料") in page_labels else ())
 
         applied: Dict[str, Tuple[str, ...]] = {}
         skipped_values: Dict[str, str] = {}
@@ -3018,20 +3026,29 @@ class TaobaoListing:
         garment_kind: str,
         recommendations: Sequence[Any] = (),
     ) -> Mapping[str, Any]:
-        """按尺码文本填写淘宝尺码表中的衣长或裤长。"""
-        if garment_kind not in {"pants", "clothing"}:
+        """按尺码填写衣长、裤长或脚长；区间值分别写入上下限。"""
+        if garment_kind not in {"pants", "clothing", "footwear"}:
             raise TaobaoListingError(f"不支持的淘宝尺码类型：{garment_kind!r}")
-        field_label = "裤长（cm）" if garment_kind == "pants" else "衣长（cm）"
+        field_label = {"pants": "裤长（cm）", "clothing": "衣长（cm）", "footwear": "脚长（cm）"}[garment_kind]
+        def normalize_chart_size(value):
+            if garment_kind == "footwear":
+                from shoe_size import shoe_size
+                from size_image_recognition import RecognitionError
+                try:
+                    return shoe_size(value)
+                except RecognitionError:
+                    return None
+            return normalize_size_name(value)
         by_size: Dict[str, str] = {}
         for item in lengths:
-            size = normalize_size_name(getattr(item, "size", None))
+            size = normalize_chart_size(getattr(item, "size", None))
             if size is None:
                 raise TaobaoListingError(
                     f"淘宝尺码表识别结果包含无效尺码：{getattr(item, 'size', None)!r}"
                 )
             if size in by_size:
                 raise TaobaoListingError(f"淘宝尺码表识别结果包含重复尺码：{size}")
-            by_size[size] = form_number(getattr(item, "length", None))
+            by_size[size] = form_number(getattr(item, "foot_length" if garment_kind == "footwear" else "length", None))
         if not by_size:
             raise TaobaoListingError("淘宝尺码表识别结果为空")
 
@@ -3141,7 +3158,7 @@ class TaobaoListing:
                     if await cells.count() <= column_index:
                         valid = False
                         break
-                    value = normalize_size_name(
+                    value = normalize_chart_size(
                         await cells.nth(column_index).inner_text()
                     )
                     if value is None:
@@ -3176,7 +3193,7 @@ class TaobaoListing:
                         if await cells.count() <= column_index:
                             valid = False
                             break
-                        value = normalize_size_name(
+                        value = normalize_chart_size(
                             await cells.nth(column_index).inner_text()
                         )
                         if value is None:
@@ -3210,7 +3227,7 @@ class TaobaoListing:
             if fixed_row_sizes:
                 size = fixed_row_sizes[index]
             else:
-                size = normalize_size_name(
+                size = normalize_chart_size(
                     await cells.nth(size_indexes[0]).inner_text()
                 )
             if size is None:
@@ -3225,27 +3242,58 @@ class TaobaoListing:
                 f"淘宝尺码表尺码不一致：缺少 {missing!r}，多出 {extra!r}"
             )
 
+        bounds_by_size = {}
+        if garment_kind == "footwear":
+            for size, expected in by_size.items():
+                match = re.fullmatch(r"(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)", expected)
+                if match:
+                    bounds_by_size[size] = match.groups()
+            if bounds_by_size:
+                first_inputs = next(iter(page_rows.values())).locator(
+                    ":scope > td"
+                ).nth(value_indexes[0]).locator('input:not([readonly]):not([disabled])')
+                if await first_inputs.count() == 1:
+                    toggles = headers.nth(value_indexes[0]).get_by_text("区间", exact=False)
+                    visible = [toggles.nth(i) for i in range(await toggles.count())
+                               if await toggles.nth(i).is_visible()]
+                    if len(visible) != 1:
+                        raise TaobaoListingError(f"淘宝“{field_label}”无法切换区间模式，不能填写脚长上下限")
+                    await visible[0].click(timeout=10_000)
+                    deadline = asyncio.get_running_loop().time() + 3
+                    while await first_inputs.count() != 2 and asyncio.get_running_loop().time() < deadline:
+                        await asyncio.sleep(0.05)
+                # Validate every row before writing either bound.
+                for size, row in page_rows.items():
+                    inputs = row.locator(":scope > td").nth(value_indexes[0]).locator(
+                        'input:not([readonly]):not([disabled])'
+                    )
+                    if await inputs.count() != 2:
+                        raise TaobaoListingError(f"淘宝尺码 {size} 的“{field_label}”区间输入框未就绪")
+                self.logger.info("淘宝尺码表“%s”已确认区间模式，分别填写上下限", field_label)
+
         actual: Dict[str, str] = {}
         for size, row in page_rows.items():
             cells = row.locator(":scope > td")
             inputs = cells.nth(value_indexes[0]).locator(
                 'input:not([readonly]):not([disabled])'
             )
-            if await inputs.count() != 1:
+            expected = by_size[size]
+            parts = bounds_by_size.get(size, (expected, expected)) if bounds_by_size else (expected,)
+            if await inputs.count() != len(parts):
                 raise TaobaoListingError(
                     f"淘宝尺码 {size} 的“{field_label}”输入框不唯一"
                 )
-            control = inputs.first
-            expected = by_size[size]
-            if (await control.input_value()).strip() != expected:
-                await control.fill(expected)
-                await control.press("Tab")
-            value = (await control.input_value()).strip()
-            if value != expected:
+            for input_index, part in enumerate(parts):
+                control = inputs.nth(input_index)
+                if (await control.input_value()).strip() != part:
+                    await control.fill(part)
+                    await control.press("Tab")
+            values = [(await inputs.nth(i).input_value()).strip() for i in range(len(parts))]
+            if tuple(values) != tuple(parts):
                 raise TaobaoListingError(
-                    f"淘宝尺码 {size} 的“{field_label}”回读失败：{value!r}"
+                    f"淘宝尺码 {size} 的“{field_label}”回读失败：期望 {parts!r}，实际 {values!r}"
                 )
-            actual[size] = value
+            actual[size] = expected
         unresolved_required = await self._review_empty_required_size_cells(
             table,
             header_texts,
@@ -3516,7 +3564,7 @@ class TaobaoListing:
                             control_type="input",
                         )
                     )
-                    if resolved is None:
+                    if resolved is None or getattr(resolved, "is_no_fill", False):
                         unresolved.append(field_label)
                         continue
                     await control.fill(resolved.label)
@@ -4285,7 +4333,7 @@ class TaobaoListing:
                 control_type="select",
             )
         )
-        if resolved is None:
+        if resolved is None or getattr(resolved, "is_no_fill", False):
             if self.logger is not None:
                 self.logger.info(
                     "淘宝 SKU 批量字段“%s”已加入本平台待审核汇总，"
@@ -4639,7 +4687,7 @@ class TaobaoListing:
                 control_type="radio",
             )
         )
-        if resolved is None:
+        if resolved is None or getattr(resolved, "is_no_fill", False):
             if self.logger is not None:
                 self.logger.info(
                     "淘宝“%s”已加入本平台待审核汇总，"
@@ -4848,7 +4896,7 @@ class TaobaoListing:
                 control_type="select",
             )
         )
-        if resolved is None:
+        if resolved is None or getattr(resolved, "is_no_fill", False):
             if self.logger is not None:
                 self.logger.info(
                     "淘宝店铺“%s”运费模板已加入本平台"
@@ -5099,7 +5147,7 @@ class TaobaoListing:
             if self.logger is not None:
                 self.logger.info(
                     "正在按尺码填写淘宝尺码表：%s",
-                    "裤长" if garment_kind == "pants" else "衣长",
+                    {"pants": "裤长", "clothing": "衣长", "footwear": "脚长"}[garment_kind],
                 )
             size_chart = {
                 "filled": True,

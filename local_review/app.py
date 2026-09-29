@@ -25,6 +25,7 @@ from .security import hash_password, new_session, session_hash, verify_password
 from .service import ApiError, analyze_product, decide_attribute, decide_review_learning, ingest_event, require
 from .ui import SCRIPT, STYLES, page
 from .launcher import Launcher, PLATFORMS
+from attribute_runtime import NO_FILL_VALUE_ID
 
 
 SESSION_COOKIE = "km_session"
@@ -203,27 +204,30 @@ def _mutate_review(
                 "status": status,
                 "lease_until": lease_until,
             }
-        require(action == "confirm", 404, "not_found")
-        final = data.get("final_value_id")
+        require(action in {"confirm", "no_fill"}, 404, "not_found")
+        no_fill = action == "no_fill"
+        final = NO_FILL_VALUE_ID if no_fill else data.get("final_value_id")
         require(
-            isinstance(final, str) and 0 < len(final.strip()) <= 256,
+            no_fill or (isinstance(final, str) and 0 < len(final.strip()) <= 256),
             400,
             "invalid_final_value_id",
         )
+        require(no_fill or final != NO_FILL_VALUE_ID, 400, "invalid_final_value_id")
         # 审核确认兼容多选：final_value_id 支持逗号分隔多个候选
         # valueId（或 custom_allowed 时的自定义值），与 Excel 的
         # “逗号分组全选”语法一致；每个部分不得重复。
-        parts = [
+        parts = [] if no_fill else [
             part.strip()
             for part in re.split(r"[,，、;；]", final.strip())
             if part.strip()
         ]
         require(
-            parts and len(parts) == len(set(parts)),
+            no_fill or (parts and len(parts) == len(set(parts))),
             400,
             "invalid_final_value_id",
         )
-        final = ",".join(parts)
+        if not no_fill:
+            final = ",".join(parts)
         reason = data.get("correction_reason")
         require(reason is None or isinstance(reason, str) and 0 < len(reason) <= 1000, 400, "invalid_correction_reason")
         require(
@@ -240,7 +244,7 @@ def _mutate_review(
         ).fetchone()
         options = json.loads(snapshot["options_json"]) if snapshot else []
         selection_only = bool(json.loads(task["evidence_json"]).get("selection_only"))
-        unmatched = [
+        unmatched = [] if no_fill else [
             part
             for part in parts
             if sum(
@@ -258,7 +262,8 @@ def _mutate_review(
             "candidate_not_unique",
         )
         require(
-            task["suggested_value_id"] is None
+            no_fill
+            or task["suggested_value_id"] is None
             or parts == [task["suggested_value_id"]]
             or bool(reason),
             422,
@@ -281,7 +286,7 @@ def _mutate_review(
         }
         connection.execute(
             "INSERT INTO review_actions(id,idempotency_key,review_id,user_id,suggested_value_id,final_value_id,correction_reason,snapshot_version,task_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (action_id, f"confirm:{review_id}:{version}", review_id, user["id"], task["suggested_value_id"], final, reason, task["snapshot_version"], version, now),
+            (action_id, f"{action}:{review_id}:{version}", review_id, user["id"], task["suggested_value_id"], final, reason, task["snapshot_version"], version, now),
         )
         connection.execute(
             "INSERT INTO attribute_decisions(id,product_version,platform_id,category_leaf_id,field_id,canonical_field,snapshot_version,proposed_value_id,final_value_id,source,status,reason_code,evidence_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'human','confirmed',?,?,?,?)",

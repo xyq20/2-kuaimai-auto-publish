@@ -113,8 +113,8 @@ class DouyinFields:
 @dataclass(frozen=True)
 class DouyinAssets:
     wash_label_images: Tuple[Path, ...]
-    size_chart_image: Path
-    height_weight_image: Path
+    size_chart_image: Optional[Path]
+    height_weight_image: Optional[Path]
 
 
 def normalize_key(value: Any) -> str:
@@ -284,11 +284,11 @@ def _douyin_attributes(fields: Dict[str, Any]) -> FrozenAttributes:
 def parse_douyin_fields(fields: Dict[str, Any]) -> DouyinFields:
     """从 Excel 键值映射提取并校验抖音表单所需的业务字段。"""
     short_title = _cell_text(_required_value(fields, "导购短标题", "导购短标题"))
-    materials_value = _required_value(
-        fields, "面料材质", "面料材质", "水洗标", "吊牌图", "面料", "面料俗称"
+    materials_source = field_lookup(
+        fields, "面料材质", "水洗标", "吊牌图", "面料", "面料俗称"
     )
-    materials_text = _cell_text(materials_value)
-    materials = parse_materials(materials_text)
+    materials_text = _cell_text(materials_source[1]) if materials_source else ""
+    materials = parse_materials(materials_text) if materials_text else ()
     sizes = _split_nonempty(_required_value(fields, "尺码", "尺码"), "/", "尺码")
     price = _normalize_price(
         _required_value(fields, "价格", "价格", "京东价", "市场价", "售卖价", "售价")
@@ -334,15 +334,23 @@ def _exactly_one_image(product_dir: Path, folder_name: str) -> Path:
     return files[0]
 
 
-def read_douyin_assets(product_dir: Path) -> DouyinAssets:
+def read_douyin_assets(product_dir: Path, *, garment_kind: str = "clothing") -> DouyinAssets:
     """读取抖音资料图片。
 
     水洗标图片只按 ``水洗标图片`` 文件夹内的图片文件读取，文件名不参与
     匹配；因此 ``1.png``、``吊牌正面.jpg`` 或其他任意图片文件名都等价。
     """
     wash_label_images = _images_in(product_dir / "水洗标图片")
+    needs_recommendations = garment_kind in {"pants", "clothing"}
     return DouyinAssets(
         wash_label_images=wash_label_images,
-        size_chart_image=_exactly_one_image(product_dir, "尺码信息表"),
-        height_weight_image=_exactly_one_image(product_dir, "身高体重推荐表"),
+        size_chart_image=(
+            _exactly_one_image(product_dir, "尺码信息表") if needs_recommendations
+            else (_exactly_one_image(product_dir, "尺码信息表")
+                  if _images_in(product_dir / "尺码信息表") else None)
+        ),
+        height_weight_image=(
+            _exactly_one_image(product_dir, "身高体重推荐表") if needs_recommendations
+            else next(iter(_images_in(product_dir / "身高体重推荐表")), None)
+        ),
     )

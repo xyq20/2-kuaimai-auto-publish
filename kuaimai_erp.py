@@ -721,7 +721,7 @@ def read_product_data(
             else None
         ),
         douyin_assets=(
-            read_douyin_assets(product_dir)
+            read_douyin_assets(product_dir, garment_kind=profile.garment_kind)
             if include_douyin and has_douyin_signals
             else None
         ),
@@ -808,13 +808,24 @@ def recognize_product_recommendations(
     """在打开浏览器前完成本地尺码识别，失败则不进入页面。"""
     if product.douyin_fields is None or product.douyin_assets is None:
         return ()
-    if product.garment_kind == "pants":
+    if product.garment_kind == "footwear":
+        from shoe_size import recognize_shoe_measurements
+        if product.douyin_assets.size_chart_image is None:
+            raise AutomationError("鞋类商品缺少尺码信息表图片，无法填写脚长")
+        recommendations = recognize_shoe_measurements(
+            product.douyin_assets.size_chart_image, product.douyin_fields.sizes
+        )
+    elif product.garment_kind == "pants":
+        assert product.douyin_assets.size_chart_image is not None
+        assert product.douyin_assets.height_weight_image is not None
         recommendations = recognize_recommendations(
             product.douyin_assets.size_chart_image,
             product.douyin_assets.height_weight_image,
             product.douyin_fields.sizes,
         )
     elif product.garment_kind == "clothing":
+        assert product.douyin_assets.size_chart_image is not None
+        assert product.douyin_assets.height_weight_image is not None
         recommendations = recognize_clothing_recommendations(
             product.douyin_assets.size_chart_image,
             product.douyin_assets.height_weight_image,
@@ -1030,7 +1041,7 @@ def resolve_taobao_category_mode(product: ProductData, category_mode: str) -> st
 def taobao_garment_kind(product: ProductData, category_mode: str) -> str:
     if category_mode == "casual-pants":
         return "pants"
-    if product.garment_kind in {"pants", "clothing"}:
+    if product.garment_kind in {"pants", "clothing", "footwear"}:
         return product.garment_kind
     raise AutomationError(
         "当前品类无法确定淘宝尺码表是衣长还是裤长，请进入运营审核"
@@ -1063,7 +1074,11 @@ def recognize_taobao_size_lengths(
             f"尺码信息表文件夹必须恰好 1 张图片，当前为 {len(images)} 张"
         )
     garment_kind = taobao_garment_kind(product, category_mode)
-    lengths = recognize_size_lengths(images[0], sizes, garment_kind)
+    if garment_kind == "footwear":
+        from shoe_size import recognize_shoe_measurements
+        lengths = recognize_shoe_measurements(images[0], sizes)
+    else:
+        lengths = recognize_size_lengths(images[0], sizes, garment_kind)
     (artifact_dir / "taobao-size-lengths.json").write_text(
         json.dumps(
             {
@@ -4602,14 +4617,15 @@ async def run_browser_automation(
         and product.youzan_fields.garment_kind == "unknown"
     ):
         raise AutomationError(
-            "有赞运费模板只能按裤子或外套判定；请检查 Excel“商品分类”"
+            "有赞运费模板无法按裤子、外套或鞋类判定；请检查 Excel“商品分类”"
         )
     tmall_assets: Optional[TmallAssets] = (
-        read_tmall_assets(product.product_dir) if tmall_requested and not inspect_only else None
+        read_tmall_assets(product.product_dir, garment_kind=product.garment_kind)
+        if tmall_requested and not inspect_only else None
     )
     recommendations = (
         recognize_product_recommendations(product, artifact_dir)
-        if (douyin_requested or taobao_requested)
+        if (douyin_requested or (taobao_requested and product.garment_kind != "footwear"))
         and product.douyin_fields is not None
         else ()
     )
@@ -4629,7 +4645,7 @@ async def run_browser_automation(
         )
         logger.info(
             "淘宝尺码信息表识别完成：%s | %s",
-            "裤长" if taobao_garment_kind_value == "pants" else "衣长",
+            {"pants": "裤长", "clothing": "衣长", "footwear": "脚长"}[taobao_garment_kind_value],
             " / ".join(item.size for item in taobao_size_lengths),
         )
 
@@ -5063,13 +5079,15 @@ async def run_browser_automation(
                     await douyin.apply_category_and_fields(product.douyin_fields)
                 )
                 category_fields.update(title_prediction)
-                materials = await douyin.apply_materials(
+                materials = await douyin.apply_materials_if_present(
                     product.douyin_fields.materials,
                     product.douyin_assets.wash_label_images,
                     product.douyin_fields.materials_text,
                 )
                 size_rows = (
-                    await douyin.fill_size_recommendations(recommendations)
+                    (await douyin.fill_shoe_sizes(recommendations)
+                     if product.garment_kind == "footwear"
+                     else await douyin.fill_size_recommendations(recommendations))
                     if recommendations
                     else {
                         "status": "skipped",
@@ -5084,6 +5102,9 @@ async def run_browser_automation(
                     timeout_seconds=args.upload_timeout,
                 )
                 delivery = await douyin.apply_delivery_mode()
+                warranty = await douyin.apply_leather_shoe_warranty(
+                    category_fields["category"]
+                )
                 sku_rows = await douyin.fill_sku_price_inventory(
                     product.douyin_fields.price,
                     product.douyin_fields.spot_stock,
@@ -5100,6 +5121,7 @@ async def run_browser_automation(
                     "sizes": size_rows,
                     "images": image_actions,
                     "delivery": delivery,
+                    "warranty": warranty,
                     "sku": {
                         "rows": sku_rows,
                         "price": product.douyin_fields.price,
@@ -5447,7 +5469,17 @@ async def run_browser_automation(
                     tmall_report["product_identity"] = identity
                     tmall_stage = "full_form"
                     try:
-                        await tmall.require_full_form()
+                        form_deadline = asyncio.get_running_loop().time() + 30
+                        while True:
+                            try:
+                                await tmall.require_full_form()
+                                break
+                            except TmallProductWriteRequired:
+                                raise
+                            except TmallFormListingError:
+                                if asyncio.get_running_loop().time() >= form_deadline:
+                                    raise
+                                await asyncio.sleep(0.2)
                         tmall_report["form_mode"] = "existing"
                         expected_image_count = len(product.main_images)
                         existing_image_state = (
@@ -5581,6 +5613,9 @@ async def run_browser_automation(
                         # 蓝色“发布”生成下半页表单。底部保存/铺货仍完全由
                         # args.save 和 args.publish 门禁控制。
                         tmall_stage = "initial_product_publish"
+                        tmall_report["initial_listing_date"] = (
+                            await tmall.fill_leather_shoe_listing_date(category)
+                        )
                         initial_product_publish = {"clicked": False, "matched_existing_product": True} if matched_existing else (
                             await tmall.publish_product_information(
                                 timeout_seconds=args.timeout,
@@ -5692,6 +5727,9 @@ async def run_browser_automation(
                     tmall_stage = "size_display_cleanup"
                     await tmall.clean_size_chart_integer_displays()
                     tmall_stage = "remaining_required"
+                    tmall_report["leather_shoe_listing_date"] = (
+                        await tmall.fill_leather_shoe_listing_date(category)
+                    )
                     if (
                         attribute_runtime is not None
                         and attribute_runtime.has_deferred_reviews

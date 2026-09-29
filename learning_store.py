@@ -475,6 +475,21 @@ class LearningStore:
         for row in rows:
             if product_version is not None and row['product_version'] != product_version:
                 continue
+            # Explicitly omitted fields are reusable only for the same
+            # product. They must never become cross-product learning data.
+            if row['final_value_id'] == "__NO_FILL__":
+                old = json.loads(row['payload_json'])
+                review = json.loads(row['review_json']) if row['review_json'] else {}
+                old_canonical = str(review.get('canonical_field') or '').strip()
+                same_field = (
+                    bool(canonical_field) and old_canonical == str(canonical_field).strip()
+                ) or (
+                    not old_canonical
+                    and str(old.get('field_label', '')).strip() == str(snapshot.field_label).strip()
+                )
+                if product_version is not None and same_field:
+                    return "__NO_FILL__"
+                continue
             old = json.loads(row['payload_json'])
             review = json.loads(row['review_json']) if row['review_json'] else {}
             old_canonical = str(review.get('canonical_field') or '').strip()

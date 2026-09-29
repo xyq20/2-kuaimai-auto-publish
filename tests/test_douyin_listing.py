@@ -495,6 +495,31 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         await self.playwright.stop()
         self.tempdir.cleanup()
 
+    async def test_leather_shoe_warranty_selects_90_days_only_for_leather_shoes(self):
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => panel.insertAdjacentHTML('beforeend', `
+          <div class="el-form-item">
+            <label class="el-form-item__label">售后服务承诺</label>
+            <div class="el-form-item__content"><label>
+              <input type="radio" name="warranty">保修期内提供维修（寄修）
+            </label></div>
+          </div>
+          <div class="el-form-item">
+            <label class="el-form-item__label">选择保修天数</label>
+            <div class="el-form-item__content"><div class="el-select"><input></div></div>
+          </div>`)
+        """)
+        self.listing._select_values = AsyncMock(return_value=("90天",))
+
+        self.assertIsNone(await self.listing.apply_leather_shoe_warranty("男鞋 > 运动鞋"))
+        self.assertFalse(await self.page.locator('input[name="warranty"]').is_checked())
+        self.assertEqual(
+            await self.listing.apply_leather_shoe_warranty("男鞋 > 休闲皮鞋"),
+            "90天",
+        )
+        self.assertTrue(await self.page.locator('input[name="warranty"]').is_checked())
+        self.assertEqual(self.listing._select_values.await_args.args[1], ("90天",))
+
     async def test_delayed_tab_category_title_and_exact_select_controls(self):
         await self.listing.open()
         self.assertEqual(
@@ -731,6 +756,110 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator("#material-rows .measure-item").count(), 2)
         self.assertEqual(calls[0][2], (Path("wash-label.jpg"),))
         self.assertEqual(calls[0][3], "抖音水洗标/吊牌图")
+
+    async def test_material_component_is_skipped_when_category_has_no_field(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.page.locator(".el-form-item").filter(
+            has=self.page.get_by_text("面料材质", exact=True)
+        ).first.evaluate("element => element.remove()")
+
+        result = await self.listing.apply_materials_if_present((), ())
+
+        self.assertEqual(result, ())
+
+    async def test_material_component_requires_excel_value_when_visible(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+
+        with self.assertRaisesRegex(DouyinListingError, "Excel 缺少面料材质"):
+            await self.listing.apply_materials_if_present((), ())
+
+    async def test_shoe_sizes_commit_exact_numbers_before_filling_foot_lengths(self):
+        from shoe_size import ShoeMeasurement
+        await self.listing.open()
+        await self.listing.panel.evaluate(r"""panel => {
+          panel.innerHTML = `<div class="block-specification">
+            <div><div class="title-bg"><input value="颜色分类" disabled></div>
+              <div class="specification-value"><div class="specification-value-flex_item"><div class="el-select"><input class="el-input__inner" value="棕色"></div></div></div></div>
+            <div><div class="title-bg"><input value="鞋码大小" disabled></div>
+            <div class="specification-value">
+            ${['39','40'].map(size => `<div class="specification-value-flex_item">
+              <div class="el-select"><input class="el-input__inner" value="${size}码"
+                onkeyup="this.parentElement.querySelector('.el-select-dropdown').style.display=this.value==='${size}'?'block':'none'">
+                <div class="el-select-dropdown" style="display:none">
+                  ${[`${size}-40`, size].map(v => `<div class="el-select-dropdown__item"
+                    onclick="this.closest('.el-select').querySelector('input').value='${v}'; this.parentElement.style.display='none'; window.shoeClicks.push('${v}')">${v}</div>`).join('')}
+                </div></div></div>`).join('')}</div></div></div>
+            <div class="el-table"><div class="el-table__header-wrapper"><table><thead><tr><th>尺码</th><th>脚长(cm)</th></tr></thead></table></div>
+              <div class="el-table__body-wrapper"><table><tbody>${['40','39'].map(s => `<tr><td>${s}</td><td><input oninput="window.clicksBeforeFeet=window.shoeClicks.slice()"></td></tr>`).join('')}</tbody></table></div></div>`;
+          window.shoeClicks=[];
+        }""")
+        result = await self.listing.fill_shoe_sizes((
+            ShoeMeasurement('39', '26.1-26.6'), ShoeMeasurement('40', '26.6-27.1'),
+        ))
+        self.assertEqual(await self.page.evaluate('window.shoeClicks'), ['39', '40'])
+        self.assertEqual(await self.page.evaluate('window.clicksBeforeFeet'), ['39', '40'])
+        inputs = self.listing.panel.locator('.el-table__body-wrapper input')
+        self.assertEqual(await inputs.nth(0).input_value(), result['40'])
+        self.assertEqual(await inputs.nth(1).input_value(), result['39'])
+        self.assertEqual(await self.listing.panel.locator('.specification-value input').first.input_value(), '棕色')
+
+    async def test_shoe_size_mismatch_stops_before_writing(self):
+        from shoe_size import ShoeMeasurement
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => {
+          panel.innerHTML = '<div class="block-specification"><div class="title-bg"><input value="鞋码大小"></div><div class="specification-value"><div class="specification-value-flex_item"><div class="el-select"><input class="el-input__inner" value="39码"></div></div></div></div>';
+        }""")
+        with self.assertRaisesRegex(DouyinListingError, '鞋码规格与尺码图不一致'):
+            await self.listing.fill_shoe_sizes((ShoeMeasurement('40', '26.6-27.1'),))
+        self.assertEqual(await self.listing.panel.locator('.el-input__inner').input_value(), '39码')
+
+    async def test_empty_old_shoe_rows_removed_but_numeric_rows_preserved(self):
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => {
+          panel.innerHTML = `<div class="el-table"><div class="el-table__body-wrapper"><table><tbody>
+          ${['39码','40码','39','40'].map(s=>`<tr><td><input value="${s}"></td><td><input></td><td><button onclick="this.closest('tr').remove()">删除</button></td></tr>`).join('')}
+          </tbody></table></div></div>`;
+        }""")
+        table = self.listing.panel.locator('.el-table')
+        await self.listing._remove_empty_renamed_shoe_rows(table, {'39':'26.1', '40':'26.6'})
+        names = await table.locator('td:first-child input').evaluate_all('xs=>xs.map(x=>x.value)')
+        self.assertEqual(names, ['39','40'])
+
+    async def test_old_shoe_row_with_measurements_blocks_all_cleanup(self):
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => {
+          panel.innerHTML = `<div class="el-table"><div class="el-table__body-wrapper"><table><tbody>
+          ${['39码','40码','39','40'].map(s=>`<tr><td><input value="${s}"></td><td><input value="${s==='40码'?'27':''}"></td><td><button onclick="this.closest('tr').remove()">删除</button></td></tr>`).join('')}
+          </tbody></table></div></div>`;
+        }""")
+        table = self.listing.panel.locator('.el-table')
+        with self.assertRaisesRegex(DouyinListingError, '含测量数据'):
+            await self.listing._remove_empty_renamed_shoe_rows(table, {'39':'26.1', '40':'26.6'})
+        self.assertEqual(await table.locator('tbody tr').count(), 4)
+
+    async def test_dismiss_dropdown_does_not_click_option_covering_field_label(self):
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => {
+          panel.innerHTML = `<div class="el-form-item">
+            <label class="el-form-item__label" style="display:block;width:120px;height:30px">鞋底材质</label>
+            <div class="el-select"><input><div class="el-select__tags"><span class="el-tag">橡胶</span></div>
+              <div class="el-select-dropdown" style="position:fixed;background:white;z-index:99999">
+                <div class="el-select-dropdown__item" onclick="document.querySelector('.el-tag').remove();this.parentElement.style.display='none'">橡胶</div>
+              </div>
+            </div></div>`;
+          const label=panel.querySelector('label'), pop=panel.querySelector('.el-select-dropdown');
+          const box=label.getBoundingClientRect();
+          Object.assign(pop.style,{left:box.left+'px',top:box.top+'px',width:box.width+'px',height:box.height+'px'});
+          pop.firstElementChild.style.height=box.height+'px';
+          document.addEventListener('keydown', e=> {if(e.key==='Escape')e.stopImmediatePropagation()}, true);
+          document.addEventListener('mouseup', e=> {if(!e.target.closest('.el-select'))pop.style.display='none'});
+        }""")
+        select = self.listing.panel.locator('.el-select')
+        await self.listing._dismiss_select_dropdown(select)
+        self.assertEqual(await self.listing._read_select_values(select, multi=True), ('橡胶',))
+        self.assertFalse(await select.locator('.el-select-dropdown').is_visible())
 
     async def test_multiple_materials_use_smart_fill_with_excel_text(self):
         await self.listing.open()

@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from attribute_runtime import AttributeRequest
-from category_profile import category_search_terms
+from category_profile import category_search_terms, is_footwear_category
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
@@ -611,6 +611,8 @@ class XhsFormListing(TaobaoListing):
         the report.  Any duplicate or incomplete result remains an error.
         """
         expected = tuple(normalize_label(part) for part in category_path)
+        if len(expected) > 1 and "男鞋" in expected[0]:
+            result_texts = tuple(text for text in result_texts if len(_category_parts(text)) > 1)
         complete = [
             text
             for text in result_texts
@@ -826,7 +828,7 @@ class XhsFormListing(TaobaoListing):
             # Only the actual search-result portal is scanned.  The page also
             # keeps a large cascader tree in the DOM; enumerating that tree was
             # the source of a 25+ second delay and is not valid click evidence.
-            search_term = path[0]
+            search_term = path[-1] if "男鞋" in path[0] else path[0]
             await search.fill(search_term, timeout=10_000)
             search_filled_at = asyncio.get_running_loop().time()
             target, target_text, strategy = await self._wait_for_category_result(
@@ -1159,7 +1161,7 @@ class XhsFormListing(TaobaoListing):
                     control_type="select",
                 )
             )
-            if resolved is None:
+            if resolved is None or getattr(resolved, "is_no_fill", False):
                 return ()
             resolved_values.append(resolved.label)
         return tuple(resolved_values)
@@ -1996,6 +1998,24 @@ class XhsFormListing(TaobaoListing):
         uploader: Any,
     ) -> Mapping[str, Any]:
         category = await self.apply_category(fields.category_path)
+        if is_footwear_category(" > ".join(fields.category_path)):
+            titles = self.panel.locator('.block-specification .title-bg')
+            for index in range(await titles.count()):
+                title_row = titles.nth(index)
+                select = title_row.locator('.el-select').first
+                if not await select.count():
+                    continue
+                if (await select.locator('input.el-input__inner').first.input_value()).strip() != '尺码':
+                    continue
+                group = title_row.locator('xpath=..')
+                values = group.locator('.specification-value input.el-input__inner')
+                before = await values.evaluate_all('xs=>xs.map(x=>x.value)')
+                actual = await self._select_values(select, (('鞋码',),), label='鞋类规格名', multi=False)
+                if actual != ('鞋码',):
+                    raise XhsFormListingError('小红书鞋类规格名未成功匹配“鞋码”')
+                after = await values.evaluate_all('xs=>xs.map(x=>x.value)')
+                if before != after:
+                    raise XhsFormListingError('小红书切换鞋码规格名后原规格值发生变化，停止保存')
         identity = await self.fill_identity(title, style_code)
         attributes = await self.fill_category_attributes(fields)
         presale = await self.apply_full_payment_presale()

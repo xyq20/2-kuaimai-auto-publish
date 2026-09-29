@@ -95,10 +95,20 @@ def category_path_parts(value: object) -> Tuple[str, ...]:
     )
 
 
+def is_leather_shoe_category(value: object) -> bool:
+    parts = category_path_parts(value)
+    return bool(is_footwear_category(value) and parts and "皮鞋" in parts[-1])
+
+
+def is_footwear_category(value: object) -> bool:
+    parts = category_path_parts(value)
+    return bool(parts and parts[-1].endswith(("鞋", "靴", "鞋子", "靴子", "鞋靴")))
+
+
 def category_gender_roots(hints: Iterable[str]) -> Tuple[str, ...]:
     text = " ".join(str(value) for value in hints)
-    if any(marker in text for marker in ("男士", "男装", "男性")):
-        return ("男装", "男士", "男款")
+    if any(marker in text for marker in ("男士", "男装", "男性", "男鞋")):
+        return ("男装", "男士", "男款", "男鞋", "流行男鞋")
     if any(marker in text for marker in ("女士", "女装", "女性")):
         return ("女装", "女士", "女款")
     return ()
@@ -155,9 +165,12 @@ def choose_category_candidate(
     # Excel slash alternatives keep their authored priority. An exact leaf
     # match must not lose to a later, longer alternative's specificity score.
     for wanted in expected:
+        # Excel 的 OR 项可能是完整路径，平台只比较该项的末级类目。
+        wanted_parts = category_path_parts(wanted)
+        wanted_leaf = wanted_parts[-1] if wanted_parts else wanted
         matching = [text for text in paths
                     if has_gender_root(category_path_parts(text))
-                    and category_path_parts(text)[-1] == wanted]
+                    and category_path_parts(text)[-1] == wanted_leaf]
         if matching:
             shortest = min(len(category_path_parts(text)) for text in matching)
             winners = [text for text in matching if len(category_path_parts(text)) == shortest]

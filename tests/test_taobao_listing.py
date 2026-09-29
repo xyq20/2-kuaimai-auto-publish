@@ -734,6 +734,13 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(actual, "服饰 > 动态测试类目")
 
+    async def test_category_search_does_not_join_separate_shoe_paths(self):
+        await self.page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
+          '<div class="el-autocomplete-suggestion"><ul><li>男鞋 > 男式正装皮鞋</li><li>流行男鞋 > 时尚单鞋 > 正装皮鞋</li></ul></div>')""")
+        rows = await self.listing._visible_category_result_nodes()
+        self.assertEqual([name for name, _node in rows], [
+            '男鞋 > 男式正装皮鞋', '流行男鞋 > 时尚单鞋 > 正装皮鞋'])
+
     async def test_pants_size_chart_fills_length_by_size(self):
         actual = await self.listing.fill_size_chart_lengths(
             (
@@ -753,6 +760,52 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             ).evaluate_all("inputs => inputs.map(input => input.value)"),
             ["104", "106", "108", "110", "112"],
         )
+
+    async def test_shoe_size_chart_matches_numeric_suffix_and_foot_length(self):
+        from shoe_size import ShoeMeasurement
+        await self.page.locator('.size-chart-table').evaluate("""table => {
+          const header=table.querySelector('thead th:nth-child(2)');
+          header.innerHTML='脚长（cm） <a>区间</a>';
+          header.querySelector('a').onclick=() => {
+            table.querySelectorAll('tbody tr').forEach(row => {
+              row.children[1].innerHTML='<input><input>';
+            });
+            header.querySelector('a').textContent='单值';
+          };
+          table.querySelector('tbody').innerHTML=['40码','39'].map(s=>`<tr><td>${s}</td><td><input></td><td>清空</td></tr>`).join('');
+          table.querySelectorAll('tbody input').forEach(input => {
+            input.oninput=() => { if(input.value.includes('-')) input.value='26.12'; };
+          });
+          const labels=table.parentElement.querySelectorAll('label');
+          labels[1].lastChild.textContent='脚长（cm）';
+        }""")
+        actual = await self.listing.fill_size_chart_lengths(
+            (ShoeMeasurement('39', '26.1-26.6'), ShoeMeasurement('40', '26.6-27.1')),
+            'footwear',
+        )
+        self.assertEqual(actual['field'], '脚长（cm）')
+        self.assertEqual(actual['rows'], {'40': '26.6-27.1', '39': '26.1-26.6'})
+        self.assertEqual(await self.page.locator('.size-chart-table tbody input').evaluate_all(
+            'inputs => inputs.map(input => input.value)'), ['26.6', '27.1', '26.1', '26.6'])
+        # A rerun must retain range mode instead of toggling it back to single value.
+        repeated = await self.listing.fill_size_chart_lengths(
+            (ShoeMeasurement('39', '26.1-26.6'), ShoeMeasurement('40', '26.6-27.1')),
+            'footwear',
+        )
+        self.assertEqual(repeated['rows'], actual['rows'])
+
+    async def test_shoe_range_without_toggle_stops_before_writing(self):
+        from shoe_size import ShoeMeasurement
+        from taobao_listing import TaobaoListingError
+        await self.page.locator('.size-chart-table').evaluate("""table => {
+          table.querySelector('thead th:nth-child(2)').textContent='脚长（cm）';
+          table.querySelector('tbody').innerHTML='<tr><td>39码</td><td><input value="25"></td><td>清空</td></tr>';
+          table.parentElement.querySelectorAll('label')[1].lastChild.textContent='脚长（cm）';
+        }""")
+        with self.assertRaisesRegex(TaobaoListingError, '无法切换区间模式'):
+            await self.listing.fill_size_chart_lengths(
+                (ShoeMeasurement('39', '26.1-26.6'),), 'footwear')
+        self.assertEqual(await self.page.locator('.size-chart-table tbody input').input_value(), '25')
 
     async def test_pants_size_chart_infers_fixed_size_column_when_header_is_blank(self):
         await self.page.locator(

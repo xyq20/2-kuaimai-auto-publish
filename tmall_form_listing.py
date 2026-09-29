@@ -16,7 +16,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from attribute_runtime import AttributeRequest
-from category_profile import choose_category_candidate
+from category_profile import choose_category_candidate, is_leather_shoe_category, is_footwear_category
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
@@ -394,7 +394,7 @@ class TmallFormListing(TaobaoListing):
                     control_type="select",
                 )
             )
-            if resolved is None:
+            if resolved is None or getattr(resolved, "is_no_fill", False):
                 return ()
             resolved_values.append(resolved.label)
         return tuple(resolved_values)
@@ -950,13 +950,57 @@ class TmallFormListing(TaobaoListing):
             )
         return actual
 
+    async def fill_leather_shoe_listing_date(self, category: str) -> Optional[str]:
+        if not is_leather_shoe_category(category):
+            return None
+        if self.panel is None:
+            raise TmallFormListingError("请先调用 open() 打开天猫资料")
+        labels = self.panel.locator(".el-form-item > .el-form-item__label")
+        matches = []
+        for index in range(await labels.count()):
+            label = labels.nth(index)
+            if not await label.is_visible() or normalize_label(
+                await label.inner_text()
+            ) != normalize_label("上市时间"):
+                continue
+            item = label.locator("xpath=..")
+            if not await item.evaluate(
+                "element => Boolean(element.closest('.useCategory-wrap, .sku-batch-item, .el-table'))"
+            ):
+                matches.append(item)
+        if len(matches) != 1:
+            raise TmallFormListingError(
+                f"天猫皮鞋顶部“上市时间”字段匹配数为 {len(matches)}"
+            )
+        expected = shanghai_today().isoformat()
+        inputs = matches[0].locator("input:not([readonly]):not([disabled])")
+        visible_inputs = [
+            inputs.nth(index)
+            for index in range(await inputs.count())
+            if await inputs.nth(index).is_visible()
+        ]
+        if len(visible_inputs) != 1:
+            raise TmallFormListingError("天猫皮鞋顶部“上市时间”输入框不唯一")
+        control = visible_inputs[0]
+        if (await control.input_value()).strip() != expected:
+            await control.fill(expected)
+            await control.press("Tab")
+        actual = (await control.input_value()).strip()
+        if actual != expected:
+            raise TmallFormListingError(
+                f"天猫皮鞋顶部“上市时间”回读失败：期望 {expected!r}，页面为 {actual!r}"
+            )
+        return actual
+
     async def fill_product_identity(self, fields: Any) -> Mapping[str, Any]:
         source_fields = _fields_mapping(fields)
         specifications = (
             ("货号", ("商家外部编码", "款式编码")),
             ("品牌", ()),
-            ("上市年份季节", ("上市季节",)),
         )
+        footwear = is_footwear_category(await self._category_text())
+        if not footwear:
+            specifications += (("上市年份季节", ("上市季节",)),)
         expected = {
             label: _required_source(source_fields, label, aliases)
             for label, aliases in specifications
@@ -974,6 +1018,8 @@ class TmallFormListing(TaobaoListing):
             )
 
         await self._wait_for_loading_masks()
+        if footwear:
+            return {"values": actual}
         deadline = asyncio.get_running_loop().time() + 30
         season_item = None
         last_error: Optional[Exception] = None
@@ -1795,7 +1841,7 @@ class TmallFormListing(TaobaoListing):
                         control_type=control_type,
                     )
                 )
-                if resolved is None:
+                if resolved is None or getattr(resolved, "is_no_fill", False):
                     deferred.append(page_label)
                     continue
                 chosen = resolved.label
@@ -2424,7 +2470,7 @@ class TmallFormListing(TaobaoListing):
             if part.strip()
         )
         category_leaf = category_parts[-1] if category_parts else ""
-        is_footwear = category_leaf.endswith(("鞋", "靴", "鞋子", "靴子"))
+        is_footwear = is_footwear_category(category_path)
         titles = self.panel.locator(".block-specification .title-bg")
         plans: List[Tuple[str, Tuple[Any, ...], Tuple[str, ...], Tuple[str, ...]]] = []
         for index in range(await titles.count()):
@@ -2592,8 +2638,14 @@ class TmallFormListing(TaobaoListing):
             )
             await self._fill_batch_text(row, "价格", price)
             await self._fill_batch_text(row, "库存", stock)
-            await self._fill_batch_date(row, today_value)
-            await self._fill_batch_text(row, "货号", code)
+            batch_labels = await row.locator(".sku-batch-item_label").all_text_contents()
+            has_batch_date = any(normalize_label(label) == normalize_label("上市时间") for label in batch_labels)
+            has_batch_code = any(normalize_label(label) == normalize_label("货号") for label in batch_labels)
+            footwear = is_footwear_category(await self._category_text())
+            if has_batch_date or not footwear:
+                await self._fill_batch_date(row, today_value)
+            if has_batch_code or not footwear:
+                await self._fill_batch_text(row, "货号", code)
         except TaobaoListingError as exc:
             raise TmallFormListingError(str(exc).replace("淘宝", "天猫")) from exc
 
@@ -2631,9 +2683,21 @@ class TmallFormListing(TaobaoListing):
                 else:
                     dynamic[label] = resolved
             else:
+                text_value = source[1]
+                if footwear and normalize_label(label) == normalize_label("鞋跟高度（cm）"):
+                    groups = selection_value_groups(label, text_value)
+                    numbers = [
+                        match.group(1)
+                        for group in groups for candidate in group
+                        for match in [re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:cm|厘米)?\s*", candidate, re.IGNORECASE)]
+                        if match is not None
+                    ]
+                    if len(groups) != 1 or not numbers:
+                        raise TmallFormListingError("Excel 鞋跟高度没有可填写的单个厘米数值")
+                    text_value = numbers[0]
                 try:
                     dynamic[label] = await self._fill_batch_text(
-                        row, label, source[1]
+                        row, label, text_value
                     )
                 except TaobaoListingError as exc:
                     raise TmallFormListingError(
@@ -2649,8 +2713,8 @@ class TmallFormListing(TaobaoListing):
                 "values": {
                     "价格": price,
                     "库存": stock,
-                    "上市时间": today_value,
-                    "货号": code,
+                    **({"上市时间": today_value} if has_batch_date else {}),
+                    **({"货号": code} if has_batch_code else {}),
                     **dynamic,
                 },
                 "platform_codes_preserved": True,
@@ -2664,8 +2728,8 @@ class TmallFormListing(TaobaoListing):
         expected = {
             "价格": price,
             "库存": stock,
-            "上市时间": today_value,
-            "货号": code,
+            **({"上市时间": today_value} if has_batch_date else {}),
+            **({"货号": code} if has_batch_code else {}),
             **dynamic,
         }
         deadline = asyncio.get_running_loop().time() + 8
@@ -2755,6 +2819,9 @@ class TmallFormListing(TaobaoListing):
             parts = tuple(display_text(item) for item in value)
         else:
             text = str(value).strip().replace("～", "~")
+            numeric_range = re.fullmatch(r"(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)", text)
+            if numeric_range:
+                text = "~".join(numeric_range.groups())
             if "~" in text:
                 if text.count("~") != 1:
                     raise TmallFormListingError(
@@ -3058,7 +3125,7 @@ class TmallFormListing(TaobaoListing):
                 control_type="input",
             )
         )
-        if resolved is None:
+        if resolved is None or getattr(resolved, "is_no_fill", False):
             return None
         parts = self._size_value_parts(
             resolved.label,
@@ -3077,12 +3144,19 @@ class TmallFormListing(TaobaoListing):
     ) -> Mapping[str, Any]:
         if not rows:
             raise TmallFormListingError("天猫尺码表没有来源数据")
+        footwear = is_footwear_category(await self._category_text())
+        def size_key(value: str) -> str:
+            text = normalize_option(value)
+            if footwear and re.fullmatch(r"\d+(?:\.\d+)?码?", text):
+                from shoe_size import shoe_size
+                return shoe_size(text)
+            return text
         sources_by_size: Dict[str, Mapping[str, Tuple[str, Any]]] = {}
         for row in rows:
             normalized_sources = self._row_sources(row)
             size_record = normalized_sources.get(normalize_label("尺码"))
             size = str(size_record[1]).strip() if size_record else ""
-            normalized_size = normalize_option(size)
+            normalized_size = size_key(size)
             if not normalized_size:
                 raise TmallFormListingError("天猫尺码表来源行缺少尺码")
             if normalized_size in sources_by_size:
@@ -3203,6 +3277,16 @@ class TmallFormListing(TaobaoListing):
                     switch = switches.nth(switch_index)
                     if await switch.is_visible():
                         visible_switches.append(switch)
+                if (not visible_switches and footwear
+                        and normalized_header == normalize_label("脚长(cm)")):
+                    # 用户确认：天猫鞋类仅支持单值脚长时，取已识别区间的最小值。
+                    for key, parts in tuple(parsed_sources.items()):
+                        if key[1] == normalized_header and len(parts) == 2:
+                            minimum = min(Decimal(parts[0]), Decimal(parts[1]))
+                            parsed_sources[key] = (format(minimum.normalize(), "f"),)
+                    if self.logger is not None:
+                        self.logger.info("天猫鞋类脚长仅支持单值，按确认规则取尺码图区间最小值")
+                    continue
                 if len(visible_switches) != 1:
                     if self.attribute_runtime is not None:
                         if normalized_header in required_keys:
@@ -3287,11 +3371,13 @@ class TmallFormListing(TaobaoListing):
                 # Element UI 的测量/占位行没有业务尺码，也没有对应来源，
                 # 不参与填写和完整性校验。
                 continue
-            normalized_size = normalize_option(page_size)
+            normalized_size = size_key(page_size)
             if normalized_size not in sources_by_size:
                 raise TmallFormListingError(
                     f"天猫尺码表页面出现 Excel 未提供的尺码：{page_size}"
                 )
+            if normalized_size in seen_sizes:
+                raise TmallFormListingError(f"天猫尺码表页面尺码重复：{page_size}")
             seen_sizes.add(normalized_size)
             sources = sources_by_size[normalized_size]
             filled: Dict[str, Any] = {}
@@ -3595,9 +3681,14 @@ class TmallFormListing(TaobaoListing):
         )
         actions: Dict[str, str] = {}
         for label, path in mappings:
+            if path is None:
+                continue
             try:
                 item = await self._form_item(label)
             except TaobaoListingError as exc:
+                if (label == "产品参数图片" and str(exc).endswith("：0")
+                        and is_footwear_category(await self._category_text())):
+                    continue
                 raise TmallFormListingError(str(exc).replace("淘宝", "天猫")) from exc
             actions[label] = await uploader(
                 self.page,
@@ -3714,6 +3805,8 @@ class TmallFormListing(TaobaoListing):
                 f"天猫“是否申报新品”字段不是唯一项：{len(matches)}"
             )
         item = matches[0]
+        if await item.locator(".el-select").count() == 1:
+            return await self._fill_exact_form_item("是否申报新品", item, expected)
         radios = item.get_by_role("radio", name=expected, exact=True)
         if await radios.count() != 1:
             raise TmallFormListingError(

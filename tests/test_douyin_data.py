@@ -123,6 +123,19 @@ class DouyinFieldParsingTests(unittest.TestCase):
 
         self.assertEqual(parse_douyin_fields(fields).materials, (MaterialComponent("棉", 100),))
 
+    def test_shoe_fields_without_fabric_material_retain_shoe_attributes(self):
+        fields = dict(CURRENT_PRODUCT_FIELDS)
+        del fields["面料材质/水洗标/吊牌图/面料"]
+        fields["鞋面材质"] = "牛皮"
+        fields["鞋底材质"] = "橡胶"
+
+        result = parse_douyin_fields(fields)
+
+        self.assertEqual(result.materials, ())
+        self.assertEqual(result.materials_text, "")
+        self.assertEqual(result.attributes["鞋面材质"], "牛皮")
+        self.assertEqual(result.attributes["鞋底材质"], "橡胶")
+
     def test_rejects_missing_required_fields(self):
         fields = dict(CURRENT_PRODUCT_FIELDS)
         del fields["导购短标题"]
@@ -254,6 +267,14 @@ class DouyinAssetDiscoveryTests(unittest.TestCase):
             self.assertEqual(result.wash_label_images, ())
             self.assertEqual(result.size_chart_image, size_chart)
             self.assertEqual(result.height_weight_image, recommendation)
+
+    def test_footwear_does_not_require_clothing_recommendation_images(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            result = read_douyin_assets(product_dir, garment_kind="footwear")
+
+            self.assertIsNone(result.size_chart_image)
+            self.assertIsNone(result.height_weight_image)
 
     def test_requires_exactly_one_size_and_recommendation_image(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -448,7 +469,7 @@ class ProductDataReadIntegrationTests(unittest.TestCase):
             self._write_legacy_images(product_dir)
             excel_path = self._write_excel(product_dir, self._base_fields() + [("导购短标题", "短标题")])
 
-            with self.assertRaisesRegex(DouyinDataError, "面料材质"):
+            with self.assertRaisesRegex(DouyinDataError, "尺码"):
                 kuaimai_erp.read_product_data(excel_path)
 
     def test_non_douyin_platform_can_skip_partial_douyin_inputs(self):

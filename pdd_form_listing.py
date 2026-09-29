@@ -79,6 +79,7 @@ PDD_CATEGORY_MARKERS = frozenset(
         "面料俗称", "材质", "款式", "裤长", "版型", "风格", "适用年龄",
         "流行元素", "弹力", "商品货号", "上市时节", "功能", "是否加绒",
         "成分含量", "适用场景", "裆部结构",
+        "鞋面材质", "鞋底材质", "鞋面内里材质", "鞋头款式", "鞋帮高度",
     )
 )
 
@@ -337,7 +338,7 @@ class PddFormListing(TaobaoListing):
                     control_type="select",
                 )
             )
-            if resolved is None:
+            if resolved is None or getattr(resolved, "is_no_fill", False):
                 return ()
             resolved_groups.append((resolved.label,))
         return tuple(resolved_groups)

@@ -92,6 +92,7 @@ YOUZAN_BATCH_ORDER = ("价格", "库存", "重量(kg)")
 YOUZAN_FREIGHT_TEMPLATES = {
     "pants": "T恤、裤子、饰品邮费模版",
     "coat": "鞋子、皮衣、外套邮费模版",
+    "footwear": "鞋子、皮衣、外套邮费模版",
 }
 YOUZAN_ATTRIBUTE_PATHS = frozenset(
     ("/yz/getCategoryProperties", "/yz/getCategoryProperties.json")
@@ -687,7 +688,7 @@ class YouzanFormListing(TaobaoListing):
                     control_type="select",
                 )
             )
-            if resolved is None:
+            if resolved is None or getattr(resolved, "is_no_fill", False):
                 runtime.raise_deferred_reviews()
                 raise YouzanFormListingError("有赞商品分类等待运营审核")
             candidates = [
@@ -965,7 +966,7 @@ class YouzanFormListing(TaobaoListing):
                     control_type="select",
                 )
             )
-            if resolved is None:
+            if resolved is None or getattr(resolved, "is_no_fill", False):
                 return ()
             resolved_values.append(resolved.label)
         return tuple(resolved_values)

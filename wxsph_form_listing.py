@@ -577,6 +577,8 @@ class WxsphFormListing(YouzanFormListing):
             )
             approved = (runtime.confirmed_choice(approval_request)
                         if callable(getattr(runtime, "confirmed_choice", None)) else None)
+            if approved is not None and getattr(approved, "is_no_fill", False):
+                return ()
             if approved is not None:
                 resolved_values.append(approved.label)
                 resolved_options[normalize_option(approved.label)] = (approved.value_id, approved.label)
@@ -607,7 +609,7 @@ class WxsphFormListing(YouzanFormListing):
                     control_type="select",
                 )
             )
-            if resolved is None:
+            if resolved is None or getattr(resolved, "is_no_fill", False):
                 return ()
             resolved_values.append(resolved.label)
             resolved_options[normalize_option(resolved.label)] = (
@@ -782,7 +784,7 @@ class WxsphFormListing(YouzanFormListing):
                 "summary": "程序选择及手填未能通过回读，无法手填，请从页面候选中选择。运营确认值将覆盖 Excel 原值。"},
         )
         resolved = await self.attribute_runtime.resolve(request)
-        if resolved is None:
+        if resolved is None or getattr(resolved, "is_no_fill", False):
             if self.logger:
                 self.logger.warning("微信小店属性“%s”写入失败已汇总审核，继续后续字段", page_label)
             return None

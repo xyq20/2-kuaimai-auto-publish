@@ -404,6 +404,20 @@ def jd_category_target(fields: Mapping[str, str]) -> Tuple[Tuple[str, ...], str]
     return hints, target
 
 
+def _jd_category_matches(current: str, hints: Sequence[str], target: str) -> bool:
+    if _category_parts(current)[-1:] == (normalize_label(target),):
+        return True
+    # 男鞋平台类目可使用 Excel 的其它 OR 备选；保留男鞋分支约束。
+    if not any("男鞋" in hint for hint in hints):
+        return False
+    parts = _category_parts(current)
+    return bool(
+        len(parts) >= 3
+        and any(part in {"男鞋", "流行男鞋"} for part in parts[:-1])
+        and parts[-1] in {normalize_label(hint) for hint in hints}
+    )
+
+
 def _image_color_histogram(path: Path) -> Any:
     """Return a garment-focused HSV histogram for conservative color grouping."""
     try:
@@ -685,7 +699,7 @@ class JdFormListing(YouzanFormListing):
                         control_type="select",
                     )
                 )
-                if resolved is None:
+                if resolved is None or getattr(resolved, "is_no_fill", False):
                     return None
                 matches = tuple(
                     option
@@ -1114,7 +1128,7 @@ class JdFormListing(YouzanFormListing):
                 control_type="multi_select" if multi else "select",
             )
         )
-        if resolved is None:
+        if resolved is None or getattr(resolved, "is_no_fill", False):
             return None
         return resolved.label
 
@@ -1400,7 +1414,7 @@ class JdFormListing(YouzanFormListing):
             current = await self._category_text()
         except JdFormListingError:
             current = ""
-        if _category_parts(current)[-1:] == (normalize_label(target),):
+        if _jd_category_matches(current, category_hints, target):
             return {
                 "hints": category_hints,
                 "target": target,
@@ -2132,6 +2146,14 @@ class JdFormListing(YouzanFormListing):
         desired = JD_EXACT_OPTION_MAP.get(normalized, {}).get(
             normalize_option(desired), desired
         )
+        if normalized == normalize_label("鞋跟高度") and await selects.count():
+            field = await self._captured_api_field_definition(page_label)
+            labels = tuple(option.label for option in field.option_values)
+            for alternative in re.split(r"[/／]", desired):
+                matches = match_option_candidates((alternative.strip(),), labels)
+                if len(matches) == 1:
+                    desired = labels[matches[0]]
+                    break
         actual: Optional[Tuple[str, ...]] = None
         if await selects.count():
             # Material rows contain a value select plus an optional percentage input.
@@ -2181,6 +2203,15 @@ class JdFormListing(YouzanFormListing):
                     )
                 except JdFormListingError:
                     raise
+                if actual is None and normalized in {
+                    normalize_label(label) for label in
+                    ("鞋面材质", "鞋面内里材质", "鞋里材质", "鞋底材质", "鞋垫材质")
+                }:
+                    actual = await self._raise_as_jd(self._select_values(
+                        value_select, (("其他", "其它"),), label=page_label, multi=multi,
+                    ))
+                    if actual is not None and self.logger is not None:
+                        self.logger.info('京东鞋类属性“%s”无匹配材质，使用兜底候选：%s', page_label, actual)
                 if actual is None:
                     if await self._interface_field_has_options(page_label):
                         # valueId 型字段不允许直填自造文字候选，否则铺货
@@ -3125,7 +3156,7 @@ class JdFormListing(YouzanFormListing):
                 await asyncio.sleep(0.15)
         raise JdFormListingError(str(last_error or "京东批量设置超时"))
 
-    async def apply_sku_thickness(self) -> Mapping[str, str]:
+    async def apply_sku_thickness(self, fields: Optional[Mapping[str, str]] = None) -> Mapping[str, str]:
         if self.panel is None:
             raise JdFormListingError("请先打开京东资料")
         triggers = await self._header_actions("SKU属性", "批量设置")
@@ -3154,6 +3185,41 @@ class JdFormListing(YouzanFormListing):
             await asyncio.sleep(0.1)
         if dialog is None:
             raise JdFormListingError("京东 SKU 属性批量弹窗未出现")
+
+        if fields and any("男鞋" in hint for hint in _jd_category_hints(fields)):
+            report = {}
+            items = dialog.locator('.el-form-item:visible')
+            if not await items.count():
+                refreshes = await self._innermost_visible_text(dialog, "刷新数据")
+                if len(refreshes) == 1:
+                    await refreshes[0].click()
+                await items.first.wait_for(state="visible", timeout=30_000)
+            for index in range(await items.count()):
+                item = items.nth(index)
+                label = item.locator(':scope > .el-form-item__label')
+                if not await label.count():
+                    continue
+                name = (await label.inner_text()).strip().strip('*：: ')
+                aliases = (name, "鞋面内里材质", "鞋里材质") if name == "内里材质" else (name,)
+                desired = _first_excel_value(fields, aliases)
+                if not desired:
+                    if await self._is_required(item):
+                        raise JdFormListingError(f"Excel 中缺少京东鞋类 SKU 属性：{name}")
+                    continue
+                actual = await self._raise_as_jd(self._fill_attribute(name, item, desired, required=True))
+                if actual is None and name == "内里材质":
+                    actual = await self._raise_as_jd(self._fill_attribute(name, item, "其他/其它", required=True))
+                if actual is None:
+                    raise JdFormListingError(f"京东鞋类 SKU 属性没有匹配候选：{name}={desired}")
+                report[name] = "/".join(actual)
+            if not report:
+                raise JdFormListingError("京东鞋类 SKU 属性尚未加载")
+            confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
+            await confirm.click()
+            await dialog.wait_for(state="hidden", timeout=10_000)
+            if self.logger is not None:
+                self.logger.info("京东鞋类 SKU 属性已填写：%s", report)
+            return report
 
         async def visible_thickness_labels() -> List[Any]:
             labels = dialog.get_by_text(re.compile(r"^\s*厚度\s*[：:]?\s*$"))
@@ -3782,7 +3848,7 @@ class JdFormListing(YouzanFormListing):
         attributes = await self.fill_attributes(fields)
         color_spec_values = await self.reapply_echoed_color_spec_values()
         sku = await self.fill_sku_batch(fields.fields)
-        sku_attributes = await self.apply_sku_thickness()
+        sku_attributes = await self.apply_sku_thickness(fields.fields)
         prices = await self.fill_summary_prices(fields.fields)
         delivery = await self.fill_delivery_template()
         images = await self.append_sku_images(
@@ -3826,7 +3892,7 @@ class JdFormListing(YouzanFormListing):
     ) -> Mapping[str, Any]:
         category = await self._category_text()
         _category_hints, category_target = jd_category_target(fields.fields)
-        if _category_parts(category)[-1:] != (normalize_label(category_target),):
+        if not _jd_category_matches(category, _category_hints, category_target):
             raise JdFormListingError("京东保存后类目回读失败：{0!r}".format(category))
         brand_item = await self._form_item_exact("品牌")
         brand, brand_values = await self._read_brand_value(brand_item)
