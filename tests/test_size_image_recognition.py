@@ -206,6 +206,33 @@ class VisionOCRUnitTests(unittest.TestCase):
             },
         )
 
+    def test_douyin_clothing_ignores_extra_cuff_row_when_bounding_cells(self):
+        tokens = (
+            _token("S", 0.46, 0.07),
+            _token("M", 0.56, 0.07),
+            _token("衣长/LENGTH", 0.20, 0.17, width=0.14),
+            _token("胸围/BUST", 0.22, 0.25, width=0.11),
+            _token("袖长/SLEEVE LENGTH", 0.17, 0.33, width=0.21),
+            _token("袖口/CUFF", 0.22, 0.40, width=0.11),
+            _token("肩宽/SHOULDER", 0.20, 0.48, width=0.17),
+            _token("63", 0.46, 0.17),
+            _token("65", 0.56, 0.17),
+            _token("112", 0.46, 0.25),
+            _token("116", 0.56, 0.25),
+            _token("78", 0.46, 0.33),
+            _token("79", 0.56, 0.33),
+            _token("24", 0.46, 0.40),
+            _token("25", 0.56, 0.40),
+            _token("10", 0.46, 0.48),
+            _token("11", 0.56, 0.48),
+        )
+
+        actual = parse_clothing_measurement_table(tokens, ("S", "M"), source="上装尺码表")
+
+        self.assertEqual(actual["S"]["sleeve"], 78)
+        self.assertEqual(actual["M"]["sleeve"], 79)
+        self.assertEqual(actual["S"]["shoulder"], 10)
+
     def test_discovers_clothing_sizes_from_unique_length_header(self):
         tokens = (
             _token("上装/Topcoat", 0.17, 0.43, width=0.20),

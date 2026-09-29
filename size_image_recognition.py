@@ -442,6 +442,9 @@ _CLOTHING_MEASUREMENT_ALIASES = {
     "shoulder": ("肩宽", "SHOULDERWIDTH", "SHOULDER"),
     "sleeve": ("袖长", "SLEEVELENGTH", "SLEEVE"),
 }
+_CLOTHING_EXTRA_ROW_ALIASES = {
+    "cuff": ("袖口", "CUFF"),
+}
 _CLOTHING_MEASUREMENT_NAMES = {
     "length": "衣长",
     "chest": "胸围",
@@ -830,20 +833,27 @@ def parse_clothing_measurement_table(
     expected_map = _expected_size_map(expected_sizes, source)
 
     row_tokens: Dict[str, OCRToken] = {}
+    all_row_tokens: Dict[str, OCRToken] = {}
+    row_aliases = {
+        **_CLOTHING_MEASUREMENT_ALIASES,
+        **_CLOTHING_EXTRA_ROW_ALIASES,
+    }
     for token in tokens:
         matches = [
             kind
-            for kind, aliases in _CLOTHING_MEASUREMENT_ALIASES.items()
+            for kind, aliases in row_aliases.items()
             if _matches_alias_composition(token.text, aliases)
         ]
         if len(matches) != 1:
             continue
         kind = matches[0]
-        if kind in row_tokens:
+        if kind in all_row_tokens:
             raise RecognitionError(
-                f"{source}：{_CLOTHING_MEASUREMENT_NAMES[kind]}行标题重复"
+                f"{source}：{row_aliases[kind][0]}行标题重复"
             )
-        row_tokens[kind] = token
+        all_row_tokens[kind] = token
+        if kind in _CLOTHING_MEASUREMENT_NAMES:
+            row_tokens[kind] = token
 
     missing_rows = [
         display_name
@@ -872,8 +882,13 @@ def parse_clothing_measurement_table(
 
     columns = sorted(headers.items(), key=lambda item: _center_x(item[1]))
     column_bounds = _cell_bounds([_center_x(token) for _size, token in columns])
-    ordered_rows = sorted(row_tokens.items(), key=lambda item: _center_y(item[1]))
-    row_bounds = _cell_bounds([_center_y(token) for _kind, token in ordered_rows])
+    ordered_rows = sorted(all_row_tokens.items(), key=lambda item: _center_y(item[1]))
+    row_centers = [_center_y(token) for _kind, token in ordered_rows]
+    row_bounds = _cell_bounds(row_centers) if len(row_centers) >= 2 else ()
+    row_bound_by_kind = {
+        kind: row_bounds[index]
+        for index, (kind, _token) in enumerate(ordered_rows)
+    }
     numeric_tokens = tuple(
         (token, value)
         for token in tokens
@@ -882,7 +897,8 @@ def parse_clothing_measurement_table(
     )
 
     cells: Dict[Tuple[str, str], Number] = {}
-    for (kind, _row_token), (top, bottom) in zip(ordered_rows, row_bounds):
+    for kind in _CLOTHING_MEASUREMENT_NAMES:
+        top, bottom = row_bound_by_kind[kind]
         for (size, _header), (left, right) in zip(columns, column_bounds):
             matches = [
                 value
