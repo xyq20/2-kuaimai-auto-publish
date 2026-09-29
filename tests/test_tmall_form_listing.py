@@ -1083,6 +1083,42 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(values, ["黑色码", "38", "38.5", "均码"])
         self.assertEqual(report["changed"], 2)
 
+    async def test_shoe_size_dropdown_searches_and_clicks_numeric_candidates(self):
+        listing = await self._listing('''
+          <div class="block-specification">
+            <div class="title-bg"><input value="欧码尺码"></div>
+            <div class="specification-value" id="sizes"></div>
+          </div>
+          <script>
+          window.selectedSizes=[];
+          for(const size of ['39','40']) {
+            const select=document.createElement('div');
+            select.className='el-select specification-value-flex_input';
+            select.innerHTML='<div class="el-input"><input readonly class="el-input__inner"></div><div class="el-select-dropdown" style="display:none"></div><input name="prop_remark" value="备注码">';
+            const input=select.querySelector('.el-input__inner');
+            const dropdown=select.querySelector('.el-select-dropdown');
+            input.value=size+'码';
+            input.onclick=()=>{input.readOnly=false;dropdown.style.display='block';};
+            input.oninput=()=>{
+              dropdown.replaceChildren();
+              for(const label of [size+'-'+(Number(size)+1),size]) {
+                const option=document.createElement('div');
+                option.className='el-select-dropdown__item';option.textContent=label;
+                option.onclick=()=>{input.value=label;input.readOnly=true;dropdown.style.display='none';window.selectedSizes.push(label);};
+                dropdown.append(option);
+              }
+            };
+            document.querySelector('#sizes').append(select);
+          }
+          </script>''')
+        report = await listing.normalize_synced_specifications('鞋靴 > 流行男鞋 > 正装皮鞋')
+        self.assertEqual(report['changed'], 2)
+        self.assertEqual(await self.page.evaluate('window.selectedSizes'), ['39', '40'])
+        self.assertEqual(await self.page.locator('[name=prop_remark]').evaluate_all('els=>els.map(e=>e.value)'), ['备注码', '备注码'])
+        again = await listing.normalize_synced_specifications('鞋靴 > 流行男鞋 > 正装皮鞋')
+        self.assertEqual(again['changed'], 0)
+        self.assertEqual(await self.page.evaluate('window.selectedSizes'), ['39', '40'])
+
     async def test_shoe_accessory_parent_category_does_not_trigger_size_cleanup(self):
         listing = await self._listing(
             """

@@ -2487,7 +2487,9 @@ class TmallFormListing(TaobaoListing):
             )
             if await value_groups.count() != 1:
                 continue
-            inputs = value_groups.first.locator("input.spec-value")
+            inputs = value_groups.first.locator(
+                "input.spec-value, .el-select.specification-value-flex_input > .el-input > input.el-input__inner"
+            )
             controls = tuple(inputs.nth(item) for item in range(await inputs.count()))
             before = tuple([await control.input_value() for control in controls])
             dimension_key = normalize_label(dimension)
@@ -2508,7 +2510,9 @@ class TmallFormListing(TaobaoListing):
             for control, old_value, new_value in zip(controls, before, after):
                 if old_value == new_value:
                     continue
-                if not await control.is_visible() or not await control.is_editable():
+                select = control.locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-select ')][1]")
+                if (not await control.is_visible() or await control.is_disabled()
+                        or (not await select.count() and not await control.is_editable())):
                     raise TmallFormListingError(
                         f"天猫规格“{dimension}”存在不可写的鞋码控件，已在修改前停止"
                     )
@@ -2519,7 +2523,27 @@ class TmallFormListing(TaobaoListing):
             for control, old_value, new_value in zip(controls, before, after):
                 if old_value == new_value:
                     continue
-                await control.fill(new_value)
+                select = control.locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-select ')][1]")
+                if await select.count():
+                    await control.scroll_into_view_if_needed()
+                    await control.click()
+                    await control.press("ControlOrMeta+A")
+                    await control.press("Backspace")
+                    await control.press_sequentially(new_value, delay=120)
+                    deadline = asyncio.get_running_loop().time() + 10
+                    while True:
+                        dropdown = await self._active_select_dropdown(select)
+                        options = dropdown.locator('.el-select-dropdown__item').filter(
+                            has_text=re.compile(rf'^\s*{re.escape(new_value)}\s*$')
+                        ) if dropdown is not None else None
+                        if options is not None and await options.count() == 1 and await options.first.is_visible():
+                            await options.first.click()
+                            break
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise TmallFormListingError(f"天猫鞋码 {new_value} 搜索后没有唯一数字候选")
+                        await asyncio.sleep(.1)
+                else:
+                    await control.fill(new_value)
                 await control.press("Tab")
                 actual = await control.input_value()
                 if actual != new_value:
@@ -2527,6 +2551,8 @@ class TmallFormListing(TaobaoListing):
                         f"天猫规格“{dimension}”鞋码清理后回读失败：{actual!r}"
                     )
                 changed += 1
+                if self.logger is not None:
+                    self.logger.info("天猫鞋码规格已去掉码并回读：%s → %s", old_value, new_value)
             dimensions[dimension] = after
         return {"changed": changed, "dimensions": dimensions}
 
