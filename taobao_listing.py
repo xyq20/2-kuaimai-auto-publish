@@ -4323,11 +4323,47 @@ class TaobaoListing:
             and str(option.get("value") or option.get("name") or "").strip()
             and str(option.get("name") or option.get("value") or "").strip()
         )
+        # SKU 批量控件不一定出现在类目属性 JSON 的字段列表里，但审核
+        # 事件仍必须带非空且稳定的身份。优先使用接口/DOM 的真实 ID，
+        # 缺失时使用稳定合成 ID，不能再把空字符串发给审核服务。
+        category_id = ""
+        api_index = getattr(self, "api_index", None)
+        category_reader = getattr(api_index, "category_leaf_ids", None)
+        if callable(category_reader):
+            category_ids = tuple(
+                dict.fromkeys(
+                    str(value).strip() for value in category_reader() if str(value).strip()
+                )
+            )
+            if len(category_ids) == 1:
+                category_id = category_ids[0]
+        if not category_id:
+            category_id = f"{self.attribute_platform_id}-sku-batch-category"
+
+        field_id = ""
+        dom_source_reader = getattr(self, "_dom_select_source_id", None)
+        if callable(dom_source_reader):
+            field_id = await dom_source_reader(select)
+        if not field_id:
+            source_reader = getattr(api_index, "source_ids", None)
+            if callable(source_reader):
+                source_ids = tuple(
+                    dict.fromkeys(
+                        str(value).strip() for value in source_reader(label)
+                        if str(value).strip()
+                    )
+                )
+                if len(source_ids) == 1:
+                    field_id = source_ids[0]
+        if not field_id:
+            field_id = "sku-batch-" + canonical_sha256(
+                {"platform": self.attribute_platform_id, "label": normalize_label(label)}
+            )[:20]
         await runtime.resolve(
             AttributeRequest(
                 platform_id=self.attribute_platform_id,
-                category_leaf_id="",
-                field_id="",
+                category_leaf_id=category_id,
+                field_id=field_id,
                 field_label=label,
                 candidates=options,
                 excel_value="/".join(candidates),
@@ -4340,9 +4376,11 @@ class TaobaoListing:
         if self.logger is not None:
             self.logger.info(
                 "%s SKU 批量字段“%s”没有平台候选，且该下拉不支持自定义值；"
-                "已提交审核并继续填写后续字段",
+                "已提交审核并继续填写后续字段（类目=%s，字段=%s）",
                 self._platform_display_name,
                 label,
+                category_id,
+                field_id,
             )
 
     async def _resolve_unprovided_batch_select(
