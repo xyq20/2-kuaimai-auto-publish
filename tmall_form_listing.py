@@ -2726,6 +2726,14 @@ class TmallFormListing(TaobaoListing):
         deferred_fields: List[str] = []
         fixed = {"价格", "库存", "上市时间", "货号", "平台规格编码", "条形码"}
         items = row.locator(":scope > .sku-batch-item")
+        # 同名 SKU 字段可能同时渲染为左侧下拉和右侧说明文本框。
+        # 这类字段只允许填写下拉控件，文本框只是页面展示/兼容残留。
+        select_labels = set()
+        for index in range(await items.count()):
+            candidate = items.nth(index)
+            label_node = candidate.locator(":scope > .sku-batch-item_label")
+            if await label_node.count() and await candidate.locator(".el-select").count() == 1:
+                select_labels.add(normalize_label((await label_node.inner_text()).strip().rstrip("：:")))
         for index in range(await items.count()):
             item = items.nth(index)
             label_node = item.locator(":scope > .sku-batch-item_label")
@@ -2733,6 +2741,13 @@ class TmallFormListing(TaobaoListing):
                 continue
             label = (await label_node.inner_text()).strip().rstrip("：:").strip()
             if not label or label in fixed:
+                continue
+            if (
+                normalize_label(label) in select_labels
+                and await item.locator(".el-select").count() == 0
+            ):
+                if self.logger is not None:
+                    self.logger.info("天猫 SKU 批量字段“%s”存在下拉控件，跳过同名文本框", label)
                 continue
             source = _field_source(source_fields, label)
             if source is None:
