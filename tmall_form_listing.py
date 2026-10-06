@@ -522,6 +522,7 @@ class TmallFormListing(TaobaoListing):
         # ERP 常在保存基础资料后的约 30 秒才重新挂载类目配置与产品字段；
         # 使用实际字段/推荐项作为完成条件，给动态重渲染保留完整 60 秒窗口。
         deadline = asyncio.get_running_loop().time() + 60
+        search_fallback_at = asyncio.get_running_loop().time() + 2
         while asyncio.get_running_loop().time() < deadline:
             current = await self._category_text()
             buttons = self.panel.get_by_role("button", name="点击使用", exact=True)
@@ -576,9 +577,26 @@ class TmallFormListing(TaobaoListing):
                 except TmallFormListingError as exc:
                     if not str(exc).endswith("：0"):
                         raise
+            # 预测卡片可能永远为空，而人工类目搜索已经可用；不要让
+            # 这个空接口把整个平台流程拖满 60 秒。
+            if self.category_hints and asyncio.get_running_loop().time() >= search_fallback_at:
+                modify = self.panel.get_by_role("button", name="修改类目", exact=True)
+                if await modify.count() == 1 and await modify.first.is_visible():
+                    break
             await asyncio.sleep(0.1)
 
         if not candidates:
+            # 天猫有时不会渲染“预测类目”卡片，但“修改类目”弹窗里的
+            # 搜索结果已经可用。不能把预测接口为空误判成类目不存在；
+            # 复用淘宝适配器的 DOM 搜索与精确提示词匹配逻辑完成兜底。
+            if self.category_hints:
+                try:
+                    actual = await super().apply_excel_category()
+                except TaobaoListingError as exc:
+                    raise TmallFormListingError(str(exc)) from exc
+                if self.logger is not None:
+                    self.logger.info("天猫预测类目为空，已改用 Excel 类目搜索结果：%s", actual)
+                return actual
             raise TmallFormListingError("天猫页面没有唯一可用的推荐类目")
         if self.category_hints:
             chosen, strategy = choose_category_candidate(
@@ -591,10 +609,18 @@ class TmallFormListing(TaobaoListing):
                 == self._normalize_category_path(chosen)
             ] if chosen else []
             if len(matches) != 1:
-                raise TmallFormListingError(
-                    "天猫预测类目中没有与 Excel 商品分类唯一匹配的项："
-                    f"{len(matches)}"
-                )
+                # 推荐卡片存在但没有命中 Excel 时，也允许走同一个精确搜索
+                # 兜底。平台偶尔会把人工可搜到的类目漏出预测列表。
+                try:
+                    actual = await super().apply_excel_category()
+                except TaobaoListingError as exc:
+                    raise TmallFormListingError(
+                        "天猫预测类目中没有与 Excel 商品分类唯一匹配的项："
+                        f"{len(matches)}；类目搜索兜底失败：{exc}"
+                    ) from exc
+                if self.logger is not None:
+                    self.logger.info("天猫预测类目未命中 Excel，已改用类目搜索结果：%s", actual)
+                return actual
             button, expected = matches[0]
             if self.logger is not None:
                 self.logger.info(

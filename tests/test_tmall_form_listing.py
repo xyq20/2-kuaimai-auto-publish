@@ -371,6 +371,34 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             await self.page.evaluate("window.productPublishClicks || 0"), 0
         )
 
+    async def test_falls_back_to_excel_category_search_when_prediction_is_empty(self):
+        listing = await self._listing(
+            """
+            <div class="platform-category-input">
+              <span class="current"></span>
+              <button role="button" name="修改类目" onclick="
+                document.querySelector('[role=dialog]').style.display='block'">修改类目</button>
+            </div>
+            <div class="conf"><div class="complex-wrap"><div class="complex-item">类目属性</div></div></div>
+            <div role="dialog" aria-label="修改类目" style="display:none">
+              <input placeholder="请输入类目关键词，支持模糊查询" oninput="
+                document.querySelector('.el-autocomplete-suggestion').style.display='block'">
+              <div class="el-autocomplete-suggestion" style="display:none">
+              <div class="category-result" onclick="
+                  document.querySelector('.current').textContent='男装 > 牛仔裤';
+                  document.querySelector('[role=dialog] .selected').textContent='已选：男装 > 牛仔裤'">男装 &gt; 牛仔裤</div>
+              </div>
+              <div class="selected"></div>
+              <button onclick="this.closest('[role=dialog]').style.display='none'">确定</button>
+            </div>
+            """
+        )
+        listing.category_hints = ("牛仔裤",)
+
+        actual = await listing.apply_recommended_category()
+
+        self.assertEqual(actual, "男装 > 牛仔裤")
+
     async def test_waits_for_delayed_recommendation_when_stale_category_text_matches(self):
         listing = await self._listing(
             """
