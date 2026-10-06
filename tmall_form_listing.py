@@ -545,6 +545,22 @@ class TmallFormListing(TaobaoListing):
             # fill_product_identity() 的受限“展开”逻辑打开该区块；绝不点击
             # 同页可能存在的蓝色“发布”。
             if current and normalize_label(current) not in {"请选择", "商品分类"}:
+                # The page can already hold a valid category while the
+                # prediction buttons are absent or stale.  Prove the visible
+                # path against the Excel hints first; requiring a prediction
+                # button in this case incorrectly reports zero matches.
+                if self.category_hints:
+                    chosen, strategy = choose_category_candidate(
+                        (current,), self.category_hints
+                    )
+                    if chosen:
+                        if self.logger is not None:
+                            self.logger.info(
+                                "天猫已有类目与 Excel 商品分类匹配，保留当前类目：%s（%s）",
+                                current,
+                                strategy,
+                            )
+                        return current
                 expand_buttons = self.panel.get_by_text("展开", exact=True)
                 visible_expand = []
                 for index in range(await expand_buttons.count()):

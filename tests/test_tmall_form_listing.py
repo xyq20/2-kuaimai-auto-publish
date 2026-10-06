@@ -402,6 +402,23 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    async def test_keeps_existing_category_when_it_matches_excel_hints(self):
+        listing = await self._listing(
+            """
+            <div class="platform-category-input">
+              <span class="current">男装 &gt; 牛仔裤</span>
+              <button>修改类目</button>
+            </div>
+            """
+        )
+        listing.category_hints = ("牛仔裤", "男士直筒牛仔裤")
+
+        category = await asyncio.wait_for(
+            listing.apply_recommended_category(), timeout=0.5
+        )
+
+        self.assertEqual(category, "男装 > 牛仔裤")
+
     async def test_existing_category_with_expand_enters_product_info_path(self):
         """已有类目且产品信息折叠时，不应继续等待推荐类目。"""
         listing = await self._listing(
