@@ -167,6 +167,23 @@ $('nav-review').onclick = () => showView('review');
 $('nav-help').onclick = () => openDialog('help-dialog');
 $('more-button').onclick = () => openDialog('more-dialog');
 $('refresh-review').onclick = () => { $('review-frame').contentWindow.postMessage({type:'refresh-review'}, location.origin); };
+$('review-frame').addEventListener('load', () => { if (!$('review-view').hidden) $('review-frame').contentWindow?.postMessage({type:'refresh-review'}, location.origin); });
+$('copy-diagnostics').onclick = async () => {
+  const button = $('copy-diagnostics'); button.disabled = true;
+  try {
+    const health = await api('/api/health');
+    const lines = ['快麦工作台诊断信息', `时间: ${new Date().toISOString()}`, `页面: ${location.href}`,
+      `服务: ${health.ok ? '正常' : '异常'}`, `共享盘: ${health.share_available ? '可用' : '不可用'}`,
+      `商品目录: ${health.products_root_exists ? '可读' : '不可用'}`, `目录路径: ${health.products_root}`,
+      `当前商品: ${state.product?.style_code || '未选择'}`, `活动任务: ${state.active?.id || '无'}`,
+      `浏览器: ${navigator.userAgent}`];
+    const text = lines.join('\n');
+    try { await navigator.clipboard.writeText(text); }
+    catch (_) { const area = document.createElement('textarea'); area.value = text; area.style.position='fixed'; area.style.opacity='0'; document.body.append(area); area.select(); document.execCommand('copy'); area.remove(); }
+    toast('诊断信息已复制，可直接粘贴发送');
+  } catch (e) { toast(`诊断信息获取失败：${e.message}`); }
+  finally { button.disabled = false; }
+};
 $('logout').onclick = async () => { try { await api('/api/logout', {}); location.assign('/'); } catch (e) { toast(e.message); } };
 $('platform-grid').innerHTML = platforms.map(p => `<button class="platform-card" data-platform="${p.id}" aria-label="${p.name}" aria-pressed="false">${logo(p)}<span class="platform-name">${p.name}</span><span class="select-check">${icon('check')}</span></button>`).join('');
 $('platform-grid').onclick = event => {
