@@ -838,12 +838,35 @@ def parse_clothing_measurement_table(
         **_CLOTHING_MEASUREMENT_ALIASES,
         **_CLOTHING_EXTRA_ROW_ALIASES,
     }
-    for token in tokens:
+    consumed_label_tokens = set()
+    for index, token in enumerate(tokens):
+        if index in consumed_label_tokens:
+            continue
         matches = [
             kind
             for kind, aliases in row_aliases.items()
             if _matches_alias_composition(token.text, aliases)
         ]
+        # Vision can split the bilingual label into two adjacent OCR tokens,
+        # e.g. ``袖长/SLEEVE`` and ``LENGTH``. Recombine same-row neighbours
+        # before declaring a measurement row missing.
+        if not matches or (matches == ["sleeve"] and re.sub(r"[^A-Z]", "", token.text.upper()) == "SLEEVE"):
+            neighbours = [token]
+            for other in tokens[index + 1:]:
+                if abs(_center_y(other) - _center_y(token)) <= max(token.height, other.height) * 1.8:
+                    gap = other.x - (token.x + token.width)
+                    if 0 <= gap <= max(token.width, other.width) * 1.5:
+                        neighbours.append(other)
+                        break
+            if len(neighbours) == 2:
+                combined = "".join(item.text for item in neighbours)
+                matches = [
+                    kind
+                    for kind, aliases in row_aliases.items()
+                    if _matches_alias_composition(combined, aliases)
+                ]
+                if len(matches) == 1:
+                    consumed_label_tokens.add(index + 1)
         if len(matches) != 1:
             continue
         kind = matches[0]

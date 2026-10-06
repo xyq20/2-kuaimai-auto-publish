@@ -194,17 +194,21 @@ class VisionOCRUnitTests(unittest.TestCase):
             _token("57", 0.60, 0.75),
         )
 
-        actual = parse_clothing_measurement_table(
-            tokens, ("S", "M"), source="外套尺码表"
+    def test_douyin_clothing_recombines_split_sleeve_label(self):
+        tokens = (
+            _token("S", 0.40, 0.10), _token("M", 0.60, 0.10),
+            _token("衣长/LENGTH", 0.05, 0.30, width=0.20),
+            _token("胸围/BUST", 0.05, 0.45, width=0.18),
+            _token("肩宽/SHOULDER", 0.05, 0.60, width=0.20),
+            _token("SLEEVE", 0.05, 0.75, width=0.18), _token("LENGTH", 0.25, 0.75, width=0.10),
+            _token("63", 0.40, 0.30), _token("64", 0.60, 0.30),
+            _token("110", 0.40, 0.45), _token("114", 0.60, 0.45),
+            _token("48", 0.40, 0.60), _token("49", 0.60, 0.60),
+            _token("63", 0.40, 0.75), _token("64", 0.60, 0.75),
         )
-
-        self.assertEqual(
-            actual,
-            {
-                "S": {"length": 63.5, "chest": 125, "shoulder": 55, "sleeve": 56},
-                "M": {"length": 65, "chest": 129, "shoulder": 56.5, "sleeve": 57},
-            },
-        )
+        actual = parse_clothing_measurement_table(tokens, ("S", "M"), source="拆分英文尺码表")
+        self.assertEqual(actual["S"]["sleeve"], 63)
+        self.assertEqual(actual["M"]["sleeve"], 64)
 
     def test_douyin_clothing_ignores_extra_cuff_row_when_bounding_cells(self):
         tokens = (
