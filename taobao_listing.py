@@ -753,7 +753,15 @@ class TaobaoListing:
         selected_text = ""
         selected_node: Any = None
         selected_hint = ""
-        for hint in category_search_terms(hints):
+        search_terms = category_search_terms(hints)
+        # 裤类平台通常把“牛仔裤/男士直筒牛仔裤”拆成叶类目和供应商
+        # 描述。先搜 Excel 中的基础叶类目，避免每次先走一个平台不存在
+        # 的长描述，再重复搜索真正可选的“牛仔裤”。
+        if category_profile(hints).garment_kind == "pants":
+            search_terms = tuple(
+                sorted(search_terms, key=lambda value: (len(value), search_terms.index(value)))
+            )
+        for hint in search_terms:
             await search.fill(hint, timeout=10_000)
             deadline = asyncio.get_running_loop().time() + 20
             while asyncio.get_running_loop().time() < deadline:
@@ -4159,15 +4167,25 @@ class TaobaoListing:
             raise TaobaoListingError(f"淘宝 SKU 批量设置行不唯一：{len(matches)}")
         return matches[0]
 
-    async def _sku_batch_item(self, row: Any, label: str) -> Any:
+    async def _sku_batch_item(
+        self, row: Any, label: str, *, control: Optional[str] = None
+    ) -> Any:
         items = row.locator(":scope > .sku-batch-item")
         matches = []
         for index in range(await items.count()):
             item = items.nth(index)
             item_label = item.locator(":scope > .sku-batch-item_label")
-            if await item_label.count() and normalize_label(
+            if not await item_label.count() or normalize_label(
                 await item_label.inner_text()
-            ) == normalize_label(label):
+            ) != normalize_label(label):
+                continue
+            if control == "select" and await item.locator(".el-select").count() != 1:
+                continue
+            if control == "text" and await item.locator(".el-select").count() != 0:
+                continue
+            if control not in {None, "select", "text"}:
+                raise TaobaoListingError(f"淘宝 SKU 批量字段控件类型无效：{control}")
+            if await item_label.count():
                 matches.append(item)
         if len(matches) != 1:
             raise TaobaoListingError(f"淘宝 SKU 批量字段“{label}”不唯一：{len(matches)}")
@@ -4177,7 +4195,7 @@ class TaobaoListing:
         expected = sku_batch_excel_value(
             label, expected, category_hints=self.category_hints
         )
-        item = await self._sku_batch_item(row, label)
+        item = await self._sku_batch_item(row, label, control="text")
         inputs = item.locator("input.el-input__inner:not([readonly])")
         if await inputs.count() != 1:
             raise TaobaoListingError(f"淘宝 SKU 批量字段“{label}”输入框不唯一")
@@ -4198,7 +4216,9 @@ class TaobaoListing:
         label: str,
         candidates: Sequence[str],
     ) -> Optional[str]:
-        item = await self._sku_batch_item(row, label)
+        # 同一页面可能同时有一个左侧下拉框和一个右侧文本框，
+        # 两者标签都叫“裤型”。按控件类型定位，避免把右侧同名输入误报为重复。
+        item = await self._sku_batch_item(row, label, control="select")
         selects = item.locator(".el-select")
         if await selects.count() != 1:
             raise TaobaoListingError(f"淘宝 SKU 批量字段“{label}”下拉框不唯一")
