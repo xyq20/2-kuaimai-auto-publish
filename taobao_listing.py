@@ -4359,6 +4359,21 @@ class TaobaoListing:
             field_id = "sku-batch-" + canonical_sha256(
                 {"platform": self.attribute_platform_id, "label": normalize_label(label)}
             )[:20]
+        # 某些天猫接口把 SKU 批量字段挂在普通属性描述下；按 DOM
+        # 字段 ID/去掉“SKU批量”前缀的标签反查其真实类目 ID。
+        fields_reader = getattr(api_index, "fields_for_label", None)
+        if callable(fields_reader):
+            base_label = re.sub(r"^SKU批量", "", str(label)).strip()
+            related = []
+            for lookup in (label, base_label):
+                for field in fields_reader(lookup):
+                    source = str(getattr(field, "source_id", "") or "").strip()
+                    category = str(getattr(field, "category_leaf_id", "") or "").strip()
+                    if category and (source == field_id or lookup == base_label):
+                        related.append(category)
+            related_ids = tuple(dict.fromkeys(related))
+            if len(related_ids) == 1:
+                category_id = related_ids[0]
         await runtime.resolve(
             AttributeRequest(
                 platform_id=self.attribute_platform_id,
