@@ -2647,18 +2647,38 @@ class TmallFormListing(TaobaoListing):
         raw_rows = snapshot.get("rows", ())
         if not raw_rows:
             raise TmallFormListingError("天猫 SKU 表格没有可校验的明细行")
-        try:
-            indices = {
-                label: self._sku_column_index(headers, label) for label in expected
-            }
-        except TaobaoListingError as exc:
-            raise TmallFormListingError(str(exc).replace("淘宝", "天猫")) from exc
+        indices = {}
+        for label in expected:
+            wanted = normalize_label(label)
+            matches = [
+                index for index, header in enumerate(headers)
+                if normalize_label(header) == wanted
+                or normalize_label(header).startswith(wanted)
+            ]
+            if len(matches) == 1:
+                indices[label] = matches[0]
+            elif len(matches) > 1:
+                # 天猫可能同时输出下拉字段和同名展示列。左侧控件已在
+                # 批量区完成回读，表格无法区分同名列时跳过该列校验。
+                if self.logger is not None:
+                    self.logger.info(
+                        "天猫 SKU 表格列“%s”存在同名列%s，跳过歧义列校验",
+                        label,
+                        matches,
+                    )
+                continue
+            else:
+                raise TmallFormListingError(
+                    f"天猫 SKU 表格列“{label}”不是唯一项：{matches}"
+                )
         rows: List[Mapping[str, str]] = []
         errors: List[str] = []
         for row_number, raw_row in enumerate(raw_rows, 1):
             raw_values = tuple(str(value) for value in raw_row)
             values = {label: raw_values[index] for label, index in indices.items()}
             for label, wanted in expected.items():
+                if label not in indices:
+                    continue
                 actual = values[label]
                 if label in {"价格", "库存"}:
                     matches = self._numeric_equal(actual, wanted)
