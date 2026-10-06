@@ -649,13 +649,7 @@ class TaobaoListing:
         await button.click()
         self.category_clicked = True
         await self._wait_for_loading_masks()
-        try:
-            await self.panel.locator(
-                ".conf .complex-wrap > .complex-item, "
-                ".conf .complex-wrap > .complex-item_multi"
-            ).first.wait_for(state="visible", timeout=30_000)
-        except Exception as exc:
-            raise TaobaoListingError("淘宝类目应用后，类目属性未渲染") from exc
+        await self._wait_for_category_applied()
         actual = await self._category_text()
         if self._normalize_category_path(actual) != self._normalize_category_path(expected):
             raise TaobaoListingError(
@@ -664,6 +658,16 @@ class TaobaoListing:
         if self.logger is not None:
             self.logger.info("已应用淘宝%s类目：%s", source, actual)
         return actual
+
+    async def _wait_for_category_applied(self) -> None:
+        """Wait for the platform-specific category form after selection."""
+        try:
+            await self.panel.locator(
+                ".conf .complex-wrap > .complex-item, "
+                ".conf .complex-wrap > .complex-item_multi"
+            ).first.wait_for(state="visible", timeout=30_000)
+        except Exception as exc:
+            raise TaobaoListingError("淘宝类目应用后，类目属性未渲染") from exc
 
     async def apply_excel_category(self) -> str:
         """Apply the Taobao category using the Excel 商品分类 hints."""
@@ -810,13 +814,7 @@ class TaobaoListing:
         await dialog.wait_for(state="hidden", timeout=30_000)
         self.category_clicked = True
         await self._wait_for_loading_masks()
-        try:
-            await self.panel.locator(
-                ".conf .complex-wrap > .complex-item, "
-                ".conf .complex-wrap > .complex-item_multi"
-            ).first.wait_for(state="visible", timeout=30_000)
-        except Exception as exc:
-            raise TaobaoListingError("淘宝 Excel 类目应用后，类目属性未渲染") from exc
+        await self._wait_for_category_applied()
         actual = await self._category_text()
         if self._normalize_category_path(actual) != self._normalize_category_path(selected_text):
             raise TaobaoListingError(

@@ -514,6 +514,16 @@ class TmallFormListing(TaobaoListing):
     def _normalize_category_path(value: object) -> str:
         return re.sub(r"[\s>＞]", "", str(value)).casefold()
 
+    async def _wait_for_category_applied(self) -> None:
+        """天猫没有淘宝的 .conf 类目属性容器，按类目回读确认激活。"""
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            current = await self._category_text()
+            if current and normalize_label(current) not in {"请选择", "商品分类"}:
+                return
+            await asyncio.sleep(0.1)
+        raise TmallFormListingError("天猫类目应用后页面未回读已选类目")
+
     async def apply_recommended_category(self) -> str:
         if self.panel is None:
             raise TmallFormListingError("请先调用 open() 打开天猫资料")
