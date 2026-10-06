@@ -26,6 +26,7 @@ const icons = {
   check: '<path d="m5 12 4 4L19 6"/>',
   box: '<path d="m12 3 9 5v9l-9 5-9-5V8l9-5Zm0 10 9-5M3 8l9 5v9M7 6l10 5"/>',
   plus: '<path d="M12 4v16M4 12h16"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10H3V7Z"/>',
   shirt: '<path d="m8 3-6 4 3 6 3-1v9h8v-9l3 1 3-6-6-4c0 4-8 4-8 0Z"/>',
 };
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${icons[name] || icons.box}</svg>`;
@@ -49,7 +50,7 @@ const modes = [
   {id:'publish', name:'保存并铺货', description:'保存后提交指定店铺', icon:'upload', note:'会保存资料并提交到已配置的店铺。'},
 ];
 const state = {selected:['douyin','jd','xhs'], product:null, products:[], productFilter:'unprocessed', mode:'save', learning:true,
-  operation:'platforms', history:[], active:null, opened:null, draft:null, admin:false, learningAvailable:false, reviewCount:0};
+  operation:'platforms', history:[], historySearchResults:null, historySearchTotal:0, active:null, opened:null, draft:null, admin:false, learningAvailable:false, reviewCount:0};
 const labels = {pending:'等待执行', running:'运行中', waiting_review:'等待审核', stopping:'正在停止',
   stopped:'已停止', interrupted:'运行中断', failed:'失败', completed:'已完成', success:'已完成'};
 const errors = {
@@ -60,6 +61,7 @@ const errors = {
   admin_required:'当前账号可审核和查看记录；启动或停止任务需要管理员账号。', unauthorized:'登录已过期，请重新登录。',
   invalid_platforms:'请至少选择一个平台，且不要重复选择。', base_requires_save:'基础资料和新建商品使用“只保存”模式。',
   launch_failed:'任务进程启动失败，请检查本机运行环境。', process_check_failed:'无法确认本机任务状态，请稍后重试。',
+  folder_open_unavailable:'审核服务所在电脑不支持打开文件夹。', folder_open_failed:'文件夹未能打开，请检查共享盘是否已连接。',
 };
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const mode = () => modes.find(m => m.id === state.mode);
@@ -67,7 +69,7 @@ const platformName = id => platform(id)?.name || (id === 'base' ? '基础资料'
 const operationName = id => ({platforms:'平台资料',base:'基础资料',create:'新建商品'}[id] || id);
 const isActive = job => job && ['running','waiting_review','stopping'].includes(job.status);
 const uuid = () => crypto.randomUUID().replaceAll('-','');
-let toastTimer, pollTimer, productRequest = 0, actionBusy = false;
+let toastTimer, pollTimer, historySearchTimer, productRequest = 0, historyRequest = 0, actionBusy = false;
 
 async function api(path, data) {
   const response = await fetch(path, {method:data === undefined ? 'GET' : 'POST', credentials:'same-origin',
@@ -87,8 +89,14 @@ function toast(message) {
 }
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
 function remember() {
-  try { localStorage.setItem('kuaimai.workbench', JSON.stringify({selected:state.selected, mode:state.mode,
-    learning:state.learning, productId:state.product?.id})); } catch (_) { /* Browsing still works without storage. */ }
+  try {
+    const snapshot = {selected:state.selected, mode:state.mode, productId:state.product?.id};
+    // `learning:false` was written by older builds even when the review
+    // service was unavailable.  Keep an explicit preference under a new key
+    // so that stale automatic state cannot disable review after a restart.
+    if (state.learningAvailable) snapshot.learning_preference = state.learning;
+    localStorage.setItem('kuaimai.workbench', JSON.stringify(snapshot));
+  } catch (_) { /* Browsing still works without storage. */ }
 }
 function renderProduct() {
   const p = state.product;
@@ -99,6 +107,8 @@ function renderProduct() {
   $('product-title').textContent = p?.title || '请选择本次处理的商品';
   $('product-category').textContent = p?.category || '';
   $('plan-product').textContent = p?.style_code || '待选择';
+  $('open-product-folder').hidden = !state.admin;
+  $('open-product-folder').disabled = !p || !state.admin;
   renderPlan();
 }
 function renderPlatformSelection() {
@@ -108,14 +118,17 @@ function renderPlatformSelection() {
 }
 function renderPlan() {
   const normal = state.operation === 'platforms';
-  const ids = normal ? state.selected : ['base'];
+  const autoBase = normal && state.mode !== 'preview' && state.product && state.product.base_saved === false;
+  const ids = normal ? (autoBase ? ['base', ...state.selected] : state.selected) : ['base'];
   $('platform-section').hidden = !normal;
   $('operation-banner').hidden = normal;
   $('operation-label').textContent = `${operationName(state.operation)} · 保存快麦商品，不铺货`;
   $('plan-count').textContent = normal ? `${ids.length} 个平台` : operationName(state.operation);
   $('plan-list').innerHTML = ids.map((id,index) => {
     const p = platform(id);
-    return `<li><span class="queue-number">${index+1}</span><span class="queue-logo">${p ? logo(p) : icon('box')}</span><span class="queue-name">${normal ? platformName(id) : operationName(state.operation)}</span>${normal ? `<div class="reorder"><button data-move="${id}" data-direction="-1" aria-label="上移${p.name}" ${index === 0 ? 'disabled' : ''}>${icon('up')}</button><button data-move="${id}" data-direction="1" aria-label="下移${p.name}" ${index === ids.length-1 ? 'disabled' : ''}>${icon('down')}</button></div>` : ''}</li>`;
+    const name = normal ? platformName(id) : operationName(state.operation);
+    const reorder = normal && id !== 'base' ? `<div class="reorder"><button data-move="${id}" data-direction="-1" aria-label="上移${name}" ${index === 0 || ids[index - 1] === 'base' ? 'disabled' : ''}>${icon('up')}</button><button data-move="${id}" data-direction="1" aria-label="下移${name}" ${index === ids.length-1 ? 'disabled' : ''}>${icon('down')}</button></div>` : '';
+    return `<li><span class="queue-number">${index+1}</span><span class="queue-logo">${p ? logo(p) : icon('box')}</span><span class="queue-name">${name}</span>${reorder}</li>`;
   }).join('');
   $('empty-plan').hidden = ids.length > 0;
   $('preview-run').disabled = !state.admin || !state.product || !ids.length || !!state.active;
@@ -123,7 +136,8 @@ function renderPlan() {
   $('plan-mode').textContent = mode().name;
   $('plan-learning').innerHTML = state.learning && normal ? '<i></i>已开启' : '已关闭';
   $('mode-note').classList.toggle('publish', state.mode === 'publish');
-  $('mode-note').innerHTML = icon(state.mode === 'publish' ? 'info' : 'shield') + `<p>${mode().note}</p>`;
+  const baseNote = autoBase ? '新商品会先保存基础资料，再继续所选平台。' : '';
+  $('mode-note').innerHTML = icon(state.mode === 'publish' ? 'info' : 'shield') + `<p>${baseNote || mode().note}</p>`;
   $('learning-toggle').disabled = !normal || !state.learningAvailable;
   $('learning-toggle').checked = state.learning && normal;
   document.querySelectorAll('[data-mode]').forEach(button => {
@@ -186,7 +200,16 @@ $('back-platforms').onclick = () => { state.operation = 'platforms'; renderPlan(
 
 async function chooseProduct(id) {
   const request = ++productRequest;
-  state.product = null; renderProduct();
+  // Keep the selected card visible while the workbook details are loading.
+  // Clearing it first made a normal SMB read look like the page had frozen.
+  const summary = state.products.find(item => item.id === id);
+  if (summary) {
+    const identity = productIdentity(summary);
+    state.product = {...summary, folder: summary.folder || summary.title,
+      title: summary.title || identity.name, style_code: summary.style_code || identity.code,
+      category: summary.category || ''};
+    renderProduct();
+  }
   try {
     const p = await api('/api/launcher/products/'+id);
     if (request !== productRequest) return;
@@ -240,6 +263,15 @@ async function loadProducts(preferred, refreshOnly = false) {
   finally { $('refresh-products').disabled = false; }
 }
 $('change-product').onclick = () => { $('product-search').value=''; renderProducts(); openDialog('product-dialog'); $('product-search').focus(); loadProducts(undefined, true); };
+$('open-product-folder').onclick = async () => {
+  const id = state.product?.id;
+  if (!id) { toast('请先选择商品。'); return; }
+  if (!state.admin) { toast(errors.admin_required); return; }
+  $('open-product-folder').disabled = true;
+  try { await api('/api/launcher/products/'+encodeURIComponent(id)+'/open-folder', {}); toast('已在审核服务所在电脑打开商品文件夹'); }
+  catch (e) { toast(e.message); }
+  finally { $('open-product-folder').disabled = !state.product || !state.admin; }
+};
 $('product-search').oninput = renderProducts;
 document.querySelectorAll('[data-product-filter]').forEach(button => button.onclick = () => { state.productFilter = button.dataset.productFilter; renderProducts(); });
 $('refresh-products').onclick = () => loadProducts(undefined, true);
@@ -247,11 +279,42 @@ $('product-list').onclick = event => { const b = event.target.closest('[data-pro
 
 function renderHistory() {
   $('history-count').textContent = state.history.length;
-  $('history-list').innerHTML = state.history.length ? state.history.map(job => `<button class="history-row" data-job="${job.id}"><div><strong>${escapeHTML(job.style_code)} · ${escapeHTML(job.title)}</strong><p>${escapeHTML(job.platforms.map(platformName).join(' → '))} · ${modes.find(m=>m.id===job.mode)?.name || ''}<br>${escapeHTML(new Date(job.created_at).toLocaleString('zh-CN'))} · ${escapeHTML(job.created_by)}</p></div><span class="history-status ${job.status}">${labels[job.status] || job.status} ${icon('chevron')}</span></button>`).join('') : '<p class="empty-message">还没有网页运行记录。开始一次任务后会记录在这里。</p>';
+  const searching = !!$('history-search').value.trim();
+  const jobs = searching ? state.historySearchResults : state.history;
+  $('history-results').textContent = searching
+    ? jobs === null ? '正在搜索运行记录…' : `找到 ${state.historySearchTotal} 条记录${state.historySearchTotal > jobs.length ? '，显示最近 100 条' : ''}`
+    : `最近 ${state.history.length} 条运行记录`;
+  $('history-list').innerHTML = jobs?.length ? jobs.map(job => `<button class="history-row" data-job="${job.id}"><div><strong>${escapeHTML(job.style_code)} · ${escapeHTML(job.title)}</strong><p>${escapeHTML(job.platforms.map(platformName).join(' → '))} · ${modes.find(m=>m.id===job.mode)?.name || ''}<br>${escapeHTML(new Date(job.created_at).toLocaleString('zh-CN'))} · ${escapeHTML(job.created_by)}</p></div><span class="history-status ${job.status}">${labels[job.status] || job.status} ${icon('chevron')}</span></button>`).join('') : `<p class="empty-message">${searching ? jobs === null ? '正在搜索…' : '没有匹配的运行记录。' : '还没有网页运行记录。开始一次任务后会记录在这里。'}</p>`;
 }
+async function loadHistorySearch() {
+  const query = $('history-search').value.trim();
+  const request = ++historyRequest;
+  if (!query) { state.historySearchResults = null; renderHistory(); return; }
+  try {
+    const data = await api('/api/launcher/jobs?search='+encodeURIComponent(query));
+    if (request !== historyRequest || query !== $('history-search').value.trim()) return;
+    state.historySearchResults = data.jobs;
+    state.historySearchTotal = data.total_matches;
+    renderHistory();
+  } catch (e) {
+    if (request === historyRequest) {
+      state.historySearchResults = []; renderHistory(); $('history-results').textContent = e.message;
+    }
+  }
+}
+$('history-search').oninput = () => {
+  clearTimeout(historySearchTimer); ++historyRequest;
+  state.historySearchResults = null; renderHistory();
+  historySearchTimer = setTimeout(loadHistorySearch, 180);
+};
 $('history-list').onclick = event => { const b = event.target.closest('[data-job]'); if (b) openJob(b.dataset.job); };
 $('active-job').onclick = () => { if (state.active) openJob(state.active.id); };
 function renderJob(job) {
+  if (job.base_auto_added && job.product_id === state.product?.id &&
+      job.stages?.some(stage => stage.platform === 'base' && stage.status === 'success')) {
+    state.product.base_saved = true;
+    renderPlan();
+  }
   $('run-title').textContent = `${job.style_code} · ${labels[job.status] || job.status}`;
   $('run-subtitle').textContent = isActive(job) ? '关闭此窗口不影响任务。需要人工确认时可进入商品属性审核。' : '以下为实际运行结果；已保存或已铺货的操作不会因关闭窗口而撤回。';
   $('run-summary').innerHTML = `<span>商品</span><strong>${escapeHTML(job.style_code)}</strong><span>执行模式</span><strong>${modes.find(m=>m.id===job.mode)?.name}</strong><span>任务编号</span><strong>${job.id.slice(0,8)}</strong>`;
@@ -276,8 +339,10 @@ $('preview-run').onclick = () => {
   state.draft = {request_key:uuid(), product_id:state.product.id, platforms:[...state.selected], mode:state.mode,
     operation:state.operation, learning:state.operation === 'platforms' && state.learning};
   $('run-title').textContent = '确认这次运行';
-  $('run-subtitle').textContent = state.mode === 'publish' ? '本次会真实保存并铺货到已配置的店铺，请核对商品与平台。' : state.mode === 'save' ? '本次会保存快麦商品资料，不提交到店铺。' : '本次只填写并校验，不保存、不铺货。';
-  $('run-summary').innerHTML = `<span>商品</span><strong>${escapeHTML(state.product.style_code)}</strong><span>执行模式</span><strong>${mode().name}</strong><span>处理范围</span><strong>${state.operation === 'platforms' ? state.selected.map(platformName).join(' → ') : operationName(state.operation)}</strong>`;
+  const autoBase = state.operation === 'platforms' && state.mode !== 'preview' && state.product.base_saved === false;
+  const runIds = state.operation === 'platforms' ? (autoBase ? ['base', ...state.selected] : state.selected) : ['base'];
+  $('run-subtitle').textContent = autoBase ? '本次会先保存基础资料，再继续所选平台。' : state.mode === 'publish' ? '本次会真实保存并铺货到已配置的店铺，请核对商品与平台。' : state.mode === 'save' ? '本次会保存快麦商品资料，不提交到店铺。' : '本次只填写并校验，不保存、不铺货。';
+  $('run-summary').innerHTML = `<span>商品</span><strong>${escapeHTML(state.product.style_code)}</strong><span>执行模式</span><strong>${mode().name}</strong><span>处理范围</span><strong>${runIds.map(platformName).join(' → ')}</strong>`;
   $('run-stages').replaceChildren(); $('log-details').hidden = true; $('run-error').hidden = true; $('run-review').hidden = true;
   $('run-confirm').hidden = false; $('run-confirm').disabled = false;
   $('run-confirm').textContent = state.mode === 'publish' ? '确认保存并铺货' : '确认开始';
@@ -309,6 +374,7 @@ async function poll() {
     const [historyData, reviewData] = await Promise.all([api('/api/launcher/jobs'),api('/api/reviews')]);
     state.history = historyData.jobs; state.active = state.history.find(isActive) || null;
     renderHistory(); renderPlan();
+    if ($('history-search').value.trim()) loadHistorySearch();
     $('active-job').hidden = !state.active;
     if (state.active) $('active-job').innerHTML = icon(state.active.status === 'waiting_review' ? 'edit' : 'play') + `<strong>${escapeHTML(state.active.style_code)} · ${labels[state.active.status]}</strong><span>查看任务 ${icon('chevron')}</span>`;
     const count = reviewData.tasks.length; $('review-count').textContent = count;
@@ -332,7 +398,7 @@ async function boot() {
   try {
     const config = await api('/api/launcher/config');
     state.admin = config.user.role === 'admin'; state.learningAvailable = config.learning_available;
-    state.learning = config.learning_available && saved.learning !== false;
+    state.learning = config.learning_available && saved.learning_preference !== false;
     $('account').textContent = config.user.username + (state.admin ? ' · 管理员' : ' · 审核员');
     document.querySelector('.avatar').textContent = config.user.username.slice(0,1).toUpperCase();
     renderPlan();

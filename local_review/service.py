@@ -1044,7 +1044,8 @@ def decide_review_learning(settings: Settings, data: Any) -> dict[str, Any]:
             if not labels:
                 continue
             records.append({**dict(row), 'category': json.loads(row['category_json']),
-                            'excel_candidates': context['excel_candidates'], 'labels': labels})
+                            'excel_candidates': context['excel_candidates'],
+                            'control_type': context.get('control_type'), 'labels': labels})
         decision = choose_review_learning(
             {**data, 'field_label': snapshot['field_label'],
              'category': json.loads(product['category_json']), 'options': options}, records)

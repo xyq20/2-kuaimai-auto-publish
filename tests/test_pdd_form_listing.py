@@ -1,9 +1,11 @@
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from attribute_runtime import ResolvedAttribute
 from pdd_data import PddFields
-from pdd_form_listing import PddFormListing
+from pdd_form_listing import PddFormListing, PddFormListingError
 from pdd_listing import parse_pdd_attribute_fields
 
 
@@ -331,6 +333,220 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
         category = await listing.apply_recommended_category()
 
         self.assertEqual(category, "男装 > 休闲裤")
+
+    async def test_existing_full_cascader_category_is_reused_for_similar_excel_hints(self):
+        listing = await self._listing()
+        listing.category_hints = ("牛仔裤", "男士直筒牛仔裤")
+        await self.page.locator(".current").evaluate(
+            "node => node.textContent = '男装 > 牛仔裤 > 牛仔裤'"
+        )
+        await self.page.locator(".recommendation").evaluate("node => node.remove()")
+
+        category = await listing.apply_recommended_category()
+
+        self.assertEqual(category, "男装 > 牛仔裤 > 牛仔裤")
+
+    async def _jeans_category_search_fixture(self):
+        listing = await self._listing()
+        listing.category_hints = ("牛仔裤", "男士直筒牛仔裤")
+        await self.page.evaluate("""() => {
+          document.querySelector('.current').textContent = '男装 > 休闲裤 > 休闲裤';
+          document.querySelector('.platform-category-input').insertAdjacentHTML('beforeend',
+            `<button onclick="document.querySelector('#category-dialog').style.display='block'">修改类目</button>`);
+          document.querySelector('.recommendation button').onclick = () => {
+            throw Error('不应选中与 Excel 不匹配的推荐');
+          };
+          document.body.insertAdjacentHTML('beforeend', `
+            <div role="dialog" aria-label="修改类目" id="category-dialog" style="display:none">
+              <input placeholder="请输入类目关键词，支持模糊查询"
+                oninput="document.querySelector('#suggestions').style.display='block'">
+              <div id="selected">已选：</div>
+              <div class="el-cascader-panel" id="category-panel" style="display:none">
+                <div class="el-cascader-menu"><div class="el-cascader-node" aria-haspopup="true">男装</div></div>
+                <div class="el-cascader-menu"><div class="el-cascader-node" aria-haspopup="true"
+                  onclick="document.querySelector('#leaf-menu').style.display='block'">牛仔裤</div></div>
+                <div class="el-cascader-menu" id="leaf-menu" style="display:none"><div class="el-cascader-node leaf"
+                  onclick="document.querySelector('#selected').textContent='已选：男装 > 牛仔裤 > 牛仔裤';
+                    document.querySelector('.current').textContent='男装 > 牛仔裤 > 牛仔裤'">牛仔裤</div></div>
+              </div>
+              <button onclick="if (document.querySelector('#selected').textContent !== '已选：')
+                document.querySelector('#category-dialog').style.display='none'">确定</button>
+            </div>
+            <div class="el-autocomplete-suggestion el-popper" id="suggestions" style="display:none">
+              <ul><li onclick="document.querySelector('#selected').textContent='已选：男装 > 牛仔裤';
+                document.querySelector('#suggestions').style.display='none';
+                setTimeout(() => document.querySelector('#category-panel').style.display='block', 200)">男装 > 牛仔裤</li></ul>
+            </div>`);
+        }""")
+
+        return listing
+
+    async def test_wrong_current_and_recommended_category_use_excel_manual_search(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.evaluate("""() => {
+          window.categorySearchInputs = [];
+          document.querySelector('#category-dialog input').addEventListener('input', event => {
+            window.categorySearchInputs.push(event.target.value);
+          });
+        }""")
+        self.assertEqual(
+            await listing.apply_recommended_category(),
+            "男装 > 牛仔裤 > 牛仔裤",
+        )
+        self.assertEqual(await listing._category_text(), "男装 > 牛仔裤 > 牛仔裤")
+        self.assertEqual(await self.page.evaluate('window.categorySearchInputs'), ['牛仔裤'])
+
+    async def test_full_jeans_search_path_does_not_append_an_extra_level(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.evaluate("""() => {
+          document.querySelector('#suggestions li').textContent = '男装 > 牛仔裤 > 牛仔裤';
+          document.querySelector('#leaf-menu').style.display = 'block';
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤 > 牛仔裤')
+
+    async def _capture_jeans_tree(self, listing, ids=(239, 7289, 7298), leaf=1):
+        root, branch, child = ids
+        await listing._capture_category_tree(SimpleNamespace(status=200, json=AsyncMock(return_value={
+            'result': 1, 'data': [
+                {'cid': root, 'parentCid': 0, 'name': '男装', 'level': 1, 'leaf': 0,
+                 'children': [
+                     {'cid': branch, 'parentCid': root, 'name': '牛仔裤', 'level': 2, 'leaf': 0,
+                      'children': [
+                          {'cid': child, 'parentCid': branch, 'name': '牛仔裤', 'level': 3, 'leaf': leaf}
+                      ]}
+                 ]}
+            ]
+        })))
+
+    async def test_root_only_render_waits_for_child_columns_with_json_proof(self):
+        # Live search first exposes only root categories; child menus arrive
+        # asynchronously. IDs may change and are not DOM matching criteria.
+        for ids in ((239, 7289, 7298), (90001, 90002, 90003)):
+            with self.subTest(ids=ids):
+                listing = await self._jeans_category_search_fixture()
+                await self._capture_jeans_tree(listing, ids)
+                await self.page.evaluate("""() => {
+                  const menus = document.querySelectorAll('.el-cascader-menu');
+                  menus[1].style.display = 'none';
+                  menus[0].firstElementChild.onclick = () => {
+                    setTimeout(() => menus[1].style.display = 'block', 300);
+                  };
+                }""")
+                self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤 > 牛仔裤')
+
+    async def test_json_dom_leaf_disagreement_stops_before_confirmation(self):
+        listing = await self._jeans_category_search_fixture()
+        await self._capture_jeans_tree(listing, leaf=0)
+        with self.assertRaisesRegex(PddFormListingError, 'JSON 与 DOM 末级标记不一致'):
+            await listing.apply_recommended_category()
+        self.assertTrue(await self.page.locator('#category-dialog').is_visible())
+
+    async def test_same_name_json_sibling_ambiguity_stops_before_confirmation(self):
+        listing = await self._jeans_category_search_fixture()
+        await self._capture_jeans_tree(listing)
+        listing._category_tree_nodes['99999'] = {
+            'cid': 99999, 'parentCid': 7289, 'name': '牛仔裤', 'level': 3, 'leaf': 1
+        }
+        with self.assertRaisesRegex(PddFormListingError, 'JSON 与 DOM 路径不一致或有歧义'):
+            await listing.apply_recommended_category()
+        self.assertTrue(await self.page.locator('#category-dialog').is_visible())
+
+    async def test_legacy_two_level_jeans_category_remains_supported(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.evaluate("""() => {
+          document.querySelector('#leaf-menu').remove();
+          const leaf = document.querySelectorAll('.el-cascader-node')[1];
+          leaf.removeAttribute('aria-haspopup');
+          leaf.onclick = () => {
+            document.querySelector('#selected').textContent = '已选：男装 > 牛仔裤';
+            document.querySelector('.current').textContent = '男装 > 牛仔裤';
+          };
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤')
+
+    async def test_same_name_intermediate_branch_preserves_its_depth(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.evaluate("""() => {
+          const branch = document.querySelector('#leaf-menu .leaf');
+          branch.setAttribute('aria-haspopup', 'true');
+          branch.onclick = () => document.querySelector('#final-menu').style.display = 'block';
+          document.querySelector('#category-panel').insertAdjacentHTML('beforeend', `
+            <div class="el-cascader-menu" id="final-menu" style="display:none">
+              <div class="el-cascader-node" onclick="
+                document.querySelector('#selected').textContent='已选：男装 > 牛仔裤 > 牛仔裤 > 牛仔裤';
+                document.querySelector('.current').textContent='男装 > 牛仔裤 > 牛仔裤 > 牛仔裤'">牛仔裤</div>
+            </div>`);
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤 > 牛仔裤 > 牛仔裤')
+
+    async def test_manual_leaf_readback_must_keep_the_complete_path(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.locator('#leaf-menu .leaf').evaluate("""node => {
+          node.onclick = () => {
+            document.querySelector('#selected').textContent = '已选：男装 > 牛仔裤';
+          };
+        }""")
+        with self.assertRaisesRegex(PddFormListingError, '末级回读不一致'):
+            await listing.apply_recommended_category()
+        self.assertTrue(await self.page.locator('#category-dialog').is_visible())
+
+    async def test_unrelated_only_child_is_not_automatically_selected(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.locator('#leaf-menu .leaf').evaluate(
+            "node => node.textContent = '休闲裤'"
+        )
+        with self.assertRaisesRegex(PddFormListingError, '下一级候选不唯一或不存在'):
+            await listing.apply_recommended_category()
+        self.assertTrue(await self.page.locator('#category-dialog').is_visible())
+        self.assertEqual(await listing._category_text(), '男装 > 休闲裤 > 休闲裤')
+
+    async def test_uncertain_child_uses_reviewed_full_path_and_dom_readback(self):
+        listing = await self._jeans_category_search_fixture()
+        path = '男装 > 牛仔裤 > 直筒牛仔裤'
+        async def resolve(request):
+            self.assertEqual(request.field_label, '商品类目')
+            self.assertEqual(request.evidence['parent_path'], ['男装', '牛仔裤'])
+            candidate = next(c for c in request.candidates if c.label == path)
+            return ResolvedAttribute(candidate.value_id, candidate.label, 'review_learning', 'snapshot')
+        listing.attribute_runtime = SimpleNamespace(resolve=resolve)
+        await self.page.locator('#leaf-menu .leaf').evaluate("""node => {
+          node.textContent = '直筒牛仔裤';
+          node.onclick = () => {
+            document.querySelector('#selected').textContent = '已选：男装 > 牛仔裤 > 直筒牛仔裤';
+            document.querySelector('.current').textContent = '男装 > 牛仔裤 > 直筒牛仔裤';
+          };
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), path)
+
+    async def test_search_candidates_keep_full_row_including_highlighted_name(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.locator('#suggestions').evaluate("""node => {
+          node.style.display = 'block';
+          node.innerHTML = '<ul><li>男装 &gt; <span>牛仔裤</span></li></ul>';
+        }""")
+        self.assertEqual([text for text, node in await listing._visible_category_result_nodes()],
+                         ['男装 > 牛仔裤'])
+
+    async def test_recommended_jeans_path_accepts_configured_child_readback(self):
+        listing = await self._listing()
+        listing.category_hints = ('牛仔裤',)
+        await self.page.evaluate("""() => {
+          document.querySelector('.recommendation span:nth-child(2)').textContent = '男装 > 牛仔裤';
+          document.querySelector('.recommendation button').onclick = () => {
+            document.querySelector('.current').textContent = '男装 > 牛仔裤 > 牛仔裤';
+          };
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤 > 牛仔裤')
+
+    async def test_recommended_path_does_not_accept_unconfigured_child(self):
+        listing = await self._listing()
+        await self.page.evaluate("""() => {
+          document.querySelector('.recommendation button').onclick = () => {
+            document.querySelector('.current').textContent = '男装 > 休闲裤 > 牛仔裤';
+          };
+        }""")
+        with self.assertRaisesRegex(PddFormListingError, '类目应用后校验失败'):
+            await listing.apply_recommended_category()
 
     async def test_batch_stock_uses_generic_quantity_not_douyin_spot_stock(self):
         listing = await self._listing()

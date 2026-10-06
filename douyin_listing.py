@@ -1150,14 +1150,48 @@ class DouyinListing:
         *,
         observed_values: Sequence[str] = (),
         direct_input_failed: bool = False,
+        fallback_options: Sequence[Mapping[str, str]] = (),
     ) -> Optional[Tuple[str, Sequence[Mapping[str, str]]]]:
         """Resolve one select value from correlated API JSON and visible DOM."""
         runtime = self.attribute_runtime
         managed = is_learning_managed_field("douyin", label)
         if runtime is None:
             raise DouyinListingError("抖音属性学习运行器未启用")
+
+        async def review_visible_options() -> Optional[Tuple[str, Sequence[Mapping[str, str]]]]:
+            options = tuple(fallback_options)
+            if not options:
+                multi = await select.locator(".el-select__tags").count() > 0
+                await self._open_select(select, multi=multi)
+                try:
+                    _dropdown, options = await self._visible_dom_options(select)
+                finally:
+                    await self._dismiss_select_dropdown(select)
+            else:
+                multi = await select.locator(".el-select__tags").count() > 0
+            try:
+                resolved = await runtime.resolve_unmatched_page_options(
+                    platform_id="douyin",
+                    category_leaf_id=(
+                        str(self._category_properties_leaf_id)
+                        if self._category_properties_leaf_id else
+                        "dom:" + canonical_sha256(await self._category_text())[:20]
+                    ),
+                    field_label=label,
+                    excel_value="/".join(str(value) for value in alternatives),
+                    options=tuple(options),
+                    multi=multi,
+                )
+            except ValueError as exc:
+                raise DouyinListingError(str(exc)) from exc
+            if resolved is None or resolved.is_no_fill:
+                return None
+            return resolved.label, ()
+
         api_property = await self._api_property(label)
         if api_property is None:
+            if direct_input_failed:
+                return await review_visible_options()
             if self.logger is not None:
                 self.logger.info(
                     "抖音属性“%s”：接口字段未定位，改用当前 DOM 匹配/直接输入与回读",
@@ -1167,6 +1201,8 @@ class DouyinListing:
         field_id = str(api_property.get("id") or "").strip()
         category_id = str(self._category_properties_leaf_id or "").strip()
         if not field_id or not category_id:
+            if direct_input_failed:
+                return await review_visible_options()
             if self.logger is not None:
                 self.logger.info(
                     "抖音属性“%s”：接口字段 ID 或类目 ID 不完整，"
@@ -1228,6 +1264,8 @@ class DouyinListing:
                         exc.reason_code,
                     )
                 return alternatives[0], api_options
+            if direct_input_failed:
+                return await review_visible_options()
             if not managed:
                 return alternatives[0], api_options
             raise DouyinListingError(
@@ -1762,6 +1800,7 @@ class DouyinListing:
                     label,
                     len(dom_options),
                 )
+            initial_dom_options = tuple(dom_options)
             matches = [
                 item
                 for item in dom_options
@@ -1890,6 +1929,12 @@ class DouyinListing:
                                     )
                                 break
             if chosen is None:
+                if self.logger is not None and is_material_field_label(label):
+                    self.logger.warning(
+                        "抖音属性“%s”未匹配 Excel 值 %s；页面有 %s 个候选，"
+                        "将尝试直接输入，失败后提交审核",
+                        label, expected, len(initial_dom_options),
+                    )
                 direct_actual = await self._try_direct_select_value(
                     select,
                     expected,
@@ -1909,6 +1954,7 @@ class DouyinListing:
                         select,
                         tuple(review_alternatives or expected_values),
                         direct_input_failed=True,
+                        fallback_options=initial_dom_options,
                     )
                     if reviewed is None:
                         return None
@@ -2289,6 +2335,7 @@ class DouyinListing:
         price: object,
         spot_stock: object,
         presale_stock: object,
+        expected_sku_rows: int,
     ) -> Mapping[str, Any]:
         """重新打开商品后，只读核对关键抖音字段和每一行 SKU 数值。"""
         expected_category = str(category).strip()
@@ -2331,6 +2378,12 @@ class DouyinListing:
             "现货库存": _decimal(spot_stock, "现货库存"),
             "预售库存": _decimal(presale_stock, "预售库存"),
         }
+        verified_sku_rows = await self._verify_sku_price_inventory(expected_sku)
+        if verified_sku_rows != expected_sku_rows:
+            raise DouyinListingError(
+                f"保存后 SKU 行数不一致：保存前 {expected_sku_rows} 行，"
+                f"重开后完整数据 {verified_sku_rows} 行"
+            )
         controls = await self._sku_input_controls()
         actual_sku = []
         for row_index, row_controls in enumerate(controls, start=1):
@@ -2354,6 +2407,8 @@ class DouyinListing:
             "short_title": actual_short_title,
             "attributes": actual_attributes,
             "sku": actual_sku,
+            "sku_verified_rows": verified_sku_rows,
+            "sku_visible_rows": len(actual_sku),
         }
 
     async def apply_category_and_fields(self, fields: Any) -> Mapping[str, Any]:
@@ -2489,19 +2544,31 @@ class DouyinListing:
         if self.panel is None:
             raise DouyinListingError("抖音资料面板尚未打开")
         labels = self.panel.locator(".el-form-item__label")
-        visible = []
+        editors = []
         for index in range(await labels.count()):
             label = labels.nth(index)
             if await label.is_visible() and _normalize_label(
                 await label.inner_text()
             ) == _normalize_label("面料材质"):
-                visible.append(label)
-        if not visible:
+                item = label.locator(
+                    "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]"
+                )
+                add_buttons = item.get_by_role(
+                    "button", name=re.compile(r"^\s*\+?\s*添加材质\s*$")
+                )
+                for button_index in range(await add_buttons.count()):
+                    if await add_buttons.nth(button_index).is_visible():
+                        editors.append(item)
+                        break
+                else:
+                    if "is-required" in (await item.get_attribute("class") or "").split():
+                        raise DouyinListingError("抖音必填面料材质编辑组件缺少添加材质入口")
+        if not editors:
             if self.logger is not None:
                 self.logger.info("当前抖音类目无面料材质组件，跳过面料材质和水洗标填写")
             return ()
-        if len(visible) != 1:
-            raise DouyinListingError(f"抖音面料材质字段匹配数为 {len(visible)}")
+        if len(editors) != 1:
+            raise DouyinListingError(f"抖音面料材质编辑组件匹配数为 {len(editors)}")
         if not materials:
             raise DouyinListingError("当前抖音类目有面料材质组件，但 Excel 缺少面料材质")
         return await self.apply_materials(materials, wash_label_paths, source_text)
@@ -3059,7 +3126,14 @@ class DouyinListing:
                     has_text=re.compile(rf'^\s*{re.escape(size)}\s*$')
                 ) if dropdown is not None else None
                 if options is not None and await options.count() == 1 and await options.first.is_visible():
-                    await options.first.click()
+                    option = options.first
+                    classes = set((await option.get_attribute('class') or '').split())
+                    if 'is-disabled' in classes:
+                        if 'selected' not in classes or (await input_box.input_value()).strip() != size:
+                            raise DouyinListingError(f"鞋码 {size} 的纯数字候选不可选择且未确认选中")
+                        await input_box.press('Escape')
+                    else:
+                        await option.click(timeout=3000)
                     break
                 if asyncio.get_running_loop().time() >= deadline:
                     raise DouyinListingError(f"鞋码 {size} 搜索后没有唯一的纯数字候选")

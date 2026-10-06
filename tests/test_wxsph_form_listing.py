@@ -21,6 +21,29 @@ def select_markup(options):
 
 
 class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
+    def test_shoe_scene_single_select_uses_first_excel_candidate(self):
+        self.assertEqual(
+            WxsphFormListing._selection_groups_for_control(
+                "适用场景", "日常，休闲", multi=False,
+                category_hints=("流行男鞋 > 休闲皮鞋",),
+            ),
+            (("日常",), ("休闲",)),
+        )
+        self.assertEqual(
+            WxsphFormListing._selection_groups_for_control(
+                "适用场景", "日常，休闲", multi=True,
+                category_hints=("流行男鞋 > 休闲皮鞋",),
+            ),
+            (("日常",), ("休闲",)),
+        )
+        self.assertEqual(
+            WxsphFormListing._selection_groups_for_control(
+                "适用场景", "日常，休闲", multi=False,
+                category_hints=("男装 > 卫衣",),
+            ),
+            (("日常，休闲",),),
+        )
+
     async def test_persisted_readback_uses_pre_save_resolved_values(self):
         listing = await self._listing()
         await self.page.locator('#fabric input').evaluate("e => e.value = '棉'")
@@ -70,6 +93,29 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         listing._resolved_api_options['面料材质'] = {'做旧': ('wrong-id', '做旧')}
         result = await listing._apply_resolved_api_options('面料材质', item, ('做旧',))
         self.assertEqual(result, ('做旧',))
+
+    async def test_resolved_option_recovers_when_popper_hides_before_click(self):
+        listing = await self._listing()
+        item = self.page.locator('#fabric')
+        listing._resolved_api_options['面料材质'] = {'棉': ('cotton', '棉')}
+        original = listing._visible_dom_options
+        observations = 0
+
+        async def hide_first_popper(select):
+            nonlocal observations
+            dropdown, options = await original(select)
+            observations += 1
+            if observations == 1:
+                await dropdown.evaluate("element => element.style.display = 'none'")
+            return dropdown, options
+
+        listing._visible_dom_options = hide_first_popper
+
+        actual = await listing._apply_resolved_api_options('面料材质', item, ('棉',))
+
+        self.assertEqual(actual, ('棉',))
+        self.assertEqual(observations, 2)
+        self.assertEqual(await item.locator('.el-select input').input_value(), '棉')
 
     async def test_approval_is_used_before_excel_write_attempt(self):
         from unittest.mock import AsyncMock

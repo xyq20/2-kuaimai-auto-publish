@@ -194,7 +194,9 @@ class AttributeRuntime:
         self.product_version = product_version
         self.device_id = device_id or store.get_or_create_device_id()
         self.verified_history = dict(verified_history or {})
-        self._flush_lock = asyncio.Lock()
+        # Python 3.9 binds Lock() to the current loop at construction.  The
+        # runtime is created before asyncio.run(), so construct it on first use.
+        self._flush_lock: Optional[asyncio.Lock] = None
         self._background_flush: Optional[asyncio.Task[int]] = None
         self._collecting_platform_id = ""
         self._deferred_reviews: dict[str, ReviewRequired] = {}
@@ -219,10 +221,88 @@ class AttributeRuntime:
         if self._deferred_reviews:
             raise ReviewBatchRequired(self.deferred_reviews)
 
+    def intentionally_omitted(self, platform_id: str, field_label: str) -> bool:
+        """Only an explicit review decision may exempt a visible Excel field."""
+        key = (
+            canonical_platform_name(platform_id),
+            normalize_history_field_label(field_label.split("#", 1)[0]),
+        )
+        remembered = self._resolved_attributes.get(key)
+        return bool(remembered and remembered[1].is_no_fill)
+
+    def review_pending_or_omitted(self, platform_id: str, field_label: str) -> bool:
+        """Tell adapters to leave a field alone after review or no-fill."""
+        if self.intentionally_omitted(platform_id, field_label):
+            return True
+        platform = canonical_platform_name(platform_id)
+        label = normalize_history_field_label(field_label.split("#", 1)[0])
+        return any(
+            canonical_platform_name(review.request.platform_id) == platform
+            and normalize_history_field_label(review.request.field_label) == label
+            for review in self._deferred_reviews.values()
+        )
+
+    async def resolve_unmatched_page_options(
+        self,
+        *,
+        platform_id: str,
+        category_leaf_id: str,
+        field_label: str,
+        excel_value: str,
+        options: Tuple[Mapping[str, Any], ...],
+        multi: bool = False,
+    ) -> Optional[ResolvedAttribute]:
+        """Submit an unmatched visible dropdown to the normal review pipeline.
+
+        Some category schemas omit a field or its option IDs. The live dropdown
+        still supplies reviewable labels; stable label IDs keep that snapshot
+        scoped to this platform, category and field across retries.
+        """
+        candidates = []
+        seen_labels = set()
+        for option in options:
+            label = str(option.get("name") or option.get("label") or "").strip()
+            if not label or option.get("disabled") or label in seen_labels:
+                continue
+            seen_labels.add(label)
+            value_id = str(option.get("value") or option.get("id") or "").strip()
+            if not value_id:
+                value_id = "dom:" + canonical_sha256(label)[:20]
+            candidates.append(CandidateValue(value_id, label))
+        if not candidates:
+            raise ValueError(f"属性“{field_label}”未取得可审核的页面候选")
+        category_id = str(category_leaf_id).strip() or (
+            "dom:" + canonical_sha256((platform_id, self.product_version))[:20]
+        )
+        field_id = "dom:" + normalize_history_field_label(field_label)
+        schema_version = canonical_sha256({
+            "platform_id": canonical_platform_name(platform_id),
+            "category_leaf_id": category_id,
+            "field_id": field_id,
+            "options": [
+                {"value_id": value.value_id, "label": value.label}
+                for value in candidates
+            ],
+        })
+        return await self.resolve(AttributeRequest(
+            platform_id=platform_id,
+            category_leaf_id=category_id,
+            field_id=field_id,
+            field_label=field_label,
+            candidates=tuple(candidates),
+            excel_value=excel_value,
+            evidence={"excel": True, "live_dom": True},
+            custom_allowed=False,
+            schema_version=schema_version,
+            control_type="multi_select" if multi else "select",
+        ))
+
     async def _flush(self) -> int:
         # All event delivery uses one ordered worker.  Snapshot/review/checkpoint
         # dependencies therefore keep their durable SQLite order even while the
         # browser continues filling the next field.
+        if self._flush_lock is None:
+            self._flush_lock = asyncio.Lock()
         async with self._flush_lock:
             return await flush_outbox_async(
                 self.store,

@@ -60,6 +60,36 @@ def make_length_request(**overrides):
 
 
 class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unmatched_visible_select_enters_review_for_unmapped_field(self):
+        client = FakeClient({
+            "status": "review_required",
+            "reason_code": "insufficient_evidence",
+        })
+        runtime = AttributeRuntime(self.store, client, "run", "shoe-product")
+        runtime.begin_review_collection("douyin")
+
+        result = await runtime.resolve_unmatched_page_options(
+            platform_id="douyin", category_leaf_id="mens-shoes",
+            field_label="鞋垫材质", excel_value="皮革",
+            options=(
+                {"name": "人造革"}, {"name": "真皮"},
+                {"name": "真皮"}, {"name": "禁用", "disabled": True},
+            ),
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(runtime.deferred_reviews), 1)
+        request = runtime.deferred_reviews[0].request
+        self.assertEqual(request.platform_id, "douyin")
+        self.assertEqual(request.field_label, "鞋垫材质")
+        self.assertEqual(tuple(v.label for v in request.candidates), ("人造革", "真皮"))
+        self.assertTrue(all(v.value_id for v in request.candidates))
+        self.assertTrue(runtime.review_pending_or_omitted("douyin", "鞋垫材质"))
+        self.assertFalse(runtime.review_pending_or_omitted("tb", "鞋垫材质"))
+        with self.assertRaises(ReviewBatchRequired):
+            runtime.raise_deferred_reviews()
+        await runtime.drain()
+
     async def test_no_fill_is_scoped_to_product_and_platform(self):
         request = make_length_request()
         snapshot = CandidateSnapshot(
@@ -76,6 +106,8 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         runtime = AttributeRuntime(self.store, FakeClient(), "run", "chosen-product")
         self.assertTrue(runtime.confirmed_choice(request).is_no_fill)
         self.assertTrue((await runtime.resolve(request)).is_no_fill)
+        self.assertTrue(runtime.review_pending_or_omitted("wxsph", "裤长"))
+        self.assertFalse(runtime.review_pending_or_omitted("jd", "裤长"))
         self.assertEqual(runtime.record_verified_readbacks(request.platform_id, {"裤长": "长裤"}), 0)
         other_product = AttributeRuntime(self.store, FakeClient(), "run", "other-product")
         self.assertIsNone(other_product.confirmed_choice(request))
@@ -932,6 +964,37 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(ValueError, "operational selector"):
             await runtime.resolve(make_length_request(control_type="freight"))
+
+
+class AttributeRuntimeLoopTests(unittest.TestCase):
+    def test_flush_lock_uses_running_loop_after_sync_construction(self):
+        class SlowClient(FakeClient):
+            def post_event(self, key, event_type, payload):
+                time.sleep(0.05)
+                return super().post_event(key, event_type, payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory) / "learning.sqlite3")
+            store.migrate()
+            old_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(old_loop)
+                runtime = AttributeRuntime(store, SlowClient(), "run", "product")
+                asyncio.set_event_loop(None)
+
+                async def deliver():
+                    result = await runtime.resolve(make_length_request(excel_value="长裤"))
+                    await asyncio.sleep(0.01)
+                    self.assertTrue(runtime._flush_lock.locked())
+                    await runtime.drain()
+                    return result
+
+                self.assertEqual(asyncio.run(deliver()).label, "长裤")
+                self.assertEqual(store.pending_outbox(), ())
+            finally:
+                asyncio.set_event_loop(None)
+                old_loop.close()
+                store.close()
 
 
 if __name__ == "__main__":

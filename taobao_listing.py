@@ -21,7 +21,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from attribute_runtime import AttributeRequest
-from category_profile import category_search_terms, choose_category_candidate
+from category_profile import category_profile, category_search_terms, choose_category_candidate
 from douyin_data import DouyinDataError, MaterialComponent, parse_materials
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
@@ -127,6 +127,7 @@ TAOBAO_VALUE_ALIASES: Mapping[Tuple[str, str], Tuple[str, ...]] = {
     (normalize_label("弹力"), normalize_option("无弹力")): ("无弹", "无弹性"),
     (normalize_label("弹力"), normalize_option("无弹性")): ("无弹", "无弹力"),
     (normalize_label("版型"), normalize_option("直筒")): ("直筒型",),
+    (normalize_label("鞋制作工艺"), normalize_option("胶粘")): ("胶粘鞋",),
 }
 
 
@@ -371,6 +372,25 @@ def single_selection_candidates(label: object, value: object) -> Tuple[str, ...]
     return groups[0]
 
 
+def sku_batch_excel_value(
+    label: object, value: object, *, category_hints: Sequence[str] = ()
+) -> str:
+    """Return the value accepted by a 淘宝 SKU batch input.
+
+    ``鞋跟高度（cm）`` is a numeric SKU column.  Excel may also carry the
+    qualitative shoe-height mapping after a slash (for example
+    ``5cm/中跟（3.1-5.5cm）``); that suffix belongs to the category selector,
+    not this input, so only the first numeric alternative is written.
+    """
+    text = str(value or "").strip()
+    if (
+        category_profile(category_hints).garment_kind == "footwear"
+        and "鞋跟高度" in normalize_label(label)
+    ):
+        return re.split(r"[/／]", text, maxsplit=1)[0].strip()
+    return text
+
+
 def _single_source(
     fields: Mapping[str, str],
     aliases: Sequence[str],
@@ -476,7 +496,9 @@ class TaobaoListing:
     @property
     def _platform_display_name(self) -> str:
         """本适配器所属平台的中文名，供日志与异常文案复用。"""
-        return "淘宝" if self.attribute_platform_id == "tb" else "天猫"
+        return {"tb": "淘宝", "tm": "天猫", "jd": "京东", "pdd": "拼多多",
+                "wxsph": "微信小店", "xhs": "小红书", "yz": "有赞"}.get(
+                    self.attribute_platform_id, self.attribute_platform_id)
 
     async def _wait_for_loading_masks(self, timeout_seconds: float = 30) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -1546,6 +1568,50 @@ class TaobaoListing:
             return None
         return matches[0] if matches else None
 
+    async def _review_unmatched_page_option(
+        self,
+        *,
+        label: str,
+        candidates: Sequence[str],
+        options: Sequence[Mapping[str, Any]],
+        multi: bool,
+    ) -> Optional[str]:
+        review = getattr(
+            self.attribute_runtime, "resolve_unmatched_page_options", None
+        )
+        if not callable(review):
+            return None
+        category_id = next((
+            str(value).strip() for value in (
+                getattr(self.api_index, "active_category_id", ""),
+                getattr(self, "_xhs_api_category_id", ""),
+                getattr(self, "_youzan_api_category_id", ""),
+            ) if value
+        ), "")
+        if not category_id:
+            category_id = "dom:" + canonical_sha256(
+                await self._category_text()
+            )[:20]
+        review_options = tuple(
+            option for option in options
+            if not option.get("created")
+            or getattr(self, "allow_created_exact_dom_option", False)
+        )
+        try:
+            resolved = await review(
+                platform_id=self.attribute_platform_id,
+                category_leaf_id=category_id,
+                field_label=label,
+                excel_value="/".join(candidates),
+                options=review_options,
+                multi=multi,
+            )
+        except ValueError as exc:
+            raise TaobaoListingError(str(exc)) from exc
+        if resolved is None or resolved.is_no_fill:
+            return None
+        return resolved.label
+
     async def _choose_one_option(
         self,
         select: Any,
@@ -1553,6 +1619,7 @@ class TaobaoListing:
         *,
         label: str,
         multi: bool,
+        review_attempted: bool = False,
     ) -> Optional[str]:
         await self._open_select(select, multi=multi)
         dropdown, options = await self._visible_dom_options(select)
@@ -1791,6 +1858,16 @@ class TaobaoListing:
                         " / ".join(initial_option_names) or "无",
                     )
                 await self._dismiss_select_dropdown(select)
+                if not review_attempted:
+                    reviewed = await self._review_unmatched_page_option(
+                        label=label, candidates=candidates,
+                        options=tuple((*initial_options, *options)), multi=multi,
+                    )
+                    if reviewed is not None:
+                        return await self._choose_one_option(
+                            select, (reviewed,), label=label, multi=multi,
+                            review_attempted=True,
+                        )
                 return None
 
             if self.logger is not None:
@@ -1808,11 +1885,22 @@ class TaobaoListing:
                     "；".join(details),
                 )
             await self._dismiss_select_dropdown(select)
+            if not review_attempted:
+                reviewed = await self._review_unmatched_page_option(
+                    label=label, candidates=candidates,
+                    options=tuple((*initial_options, *options)), multi=multi,
+                )
+                if reviewed is not None:
+                    return await self._choose_one_option(
+                        select, (reviewed,), label=label, multi=multi,
+                        review_attempted=True,
+                    )
             return None
 
         if len(candidates) > 1 and self.logger is not None:
             self.logger.info(
-                "淘宝属性“%s”：候选优先使用平台已有值 %s",
+                "%s属性“%s”：候选优先使用平台已有值 %s",
+                self._platform_display_name,
                 label,
                 chosen_text,
             )
@@ -1850,6 +1938,7 @@ class TaobaoListing:
         *,
         label: str,
         multi: bool,
+        allow_review: bool = True,
     ) -> Optional[Tuple[str, ...]]:
         current = await self._read_select_values(select, multi=multi)
         if multi:
@@ -1891,6 +1980,7 @@ class TaobaoListing:
                 group,
                 label=label,
                 multi=multi,
+                review_attempted=not allow_review,
             )
             if chosen is None:
                 if multi:
@@ -1954,14 +2044,28 @@ class TaobaoListing:
         try:
             multi = await select.locator('.el-select__tags').count() > 0
             actual = await TaobaoListing._select_values(
-                self, select, (tuple(group),), label=label, multi=multi
+                self, select, (tuple(group),), label=label, multi=multi,
+                allow_review=False,
             )
         except TaobaoListingError:
             actual = None
-        if actual and len(actual) == 1 and any(
-            normalize_option(actual[0]) == normalize_option(alias) for alias in group
+        material_matches = (
+            match_option_candidates(group, labels)
+            if is_material_field_label(label) else ()
+        )
+        matched_material = (
+            bool(actual) and len(actual) == 1 and len(material_matches) == 1
+            and labels[material_matches[0]] == actual[0]
+        )
+        if actual and len(actual) == 1 and (
+            matched_material or any(
+                normalize_option(actual[0]) == normalize_option(alias)
+                for alias in group
+            )
         ):
             value = actual[0]
+            if value in labels:
+                return values, value
             return values + (CandidateValue(value, value),), value
         return values, '/'.join(group)
 
@@ -4072,6 +4176,9 @@ class TaobaoListing:
         return matches[0]
 
     async def _fill_batch_text(self, row: Any, label: str, expected: str) -> str:
+        expected = sku_batch_excel_value(
+            label, expected, category_hints=self.category_hints
+        )
         item = await self._sku_batch_item(row, label)
         inputs = item.locator("input.el-input__inner:not([readonly])")
         if await inputs.count() != 1:

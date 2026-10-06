@@ -48,6 +48,48 @@ class LocalReviewApiTests(unittest.TestCase):
         events = self.client.get("/api/device/resume?device_id=mac-1", headers=self.device_headers).json()["events"]
         self.assertEqual(events[0]["payload"]["final_value_id"], NO_FILL_VALUE_ID)
 
+    def test_expired_claim_can_be_reclaimed_without_losing_review(self):
+        self.product_and_snapshot()
+        self.event("expired-review", "review.created", {
+            "id": "expired-review", "run_id": "run-expired", "device_id": "mac-1",
+            "product_version": "pv-1", "platform_id": "jd",
+            "category_leaf_id": "straight-pants", "field_id": "length",
+            "field_label": "裤长", "canonical_field": "pant_length",
+            "snapshot_version": "sv-1", "reason_code": "candidate_missing",
+            "evidence_json": {"summary": "manual"},
+        })
+        self.login()
+        headers = {"Origin": "http://testserver"}
+        claim = self.client.post(
+            "/api/reviews/expired-review/claim", headers=headers,
+            json={"version": 1},
+        ).json()
+        with transaction(self.settings) as connection:
+            connection.execute(
+                "UPDATE review_tasks SET lease_until=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", "expired-review"),
+            )
+
+        expired = self.client.post(
+            "/api/reviews/expired-review/confirm", headers=headers,
+            json={"version": claim["version"], "final_value_id": "long"},
+        )
+        self.assertEqual(expired.status_code, 409)
+        fresh = next(
+            task for task in self.client.get("/api/reviews").json()["tasks"]
+            if task["id"] == "expired-review"
+        )
+        reclaimed = self.client.post(
+            "/api/reviews/expired-review/claim", headers=headers,
+            json={"version": fresh["version"]},
+        ).json()
+        accepted = self.client.post(
+            "/api/reviews/expired-review/confirm", headers=headers,
+            json={"version": reclaimed["version"], "final_value_id": "long"},
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json()["status"], "resume_ready")
+
     def test_unmapped_confirmed_review_is_learned_across_platforms_and_invalidation_removes_it(self):
         self.product_and_snapshot()
         for platform, snapshot, ident in [('jd', 'audience-jd', 'old-id'), ('douyin', 'audience-dy', 'new-id')]:

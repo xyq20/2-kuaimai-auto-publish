@@ -178,6 +178,7 @@ def _contains_ordered_parts(
 class XhsFormListing(TaobaoListing):
     """Fill Xiaohongshu category data, presale, batch fields and 3:4 main art."""
 
+    attribute_platform_id = "xhs"
     freight_platform_id = "xhs"
 
     # XHS remote selects render an exact server-search result as an Element
@@ -1221,6 +1222,14 @@ class XhsFormListing(TaobaoListing):
                     page_label, str(exc).replace("淘宝", "小红书")
                 )
             ) from exc
+        if (
+            actual is None
+            and self.attribute_runtime is not None
+            and self.attribute_runtime.review_pending_or_omitted(
+                self.attribute_platform_id, page_label
+            )
+        ):
+            return None
         if actual is None and len(groups) == 1:
             # Xiaohongshu's remote selects can expose an exact, clickable DOM
             # option as ``created`` even when Element's caninputcustom flag is
@@ -1987,6 +1996,28 @@ class XhsFormListing(TaobaoListing):
             "freight": freight,
         }
 
+    async def _wait_for_footwear_specification_rows(
+        self, *, timeout_seconds: float = 20
+    ) -> Any:
+        """Wait for shoe specifications to rerender after a category change."""
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        rows = self.panel.locator('.block-specification .title-bg')
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        observed: Tuple[str, ...] = ()
+        while asyncio.get_running_loop().time() < deadline:
+            observed = tuple(
+                await rows.locator('.el-select input.el-input__inner').evaluate_all(
+                    'inputs => inputs.map(input => input.value.trim())'
+                )
+            )
+            if any(name in {'尺码', '鞋码'} for name in observed):
+                return rows
+            await asyncio.sleep(0.1)
+        raise XhsFormListingError(
+            '小红书鞋类规格名未加载完成：当前规格名 {0!r}'.format(observed)
+        )
+
     async def apply_excel_fields(
         self,
         fields: XhsFields,
@@ -1999,7 +2030,7 @@ class XhsFormListing(TaobaoListing):
     ) -> Mapping[str, Any]:
         category = await self.apply_category(fields.category_path)
         if is_footwear_category(" > ".join(fields.category_path)):
-            titles = self.panel.locator('.block-specification .title-bg')
+            titles = await self._wait_for_footwear_specification_rows()
             for index in range(await titles.count()):
                 title_row = titles.nth(index)
                 select = title_row.locator('.el-select').first

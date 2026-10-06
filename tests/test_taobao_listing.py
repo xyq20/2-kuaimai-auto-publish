@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from attribute_runtime import ResolvedAttribute
+from learning_models import CandidateValue
 from taobao_data import parse_taobao_fields
 from taobao_listing import (
     TaobaoListing,
@@ -16,6 +17,7 @@ from taobao_listing import (
     preferred_exact_candidate_label,
     selection_value_groups,
     selection_value_groups_for_control,
+    sku_batch_excel_value,
     value_candidates,
 )
 from size_image_recognition import SizeLength
@@ -401,6 +403,12 @@ function openTaobao() {
 
 
 class TaobaoPureFunctionTests(unittest.TestCase):
+    def test_shoe_craft_excel_alias_matches_live_choice(self):
+        self.assertEqual(
+            value_candidates("鞋制作工艺", "胶粘"),
+            ("胶粘", "胶粘鞋"),
+        )
+
     def test_single_select_preserves_comma_inside_one_candidate(self):
         self.assertEqual(
             selection_value_groups_for_control("功能", "防风，保暖", multi=False),
@@ -409,6 +417,24 @@ class TaobaoPureFunctionTests(unittest.TestCase):
         self.assertEqual(
             selection_value_groups_for_control("功能", "防风，保暖", multi=True),
             (("防风",), ("保暖",)),
+        )
+
+    def test_shoe_heel_sku_batch_uses_numeric_excel_alternative(self):
+        self.assertEqual(
+            sku_batch_excel_value(
+                "鞋跟高度（cm）",
+                "5cm/中跟（3.1-5.5cm）",
+                category_hints=("流行男鞋 > 休闲皮鞋",),
+            ),
+            "5cm",
+        )
+        self.assertEqual(
+            sku_batch_excel_value(
+                "鞋跟高度（cm）",
+                "5cm/中跟（3.1-5.5cm）",
+                category_hints=("男装 > 卫衣",),
+            ),
+            "5cm/中跟（3.1-5.5cm）",
         )
 
     def test_learning_select_uses_first_matching_excel_alternative(self):
@@ -546,6 +572,78 @@ class TaobaoPureFunctionTests(unittest.TestCase):
 
 
 class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shoe_craft_alias_selects_and_reads_page_choice(self):
+        await self.listing.apply_recommended_category()
+        await self.page.evaluate("""() => {
+          const root = document.querySelector('#attributes');
+          root.insertAdjacentHTML('beforeend',
+            singleSelect('鞋制作工艺', ['胶粘鞋', '缝制']));
+          attachSelectComponents(root);
+        }""")
+        item = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('鞋制作工艺'))"
+        ).first
+
+        actual = await self.listing.fill_attribute("鞋制作工艺", "胶粘", item=item)
+
+        self.assertEqual(actual, ("胶粘鞋",))
+
+    async def test_unmatched_select_asks_review_with_page_choices(self):
+        await self.listing.apply_recommended_category()
+        runtime = SimpleNamespace(resolve_unmatched_page_options=AsyncMock(return_value=None))
+        self.listing.attribute_runtime = runtime
+        item = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('风格'))"
+        ).first
+
+        actual = await self.listing.fill_attribute("风格", "页面没有的值", item=item)
+
+        self.assertIsNone(actual)
+        request = runtime.resolve_unmatched_page_options.await_args.kwargs
+        self.assertEqual((request["platform_id"], request["field_label"]), ("tb", "风格"))
+        self.assertIn("休闲", tuple(value["name"] for value in request["options"]))
+
+    async def test_excel_preflight_does_not_create_duplicate_review(self):
+        await self.listing.apply_recommended_category()
+        self.listing._review_unmatched_page_option = AsyncMock(return_value=None)
+        select = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('风格')) .el-select"
+        ).first
+
+        _candidates, excel_value = await self.listing._excel_before_review(
+            select, (CandidateValue("casual", "休闲"),),
+            ("休闲皮鞋", "其他"), label="风格",
+        )
+
+        self.assertEqual(excel_value, "休闲皮鞋/其他")
+        self.listing._review_unmatched_page_option.assert_not_awaited()
+
+    async def test_material_preflight_uses_verified_unique_page_candidate(self):
+        await self.listing.apply_recommended_category()
+        await self.page.evaluate("""() => {
+          const root = document.querySelector('#attributes');
+          root.insertAdjacentHTML('beforeend',
+            singleSelect('鞋面内里材质', ['头层牛皮（除牛反绒）', '二层牛皮']));
+          attachSelectComponents(root);
+        }""")
+        select = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('鞋面内里材质')) .el-select"
+        ).first
+
+        candidates, excel_value = await self.listing._excel_before_review(
+            select, (
+                CandidateValue("first", "头层牛皮（除牛反绒）"),
+                CandidateValue("second", "二层牛皮"),
+            ), ("头层牛皮",), label="鞋面内里材质",
+        )
+
+        self.assertEqual(excel_value, "头层牛皮（除牛反绒）")
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            await self.listing._read_select_values(select, multi=False),
+            ("头层牛皮（除牛反绒）",),
+        )
+
     async def test_style_suffix_selects_page_option_and_reads_it_back(self):
         await self.listing.apply_recommended_category()
         item = self.page.locator(

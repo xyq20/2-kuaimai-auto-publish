@@ -688,8 +688,20 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(desired, _material_option_desired("涤纶"))
         self.assertEqual(
             listing._select_numeric_material_option.await_args.kwargs,
-            {"field_label": "面料", "review_unmatched": False},
+            {"field_label": "面料", "review_unmatched": True},
         )
+
+    async def test_fabric_schema_failure_never_falls_back_to_other(self):
+        await self.page.set_content('<div class="el-form-item" id="fabric">'
+                                    '<div class="el-form-item__content"><div class="el-select">'
+                                    '<input></div></div></div>')
+        listing = JdFormListing(self.page, self.page.locator('body'), None)
+        listing._select_numeric_material_option = AsyncMock(side_effect=JdFormListingError('字段未定位'))
+        listing._fill_fabric_attribute = AsyncMock()
+        with self.assertRaisesRegex(JdFormListingError, '字段未定位'):
+            await listing._fill_attribute_item('面料', self.page.locator('#fabric'), '棉', required=True)
+        listing._select_numeric_material_option.assert_awaited_once()
+        listing._fill_fabric_attribute.assert_not_awaited()
 
     async def test_extra_material_rows_are_removed_idempotently(self):
         await self.page.set_content('''<div class="el-form-item"><div class="el-form-item__content">
@@ -1928,6 +1940,38 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.page.evaluate("window.skuAppended"))
         self.assertTrue(await self.page.evaluate("window.longAppended"))
         self.assertFalse(await self.page.evaluate("window.coverClicked"))
+
+    async def test_append_sku_images_clears_existing_display_and_long_prefix(self):
+        thumbs = "".join(
+            '<div class="file-img" data-name="img-{0}">'
+            '<button class="del-btn" onclick="this.closest(\'.file-img\').remove()">删除</button>'
+            "</div>".format(index)
+            for index in range(1, 6)
+        )
+        old_long = (
+            '<div class="file-img" data-name="old-long">'
+            '<button class="del-btn" onclick="this.closest(\'.file-img\').remove()">删除</button>'
+            '</div>'
+        )
+        fixture = (IMAGE_FIXTURE.replace("{main}", thumbs)
+                   .replace("{long}", thumbs)
+                   .replace("{second_color}", "")
+                   .replace('id="green-long"></div>', 'id="green-long">' + old_long + '</div>'))
+        listing = await self._open(fixture)
+
+        report = await listing.append_sku_images(
+            image_indices_by_color=((0, 1, 2, 3, 4),)
+        )
+
+        for group in ("#green-display", "#green-long"):
+            self.assertEqual(
+                await self.page.locator(group + " .file-img").evaluate_all(
+                    "nodes => nodes.map(node => node.dataset.name)"
+                ),
+                ["img-1", "img-2", "img-3", "img-4", "img-5"],
+            )
+        self.assertEqual(report["colors"][0]["product_display_remaining"], 5)
+        self.assertEqual(report["colors"][0]["long_image_count"], 5)
 
     async def test_append_sku_images_is_idempotent_after_saved_page_reopens(self):
         thumbs = "".join(

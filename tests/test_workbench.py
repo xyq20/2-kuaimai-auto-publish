@@ -80,6 +80,16 @@ class WorkbenchTests(unittest.TestCase):
             ProductCatalog(self.root/'not-mounted').listing()
         self.assertEqual(error.exception.code,'products_unavailable')
 
+    def test_catalog_history_matches_old_and_new_smb_mount_paths(self):
+        self.assertEqual(
+            ProductCatalog._folder_key(
+                Path('/Volumes/共享文件/谭/products/测试款 + 1001')
+            ),
+            ProductCatalog._folder_key(
+                Path.home() / 'Desktop/共享文件/谭/products/测试款 + 1001'
+            ),
+        )
+
     def test_catalog_groups_only_successful_saves_for_the_same_product_folder(self):
         runs = self.root / 'runs'
         catalog = ProductCatalog(self.settings.products_root, runs)
@@ -95,7 +105,30 @@ class WorkbenchTests(unittest.TestCase):
         products = {p['id']: p for p in catalog.listing()}
         self.assertTrue(products[self.product_id]['processed'])
         self.assertEqual(products[self.product_id]['processed_platforms'], ['京东'])
+        self.assertFalse(products[self.product_id]['base_saved'])
         self.assertFalse(next(p for p in products.values() if p['id'] != self.product_id)['processed'])
+
+    def test_catalog_marks_successful_base_save_separately(self):
+        runs = self.root / 'runs'
+        catalog = ProductCatalog(self.settings.products_root, runs)
+        run = runs / '20260926-130000'
+        (run / 'base').mkdir(parents=True)
+        atomic_json(run / 'input-summary.json', {'excel_path': str(self.product)})
+        atomic_json(run / 'base/base-save-result.json', {'result': 1, 'action': '保存'})
+
+        item = catalog.listing()[0]
+        self.assertTrue(item['base_saved'])
+        self.assertEqual(item['processed_platforms'], ['商品资料'])
+
+    def test_catalog_detail_refreshes_base_saved_after_cached_excel_read(self):
+        runs = self.root / 'runs'
+        catalog = ProductCatalog(self.settings.products_root, runs)
+        self.assertFalse(catalog.detail(self.product_id)['base_saved'])
+        run = runs / '20260926-130500'
+        (run / 'base').mkdir(parents=True)
+        atomic_json(run / 'input-summary.json', {'excel_path': str(self.product)})
+        atomic_json(run / 'base/save-result.json', {'result': 1, 'action': '保存'})
+        self.assertTrue(catalog.detail(self.product_id)['base_saved'])
 
     def test_catalog_refresh_discovers_new_workbook_with_filename_whitespace(self):
         catalog = self.launcher.catalog
@@ -114,6 +147,39 @@ class WorkbenchTests(unittest.TestCase):
         listing = self.launcher.catalog.listing()
         self.assertEqual(len(listing), 1)
         self.assertEqual(self.launcher.catalog.path(listing[0]['id']), self.product.resolve())
+
+    def test_open_product_folder_requires_admin_and_uses_catalog_path(self):
+        endpoint = f'/api/launcher/products/{self.product_id}/open-folder'
+        self.assertEqual(self.client.post(endpoint, headers=self.headers, json={}).status_code, 401)
+        self.login('reviewer')
+        self.assertEqual(self.client.post(endpoint, headers=self.headers, json={}).status_code, 403)
+        self.client.post('/api/logout', headers=self.headers, json={})
+        self.login()
+        with patch('local_review.launcher.subprocess.run') as opened:
+            response = self.client.post(endpoint, headers=self.headers, json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['opened'])
+        self.assertEqual(opened.call_args.args[0], ['/usr/bin/open', str(self.product.parent.resolve())])
+
+    def test_history_search_finds_product_beyond_recent_hundred(self):
+        self.login()
+        for index in range(101):
+            job_id = f'{index:032x}'
+            directory = self.launcher.root / job_id
+            directory.mkdir()
+            atomic_json(directory / 'job.json', {
+                'id': job_id, 'status': 'completed', 'title': '旧款皮鞋' if index == 0 else '新款',
+                'style_code': 'MY019-1' if index == 0 else f'NEW-{index}',
+                'platforms': ['xhs'], 'mode': 'save', 'created_by': 'admin',
+                'created_at': f'2026-09-30T{index // 60:02d}:{index % 60:02d}:00+08:00',
+                'output_dir': str(directory),
+            })
+        recent = self.client.get('/api/launcher/jobs').json()['jobs']
+        self.assertEqual(len(recent), 100)
+        self.assertFalse(any(job['style_code'] == 'MY019-1' for job in recent))
+        searched = self.client.get('/api/launcher/jobs', params={'search': 'MY019-1 小红书'}).json()
+        self.assertEqual(searched['total_matches'], 1)
+        self.assertEqual(searched['jobs'][0]['style_code'], 'MY019-1')
 
     def test_api_requires_login_admin_and_same_origin_for_mutations(self):
         self.assertEqual(self.client.get('/api/launcher/products').status_code,401)
@@ -154,6 +220,40 @@ class WorkbenchTests(unittest.TestCase):
                 self.assertEqual(args.allow_taobao_save_once,names==['taobao'] and mode=='save')
                 self.assertEqual(args.allow_taobao_publish_once,names==['taobao'] and mode=='publish')
                 self.assertNotIn(self.settings.device_token,' '.join(argv))
+
+    def test_platform_save_command_can_prepend_base_stage(self):
+        config = {**self.payload, 'platforms':['jd','xhs'], 'include_base':True}
+        argv = build_command(self.product, config, 'b'*32, self.root/'output', self.settings)
+        args = erp.build_parser().parse_args(argv[3:])
+        erp.validate_execution_mode(args)
+        self.assertEqual(args.platform, 'base,jd,xhs')
+
+    def test_platform_save_command_with_auto_base_keeps_taobao_stage_authorization(self):
+        config = {**self.payload, 'platforms':['taobao'], 'include_base':True}
+        argv = build_command(self.product, config, 'b'*32, self.root/'output', self.settings)
+        args = erp.build_parser().parse_args(argv[3:])
+        erp.validate_execution_mode(args)
+        self.assertEqual(args.platform, 'base,taobao')
+        self.assertFalse(args.allow_taobao_save_once)
+
+    def test_web_start_auto_adds_base_for_product_without_base_save(self):
+        result = self.fake_start()
+        self.assertEqual(result['platforms'], ['base', 'jd', 'xhs'])
+        launch = json.loads((self.launcher.root / result['id'] / 'launch.json').read_text())
+        self.assertIn('--platform', launch['argv'])
+        self.assertEqual(launch['argv'][launch['argv'].index('--platform') + 1], 'base,jd,xhs')
+
+    def test_web_start_does_not_repeat_base_after_successful_base_save(self):
+        run = self.root / 'runs' / '20260926-130100'
+        (run / 'base').mkdir(parents=True)
+        atomic_json(run / 'input-summary.json', {'excel_path': str(self.product)})
+        atomic_json(run / 'base/save-result.json', {'result': 1, 'action': '保存'})
+        self.launcher.catalog.runs_root = run.parent
+
+        result = self.fake_start()
+        self.assertEqual(result['platforms'], ['jd', 'xhs'])
+        launch = json.loads((self.launcher.root / result['id'] / 'launch.json').read_text())
+        self.assertEqual(launch['argv'][launch['argv'].index('--platform') + 1], 'jd,xhs')
 
     def test_invalid_commands_and_unconfirmed_publish_never_spawn(self):
         invalid = [dict(platforms=[]),dict(platforms=['jd','jd']),dict(platforms=['jd;touch /tmp/bad']),
@@ -221,10 +321,10 @@ class WorkbenchTests(unittest.TestCase):
         with transaction(self.settings) as db:
             now=utc_now()
             db.execute("INSERT INTO products(product_version,style_code,title,created_at,updated_at) VALUES('p','1001','test',?,?)",(now,now))
-            db.execute("INSERT INTO run_checkpoints(run_id,product_version,device_id,execution_mode,platform_order_json,current_index,status,updated_at) VALUES(?, 'p','device','save_only','[\"jd\",\"xhs\"]',1,'running',?)",(first['id'],now))
+            db.execute("INSERT INTO run_checkpoints(run_id,product_version,device_id,execution_mode,platform_order_json,current_index,status,updated_at) VALUES(?, 'p','device','save_only','[\"base\",\"jd\",\"xhs\"]',1,'running',?)",(first['id'],now))
         with patch.object(self.launcher,'_owned',return_value=True):
             result=self.launcher.get(first['id'])
-        self.assertEqual(result['stages'],[{'platform':'jd','status':'success'},{'platform':'xhs','status':'running'}])
+        self.assertEqual(result['stages'],[{'platform':'base','status':'success'},{'platform':'jd','status':'running'},{'platform':'xhs','status':'pending'}])
 
 
 class WorkerReceiptTests(unittest.TestCase):

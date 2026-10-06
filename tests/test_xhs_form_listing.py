@@ -41,6 +41,42 @@ class XhsDataTests(unittest.TestCase):
 
 
 class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shoe_specification_waits_for_category_rerender(self):
+        listing = await self._listing()
+
+        async def delayed_category(_path):
+            await listing.panel.evaluate('''panel => setTimeout(() => {
+              panel.insertAdjacentHTML('beforeend', `<div class="block-specification">
+                <div><div class="title-bg"><div class="el-select"><input class="el-input__inner" value="颜色分类"></div></div></div>
+                <div><div class="title-bg"><div class="el-select"><input class="el-input__inner" value="尺码"></div></div>
+                  <div class="specification-value"><input class="el-input__inner" value="39码"></div></div>
+              </div>`);
+            }, 150)''')
+            return {}
+
+        listing.apply_category = AsyncMock(side_effect=delayed_category)
+        for name in (
+            'fill_identity', 'fill_category_attributes', 'apply_full_payment_presale',
+            'fill_price_inventory_batch', 'sync_main_images',
+        ):
+            setattr(listing, name, AsyncMock(return_value={}))
+        listing._select_values = AsyncMock(return_value=('鞋码',))
+        listing._visible_validation_errors = AsyncMock(return_value=())
+        with patch('xhs_form_listing.sync_store_freight', new_callable=AsyncMock):
+            await listing.apply_excel_fields(
+                XhsFields(fields={}, category_path=('流行男鞋', '休闲皮鞋')),
+                title='皮鞋', style_code='MY019-1', portrait_paths=(),
+                timeout_seconds=5, uploader=AsyncMock(),
+            )
+
+        listing._select_values.assert_awaited_once()
+        self.assertEqual(
+            await listing.panel.locator(
+                '.block-specification .specification-value input'
+            ).first.input_value(),
+            '39码',
+        )
+
     async def test_main_upload_survives_new_validation_label_after_hover(self):
         listing = await self._listing()
         await listing.panel.evaluate('''panel => {

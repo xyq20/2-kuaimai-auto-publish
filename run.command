@@ -37,7 +37,9 @@ parse_platform_choices() {
 }
 
 select_product_excel() {
-  local products_root="${KUAIMAI_PRODUCTS_ROOT:-/Volumes/共享文件/谭/products}"
+  local default_products_root="/Volumes/共享文件/谭/products"
+  [[ -d "$default_products_root" ]] || default_products_root="$HOME/Desktop/共享文件/谭/products"
+  local products_root="${KUAIMAI_PRODUCTS_ROOT:-$default_products_root}"
   local last_product_file="${KUAIMAI_LAST_PRODUCT_FILE:-$SCRIPT_DIR/.local-state/last-product-path}"
   local last_product=""
   local selected_excel=""

@@ -11,6 +11,16 @@ from category_profile import (
 
 
 class CategoryProfileTests(unittest.TestCase):
+    def test_matching_gender_alone_does_not_accept_an_unrelated_category(self):
+        for hints in (
+            ("牛仔裤", "男士直筒牛仔裤"),
+            ("男装", "牛仔裤", "男士直筒牛仔裤"),
+        ):
+            with self.subTest(hints=hints):
+                self.assertEqual(choose_category_candidate(
+                    ("男装 > 休闲裤 > 休闲裤",), hints,
+                ), ("", ""))
+
     def test_shoe_family_and_leather_leaf_are_distinct(self):
         for path in ('鞋靴 > 男鞋 > 皮鞋', '流行男鞋 > 时尚单鞋 > 正装皮鞋'):
             self.assertTrue(is_footwear_category(path))

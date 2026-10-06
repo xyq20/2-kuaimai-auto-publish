@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import kuaimai_erp as erp
+from douyin_listing import DouyinListingError
+from learning_client import RetryableCloudError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -92,6 +94,67 @@ class PlatformSelectionTests(unittest.TestCase):
 
 
 class PlatformBatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_saved_douyin_readback_retries_initial_stale_price(self):
+        verify = AsyncMock(side_effect=[
+            DouyinListingError("保存后第 1 个 SKU 的价格不一致：页面为 0"),
+            {"sku_verified_rows": 10},
+        ])
+        with patch.object(erp.asyncio, "sleep", new_callable=AsyncMock) as sleep:
+            report = await erp.retry_douyin_saved_readback(verify)
+
+        self.assertEqual(report["sku_verified_rows"], 10)
+        self.assertEqual(verify.await_count, 2)
+        sleep.assert_awaited_once_with(0.25)
+
+    async def test_saved_readback_reload_replaces_shared_editor(self):
+        page = SimpleNamespace(reload=AsyncMock())
+        old_drawer = object()
+        new_drawer = object()
+        shared_session = {"drawer": old_drawer}
+        product = SimpleNamespace(style_code="MY019-1")
+        with patch.object(
+            erp, "open_product_editor", new_callable=AsyncMock, return_value=new_drawer
+        ) as open_editor:
+            drawer, reopened = await erp.product_editor_for_saved_readback(
+                page,
+                old_drawer,
+                shared_session,
+                product,
+                timeout_seconds=30,
+                logger=LOGGER,
+                platform_label="抖音资料持久化结果",
+                force_reload=True,
+            )
+
+        self.assertTrue(reopened)
+        self.assertIs(drawer, new_drawer)
+        self.assertIs(shared_session["drawer"], new_drawer)
+        page.reload.assert_awaited_once_with(
+            wait_until="domcontentloaded", timeout=30000
+        )
+        open_editor.assert_awaited_once()
+
+    async def test_review_wait_survives_temporary_service_restart(self):
+        class StopAfterRetry(Exception):
+            pass
+
+        client = Mock()
+        client.poll_resume.side_effect = [
+            RetryableCloudError("cloud request failed"), StopAfterRetry(),
+        ]
+        context = SimpleNamespace(client=client, device_id="device")
+        review = SimpleNamespace(review_id="review-1")
+        with patch.object(erp, "save_learning_checkpoint", return_value=object()), patch.object(
+            erp, "drain_learning_events", new_callable=AsyncMock
+        ), patch.object(erp.asyncio, "sleep", new_callable=AsyncMock) as sleep:
+            with self.assertRaises(StopAfterRetry):
+                await erp.wait_for_platform_review_batch(
+                    context, SimpleNamespace(), ("pdd",), 0, (review,), LOGGER,
+                )
+
+        self.assertEqual(client.poll_resume.call_count, 2)
+        sleep.assert_awaited_once_with(5)
+
     async def _run(self, platforms, mode, *, product=None, failure_at=None):
         args = batch_args(platforms, mode)
         erp.validate_execution_mode(args)

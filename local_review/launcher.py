@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import threading
+import unicodedata
 import uuid
 from zipfile import BadZipFile
 
@@ -45,6 +46,23 @@ class ProductCatalog:
         self.runs_root = runs_root
         self._cache = {}
 
+    @staticmethod
+    def _folder_key(path: Path) -> tuple:
+        """Return a stable product-folder key across SMB mount locations.
+
+        The same share can be mounted at ``/Volumes/共享文件`` or at
+        ``~/Desktop/共享文件``. Run summaries keep the path from the time of
+        the run, so comparing absolute paths would hide the old processed
+        records after a remount.
+        """
+        resolved = Path(path).expanduser().resolve()
+        parts = resolved.parts
+        try:
+            share_index = parts.index("共享文件")
+        except ValueError:
+            return ("local", str(resolved))
+        return ("smb-share", *parts[share_index + 1 :])
+
     def _safe(self, path: Path) -> bool:
         return path.resolve().is_relative_to(self.root)
 
@@ -75,21 +93,53 @@ class ProductCatalog:
         require(path is not None, 404, "product_not_found")
         return path
 
+    def _base_saved_for(self, folder: Path) -> bool:
+        if self.runs_root is None:
+            return False
+        folder_key = self._folder_key(folder)
+        for summary_path in self.runs_root.glob("*/input-summary.json"):
+            summary = read_json(summary_path, {})
+            excel_path = summary.get("excel_path")
+            if not excel_path or self._folder_key(Path(excel_path).parent) != folder_key:
+                continue
+            run = summary_path.parent
+            for receipt_path in (
+                run / "base" / "save-result.json",
+                run / "base" / "base-save-result.json",
+                run / "base" / "publish-result.json",
+            ):
+                receipt = read_json(receipt_path, {})
+                if receipt.get("result") == 1:
+                    return True
+        return False
+
     def listing(self) -> list:
         paths = self.paths()
-        progress = {p.parent.resolve(): set() for p in paths.values()}
+        progress = {self._folder_key(p.parent): set() for p in paths.values()}
+        base_saved = {folder: False for folder in progress}
         if self.runs_root is not None:
             for summary_path in self.runs_root.glob("*/input-summary.json"):
                 summary = read_json(summary_path, {})
                 excel_path = summary.get("excel_path")
                 if not excel_path:
                     continue
-                folder = Path(excel_path).parent.resolve()
+                folder = self._folder_key(Path(excel_path).parent)
                 if folder not in progress:
                     continue
                 run = summary_path.parent
+                base_dir = run / "base"
+                if base_dir.is_dir():
+                    base_receipts = (
+                        base_dir / "save-result.json",
+                        base_dir / "base-save-result.json",
+                        base_dir / "publish-result.json",
+                    )
+                    if any(read_json(receipt_path, {}).get("result") == 1
+                           for receipt_path in base_receipts):
+                        base_saved[folder] = True
                 receipts = [*run.glob("save-result.json"), *run.glob("publish-result.json"),
-                            *run.glob("*/save-result.json"), *run.glob("*/publish-result.json")]
+                            *run.glob("*/save-result.json"), *run.glob("*/publish-result.json"),
+                            *run.glob("*/base-save-result.json")]
                 for receipt_path in receipts:
                     receipt = read_json(receipt_path, {})
                     if receipt.get("result") != 1:
@@ -104,8 +154,9 @@ class ProductCatalog:
                                       for p in validations if p.name.split('-after-save')[0] in PLATFORMS), None)
                     progress[folder].add(label or "商品资料")
         return [{"id": key, "title": p.parent.name,
-                 "processed": bool(progress[p.parent.resolve()]),
-                 "processed_platforms": sorted(progress[p.parent.resolve()])}
+                 "processed": bool(progress[self._folder_key(p.parent)]),
+                 "base_saved": base_saved[self._folder_key(p.parent)],
+                 "processed_platforms": sorted(progress[self._folder_key(p.parent)])}
                 for key, p in paths.items()]
 
     def detail(self, product_id: str) -> dict:
@@ -114,7 +165,10 @@ class ProductCatalog:
             signature = (path.stat().st_mtime_ns, path.stat().st_size)
             cached = self._cache.get(product_id)
             if cached and cached[0] == signature:
-                return cached[1]
+                detail = dict(cached[1])
+                detail["base_saved"] = self._base_saved_for(path.parent)
+                self._cache[product_id] = (signature, detail)
+                return detail
             from openpyxl import load_workbook
             from kuaimai_erp import read_excel_fields, normalize_cell
             from douyin_data import field_lookup
@@ -135,6 +189,10 @@ class ProductCatalog:
                 "folder": path.parent.name,
                 "image": f"/api/launcher/products/{product_id}/image" if self.image(product_id) else None,
             }
+            # The workbook has already been read above. Calling listing() here
+            # would rescan every historical run before returning one product,
+            # which made selecting a product visibly stall on the SMB share.
+            detail["base_saved"] = self._base_saved_for(path.parent)
             self._cache[product_id] = (signature, detail)
             return detail
         except (OSError, ValueError, KeyError, BadZipFile):
@@ -151,6 +209,19 @@ class ProductCatalog:
                     return path
         return None
 
+    def open_folder(self, product_id: str) -> dict:
+        folder = self.path(product_id).parent.resolve()
+        require(self._safe(folder) and folder.is_dir(), 404, "product_not_found")
+        require(sys.platform == "darwin", 503, "folder_open_unavailable")
+        try:
+            subprocess.run(
+                ["/usr/bin/open", str(folder)], check=True, timeout=10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            raise ApiError(503, "folder_open_failed") from None
+        return {"opened": True}
+
 
 def build_command(product: Path, config: dict, run_id: str, output_dir: Path, settings: Settings) -> list:
     operation = config.get("operation", "platforms")
@@ -162,19 +233,27 @@ def build_command(product: Path, config: dict, run_id: str, output_dir: Path, se
         require(isinstance(names, list) and 0 < len(names) <= len(PLATFORMS), 422, "invalid_platforms")
         require(all(isinstance(n, str) and n in PLATFORMS for n in names), 422, "invalid_platforms")
         require(len(set(names)) == len(names), 422, "invalid_platforms")
+    include_base = config.get("include_base", False)
+    require(type(include_base) is bool, 422, "invalid_include_base")
+    require(
+        not include_base or (operation == "platforms" and mode in {"save", "publish"}),
+        422,
+        "invalid_include_base",
+    )
     require(type(config.get("learning")) is bool, 422, "invalid_learning")
     # Base editing currently saves as part of its workflow. Never expose it as a preview.
     require(operation == "platforms" or mode == "save", 422, "base_requires_save")
     require(mode != "publish" or config.get("confirm_publish") is True, 422, "publish_confirmation_required")
     learning = config["learning"] and operation == "platforms"
     require(not learning or settings.device_token, 503, "review_not_configured")
+    command_platforms = (["base", *names] if include_base else names)
     command = [sys.executable, "-u", str(PROJECT_DIR / "kuaimai_erp.py"),
-               "--excel-url", str(product), "--platform", ",".join(names) if operation == "platforms" else "base",
+               "--excel-url", str(product), "--platform", ",".join(command_platforms) if operation == "platforms" else "base",
                "--run-id", run_id, "--output-dir", str(output_dir),
                {"preview": "--no-save", "save": "--save-only", "publish": "--save"}[mode]]
     if operation == "create":
         command.append("--create-product")
-    if names == ["taobao"] and operation == "platforms" and mode != "preview":
+    if names == ["taobao"] and operation == "platforms" and mode != "preview" and not include_base:
         command.append("--allow-taobao-save-once" if mode == "save" else "--allow-taobao-publish-once")
     if learning:
         command += ["--learning-enabled", "--learning-api-url", f"http://127.0.0.1:{settings.review_port}"]
@@ -296,6 +375,24 @@ class Launcher:
         with self.locked():
             return [self._public(job) for job in self._jobs()[:100]]
 
+    def search_history(self, query: str) -> dict:
+        terms = [part.casefold() for part in unicodedata.normalize("NFKC", query).split()]
+        with self.locked():
+            matches = []
+            for job in self._jobs():
+                haystack = unicodedata.normalize("NFKC", " ".join(
+                    str(value) for value in (
+                        job.get("style_code", ""), job.get("title", ""),
+                        job.get("created_by", ""), job.get("created_at", ""),
+                        job.get("status", ""), job.get("mode", ""),
+                        *(job.get("platforms") or ()),
+                        *(PLATFORMS.get(name, name) for name in job.get("platforms") or ()),
+                    )
+                )).casefold()
+                if all(term in haystack for term in terms):
+                    matches.append(job)
+            return {"jobs": [self._public(job) for job in matches[:100]], "total_matches": len(matches)}
+
     def get(self, job_id: str) -> dict:
         with self.locked():
             job = read_json(self._directory(job_id) / "job.json")
@@ -314,15 +411,24 @@ class Launcher:
             require(not external_runner_active(), 409, "external_job_running")
             product = self.catalog.path(payload.get("product_id"))
             detail = self.catalog.detail(payload["product_id"])
+            operation = payload.get("operation", "platforms")
+            auto_base = (
+                operation == "platforms"
+                and payload["mode"] in {"save", "publish"}
+                and not detail.get("base_saved", False)
+            )
+            command_payload = {**payload, "include_base": auto_base}
             job_id = uuid.uuid4().hex
             output_dir = PROJECT_DIR / "output/kuaimai/runs" / (datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + job_id[:8])
-            command = build_command(product, payload, job_id, output_dir, self.settings)
+            command = build_command(product, command_payload, job_id, output_dir, self.settings)
             directory = self.root / job_id
             directory.mkdir()
             atomic_json(directory / "launch.json", {"argv": command})
+            job_platforms = ((["base"] if auto_base else []) + payload["platforms"]
+                             if operation == "platforms" else ["base"])
             job = {"id": job_id, "request_key": key, "product_id": detail["id"], "title": detail["title"],
-                   "style_code": detail["style_code"], "platforms": payload["platforms"] if payload.get("operation", "platforms") == "platforms" else ["base"],
-                   "mode": payload["mode"], "operation": payload.get("operation", "platforms"),
+                   "style_code": detail["style_code"], "platforms": job_platforms,
+                   "base_auto_added": auto_base, "mode": payload["mode"], "operation": operation,
                    "learning": "--learning-enabled" in command, "status": "running", "created_at": utc_now(),
                    "created_by": username, "output_dir": str(output_dir)}
             env = os.environ.copy()

@@ -1068,6 +1068,13 @@ class YouzanFormListing(TaobaoListing):
                     )
                 ) from exc
             if actual is None:
+                if (
+                    self.attribute_runtime is not None
+                    and self.attribute_runtime.review_pending_or_omitted(
+                        self.attribute_platform_id, page_label
+                    )
+                ):
+                    return None
                 return await self._set_select_values_directly(
                     select,
                     direct_values,

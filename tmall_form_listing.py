@@ -2494,8 +2494,12 @@ class TmallFormListing(TaobaoListing):
             before = tuple([await control.input_value() for control in controls])
             dimension_key = normalize_label(dimension)
             is_size_dimension = (
-                "尺码" in dimension_key or dimension_key in {"鞋码", "码数"}
+                "尺码" in dimension_key or "鞋码" in dimension_key or dimension_key == "码数"
             )
+            if is_footwear and is_size_dimension and not controls:
+                raise TmallFormListingError(
+                    f"天猫鞋码规格“{dimension}”没有可回读的规格值控件"
+                )
             try:
                 after = normalize_tmall_spec_values(
                     before,
@@ -2504,6 +2508,13 @@ class TmallFormListing(TaobaoListing):
                 )
             except TmallRuleError as exc:
                 raise TmallFormListingError(str(exc)) from exc
+            if is_footwear and is_size_dimension and self.logger is not None:
+                self.logger.info(
+                    "天猫鞋码规格检查：%s，页面=%s，目标=%s",
+                    dimension,
+                    before,
+                    after,
+                )
             plans.append((dimension, controls, before, after))
 
         for dimension, controls, before, after in plans:

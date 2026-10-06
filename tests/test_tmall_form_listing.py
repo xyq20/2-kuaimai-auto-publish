@@ -1083,6 +1083,29 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(values, ["黑色码", "38", "38.5", "均码"])
         self.assertEqual(report["changed"], 2)
 
+    async def test_shoe_size_cleanup_recognizes_shoe_size_dimension_name(self):
+        listing = await self._listing(
+            """
+            <div class="block-specification">
+              <div class="title-bg"><input value="鞋码大小"></div>
+              <div class="specification-value">
+                <input class="spec-value" value="39码">
+                <input class="spec-value" value="40码">
+              </div>
+            </div>
+            """
+        )
+
+        report = await listing.normalize_synced_specifications("流行男鞋 > 休闲皮鞋")
+
+        self.assertEqual(report["changed"], 2)
+        self.assertEqual(
+            await self.page.locator(".spec-value").evaluate_all(
+                "nodes => nodes.map(node => node.value)"
+            ),
+            ["39", "40"],
+        )
+
     async def test_shoe_size_dropdown_searches_and_clicks_numeric_candidates(self):
         listing = await self._listing('''
           <div class="block-specification">

@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, unquote_to_bytes, urljoin, urlsplit
 
 from category_profile import category_profile
@@ -47,7 +47,7 @@ from learning_models import (
 )
 from learning_store import LearningStore
 from learning_assets import PreparedLearningAsset, prepare_learning_assets
-from learning_client import CloudLearningClient, flush_outbox_async
+from learning_client import CloudLearningClient, RetryableCloudError, flush_outbox_async
 from attribute_runtime import AttributeRuntime, ReviewBatchRequired, ReviewRequired
 from historical_readbacks import load_verified_attribute_history
 from review_resume import persist_resume_and_ack, validate_resume
@@ -103,7 +103,7 @@ SCM_HOSTS = {"scm.superboss.cc", "scma.superboss.cc", "vipscm.superboss.cc"}
 ERP_LOGIN_KEYCHAIN_SERVICE = "kuaimai-erp-auto-login"
 ERP_LOGIN_KEYCHAIN_LABEL = "快麦 ERP 自动登录"
 ERP_LOGIN_CREDENTIAL_RETRY_SECONDS = 30.0
-DEFAULT_EXCEL_URL = "smb://gongxiang/共享文件/谭/products/战浮+NGBL-2064/产品信息.xlsx"
+DEFAULT_EXCEL_URL = "smb://192.168.0.39/共享文件/谭/products/战浮+NGBL-2064/产品信息.xlsx"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 NEW_PRODUCT_SIZES = ("S", "M", "L", "XL", "2XL")
 
@@ -354,6 +354,11 @@ def create_learning_context(
 ) -> Optional[LearningRunContext]:
     if not getattr(args, "learning_enabled", False):
         return None
+    if not str(getattr(args, "learning_api_url", "")).strip():
+        raise AutomationError(
+            "已启用属性审核，但未配置审核服务地址；"
+            "请用 run-with-ai-review.command 启动，或设置 KUAIMAI_LEARNING_API_URL"
+        )
     fingerprint = ProductFingerprint.from_inputs(
         product.style_code,
         product.title,
@@ -375,20 +380,17 @@ def create_learning_context(
         },
     )
     run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
-    client: Optional[CloudLearningClient] = None
-    runtime: Optional[AttributeRuntime] = None
-    if str(getattr(args, "learning_api_url", "")).strip():
-        client = CloudLearningClient(args.learning_api_url)
-        runtime = AttributeRuntime(
-            store,
-            client,
-            run_id,
-            fingerprint.product_version,
-            device_id=store.get_or_create_device_id(),
-            verified_history=load_verified_attribute_history(
-                SCRIPT_DIR / "output/kuaimai/runs", product.style_code
-            ),
-        )
+    client = CloudLearningClient(args.learning_api_url)
+    runtime = AttributeRuntime(
+        store,
+        client,
+        run_id,
+        fingerprint.product_version,
+        device_id=store.get_or_create_device_id(),
+        verified_history=load_verified_attribute_history(
+            SCRIPT_DIR / "output/kuaimai/runs", product.style_code
+        ),
+    )
     return LearningRunContext(
         store,
         run_id,
@@ -420,6 +422,21 @@ async def initialize_learning_run(
             "已加载同款历史保存回读：%s 个平台属性，可直接复用时不再重复审核",
             len(verified_history),
         )
+    # 图片接口要求商品先存在。通用 outbox 每次只发送 50 条，不能用
+    # 一轮队列同步成功来推断当前商品已经登记；优先确认当前依赖事件。
+    product_key = f"product.upsert:{context.product_version}"
+    product_payload = {
+        "product_version": context.product_version,
+        "style_code": product.style_code,
+        "title": product.title,
+        "category_json": {"hints": list(getattr(product, "category_hints", ()))},
+    }
+    product_event_id = context.store.enqueue(product_key, "product.upsert", product_payload)
+    await asyncio.to_thread(
+        context.client.post_event, product_key, "product.upsert", product_payload
+    )
+    context.store.mark_delivered(product_event_id)
+    logger.info("审核后台已确认当前商品登记：%s；开始同步学习素材", product.style_code)
     await flush_outbox_async(
         context.store,
         context.client,
@@ -593,13 +610,22 @@ def read_excel_fields(rows: Iterable[Sequence[Any]]) -> Dict[str, Any]:
 
 
 def resolve_excel_path(value: str) -> Path:
-    """将 smb://host/share/path 映射到 macOS 已挂载的 /Volumes/share/path。"""
+    """将 SMB 地址映射到当前 macOS 的已挂载共享目录。"""
     if value.lower().startswith("smb://"):
         parsed = urlsplit(value)
         parts = [unquote(part) for part in parsed.path.split("/") if part]
         if len(parts) < 2:
             raise AutomationError(f"SMB 路径缺少共享名或文件路径：{value}")
-        path = Path("/Volumes").joinpath(*parts)
+        # Finder may mount the same SMB share under /Volumes or under a user
+        # folder (the current 192.168.0.39 share is mounted at ~/Desktop).
+        candidates = (
+            Path("/Volumes").joinpath(*parts),
+            Path.home() / "Desktop" / Path(*parts),
+        )
+        path = next(
+            (candidate for candidate in candidates if candidate.is_file()),
+            candidates[0],
+        )
     else:
         path = Path(value).expanduser()
 
@@ -4566,6 +4592,52 @@ async def product_editor_for_saved_readback(
     return persisted_drawer, True
 
 
+async def retry_douyin_saved_readback(
+    verify_once: Callable[[], Awaitable[Mapping[str, Any]]],
+    *,
+    timeout_seconds: float = 10,
+) -> Mapping[str, Any]:
+    """Wait briefly for saved Douyin values to finish loading after reopening."""
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while True:
+        try:
+            return await verify_once()
+        except DouyinListingError:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise
+            await asyncio.sleep(0.25)
+
+
+def require_resolved_page_attributes(
+    platform_id: str,
+    report: Mapping[str, Any],
+    attribute_runtime: Optional[AttributeRuntime] = None,
+) -> None:
+    """Reject Excel assignments left blank by option matching before saving."""
+    pending: List[str] = []
+
+    def walk(value: Any) -> None:
+        if not isinstance(value, Mapping):
+            return
+        for key, item in value.items():
+            if key in {"skipped_values", "skipped_no_exact_candidate"} and isinstance(item, Mapping):
+                for label, expected in item.items():
+                    if (attribute_runtime is not None
+                            and attribute_runtime.intentionally_omitted(platform_id, str(label))):
+                        continue
+                    pending.append(f"{label}={expected}")
+            elif isinstance(item, Mapping):
+                walk(item)
+
+    walk(report)
+    if pending:
+        raise AutomationError(
+            f"{platform_id}页面字段已匹配 Excel，但未写入："
+            + "；".join(dict.fromkeys(pending))
+            + "。已阻止保存，请选择平台候选或提交审核"
+        )
+
+
 async def run_browser_automation(
     args: argparse.Namespace,
     product: ProductData,
@@ -4739,6 +4811,7 @@ async def run_browser_automation(
                     page.locator("body"),
                     logger,
                     attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 shared_session["wxsph_api_capture"] = wxsph_capture
         elif wxsph_requested:
@@ -4750,6 +4823,7 @@ async def run_browser_automation(
                 page.locator("body"),
                 logger,
                 attribute_runtime=attribute_runtime,
+                category_hints=product.category_hints,
             )
         try:
             if reuse_editor:
@@ -5285,7 +5359,11 @@ async def run_browser_automation(
             elif wxsph_requested:
                 assert product.wxsph_fields is not None
                 wxsph = wxsph_capture or WxsphFormListing(
-                    page, drawer, logger, attribute_runtime=attribute_runtime
+                    page,
+                    drawer,
+                    logger,
+                    attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 if isinstance(record, dict):
                     wxsph.base_item_id = str(
@@ -5817,6 +5895,20 @@ async def run_browser_automation(
             if attribute_runtime is not None:
                 attribute_runtime.raise_deferred_reviews()
 
+            current_report = (
+                douyin_report if publish_mode else
+                taobao_report if taobao_requested else
+                pdd_report if pdd_requested else
+                wxsph_report if wxsph_requested else
+                xhs_report if xhs_requested else
+                youzan_report if youzan_requested else
+                jd_report if jd_requested else
+                tmall_report if tmall_requested else {}
+            )
+            require_resolved_page_attributes(
+                args.platform, current_report, attribute_runtime
+            )
+
             if not args.save:
                 logger.info(
                     "已完成所选范围的资料填写与校验；--no-save 已启用，"
@@ -5953,6 +6045,7 @@ async def run_browser_automation(
                         timeout_seconds=args.timeout,
                         logger=logger,
                         platform_label="抖音资料持久化结果",
+                        force_reload=True,
                     )
                 )
                 persisted_douyin = DouyinListing(
@@ -5962,14 +6055,17 @@ async def run_browser_automation(
                     artifact_dir,
                 )
                 await persisted_douyin.open()
-                persisted_report = await persisted_douyin.verify_persisted_values(
-                    category_fields["category"],
-                    category_fields["product_title"],
-                    category_fields["short_title"],
-                    category_fields["attributes"],
-                    product.douyin_fields.price,
-                    product.douyin_fields.spot_stock,
-                    product.douyin_fields.presale_stock,
+                persisted_report = await retry_douyin_saved_readback(
+                    lambda: persisted_douyin.verify_persisted_values(
+                        category_fields["category"],
+                        category_fields["product_title"],
+                        category_fields["short_title"],
+                        category_fields["attributes"],
+                        product.douyin_fields.price,
+                        product.douyin_fields.spot_stock,
+                        product.douyin_fields.presale_stock,
+                        sku_rows,
+                    )
                 )
                 (artifact_dir / "douyin-after-save-validation.json").write_text(
                     json.dumps(persisted_report, ensure_ascii=False, indent=2),
@@ -5978,7 +6074,7 @@ async def run_browser_automation(
                 logger.info(
                     "保存后%s复核通过：抖音字段与 %s 行 SKU 均已持久化",
                     "重开" if persisted_reopened else "当前页",
-                    sku_rows,
+                    persisted_report["sku_verified_rows"],
                 )
 
             if pdd_requested:
@@ -5998,6 +6094,7 @@ async def run_browser_automation(
                     page,
                     persisted_drawer,
                     logger,
+                    category_hints=product.category_hints,
                 )
                 await persisted_pdd.open()
                 persisted_report = (
@@ -6032,12 +6129,14 @@ async def run_browser_automation(
                     page,
                     persisted_drawer,
                     logger,
+                    category_hints=product.category_hints,
                 )
                 await persisted_wxsph.open()
                 persisted_report = await persisted_wxsph.verify_persisted_values(
                     product.wxsph_fields,
                     expected_attributes=wxsph_report["attributes"]["attributes"],
                     expected_freight=wxsph_report.get("freight"),
+                    expected_category=wxsph_report.get("category_selection", {}).get("selected", ""),
                 )
                 (artifact_dir / "wxsph-after-save-validation.json").write_text(
                     json.dumps(persisted_report, ensure_ascii=False, indent=2),
@@ -6721,11 +6820,16 @@ async def wait_for_platform_review_batch(
     )
     await drain_learning_events(learning_context)
     while pending:
-        response = await asyncio.to_thread(
-            learning_context.client.poll_resume,
-            learning_context.device_id,
-            30,
-        )
+        try:
+            response = await asyncio.to_thread(
+                learning_context.client.poll_resume,
+                learning_context.device_id,
+                30,
+            )
+        except RetryableCloudError as exc:
+            logger.warning("审核服务暂时不可用，5 秒后继续等待审核：%s", exc)
+            await asyncio.sleep(5)
+            continue
         events = response.get("events", ())
         if not isinstance(events, (list, tuple)):
             raise AutomationError("人工审核恢复响应格式无效")

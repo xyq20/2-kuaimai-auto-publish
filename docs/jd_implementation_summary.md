@@ -164,7 +164,7 @@ def _validate_sku(self, snapshot, expected):
 python3 kuaimai_erp.py \
   --platform jd \
   --no-save \
-  --excel-url "smb://gongxiang/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx"
+  --excel-url "smb://192.168.0.39/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx"
 ```
 
 ### 保存模式
@@ -172,7 +172,7 @@ python3 kuaimai_erp.py \
 python3 kuaimai_erp.py \
   --platform jd \
   --save-only \
-  --excel-url "smb://gongxiang/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx"
+  --excel-url "smb://192.168.0.39/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx"
 ```
 
 ## Git 提交记录

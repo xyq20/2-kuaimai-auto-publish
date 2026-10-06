@@ -38,3 +38,30 @@ class ShoeSizeTests(unittest.TestCase):
     def test_missing_length_fails(self):
         with self.assertRaisesRegex(RecognitionError, '无法唯一识别'):
             parse_shoe_measurements([t for t in self.tokens if t.text != '261–266'], ['39','40'])
+
+    def test_inner_length_chart_fills_shoe_measurements_when_foot_length_missing(self):
+        chart = [token('MM', .10, .10), token('内长', .10, .14),
+                 token('欧码', .60, .14), token('39', .60, .25),
+                 token('40', .60, .35), token('272', .10, .25),
+                 token('277', .10, .35)]
+        result = parse_shoe_measurements(chart, ['39码', '40码'])
+        self.assertEqual([(item.size, item.foot_length) for item in result],
+                         [('39', '27.2'), ('40', '27.7')])
+
+    def test_explicit_foot_length_takes_priority_over_inner_length(self):
+        chart = self.tokens + [token('内长', .35, .14)]
+        result = parse_shoe_measurements(chart, ['39', '40'])
+        self.assertEqual(result[0].foot_length, '26.1-26.6')
+
+    def test_recommended_foot_length_wins_when_both_headers_exist(self):
+        chart = self.tokens + [token('脚长', .35, .14)]
+        result = parse_shoe_measurements(chart, ['39', '40'])
+        self.assertEqual(result[0].foot_length, '26.1-26.6')
+
+    def test_sudden_ten_centimeter_jump_is_rejected(self):
+        chart = [token('MM', .10, .10), token('内长', .10, .14),
+                 token('欧码', .60, .14), token('43', .60, .25),
+                 token('44', .60, .35), token('292', .10, .25),
+                 token('397', .10, .35)]
+        with self.assertRaisesRegex(RecognitionError, '内长变化异常.*44码 39.7'):
+            parse_shoe_measurements(chart, ['43', '44'])

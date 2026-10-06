@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest
-from category_profile import choose_category_candidate
+from category_profile import category_path_parts, category_search_terms, choose_category_candidate
 from canonical_fields import is_learning_managed_field
 from pdd_data import PddFields
 from learning_models import CandidateValue, canonical_sha256
@@ -44,6 +44,27 @@ from taobao_listing import (
 
 class PddFormListingError(RuntimeError):
     """A PDD form issue that can be shown directly to the operator."""
+
+
+# 暂按页面路径差异兼容，不推断是否新增类目，也不硬编码类目 ID。
+# 键为推荐路径，值为允许的完整回读路径；旧路径仍按精确匹配接受。
+# 后续平台调整时只维护此表。不要全局去重同名层级或跨平台套用。
+PDD_CATEGORY_PATH_COMPATIBILITY: Mapping[Tuple[str, ...], Tuple[Tuple[str, ...], ...]] = {
+    ("男装", "牛仔裤"): (("男装", "牛仔裤", "牛仔裤"),),
+}
+
+def _pdd_category_search_terms(hints: Sequence[str]) -> Tuple[str, ...]:
+    """Respect Excel category order; do not promote longer descriptions."""
+    return tuple(dict.fromkeys(str(hint).strip() for hint in hints if str(hint).strip()))
+
+
+def _pdd_recommended_path_matches(expected: str, actual: str) -> bool:
+    expected_parts = category_path_parts(expected)
+    actual_parts = category_path_parts(actual)
+    return bool(expected_parts and actual_parts) and (
+        actual_parts == expected_parts
+        or actual_parts in PDD_CATEGORY_PATH_COMPATIBILITY.get(expected_parts, ())
+    )
 
 
 # These are deterministic historic spreadsheet headings, not fuzzy matches.
@@ -151,6 +172,8 @@ def _special_category_values(
 class PddFormListing(TaobaoListing):
     """Fill PDD category data, its price/inventory batch row and presale."""
 
+    attribute_platform_id = "pdd"
+
     def _start_api_capture(self) -> None:
         previous_handler = getattr(self, "_api_response_handler", None)
         if previous_handler is not None:
@@ -160,19 +183,67 @@ class PddFormListing(TaobaoListing):
                 pass
         self._api_observations: List[Mapping[str, Any]] = []
         self._api_capture_tasks: List[asyncio.Task[Any]] = []
+        self._category_tree_nodes: Dict[str, Mapping[str, Any]] = {}
 
         def handle_response(response: Any) -> None:
             try:
                 path = urlsplit(response.url).path
             except Exception:
                 return
-            if path != PDD_PROPERTIES_ENDPOINT:
+            if path not in {PDD_PROPERTIES_ENDPOINT, "/pdd/getCategoryTree.json"}:
                 return
-            task = asyncio.create_task(self._capture_api_response(response))
+            task = asyncio.create_task(
+                self._capture_category_tree(response)
+                if path == "/pdd/getCategoryTree.json"
+                else self._capture_api_response(response)
+            )
             self._api_capture_tasks.append(task)
 
         self._api_response_handler = handle_response
         self.page.on("response", handle_response)
+
+    async def _capture_category_tree(self, response: Any) -> None:
+        try:
+            payload = await response.json()
+            if response.status != 200 or payload.get("result") != 1:
+                return
+            def collect(rows: Any) -> None:
+                if not isinstance(rows, list):
+                    return
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    if all(key in row for key in ("cid", "parentCid", "name", "level", "leaf")):
+                        self._category_tree_nodes[str(row["cid"])] = {
+                            key: row[key] for key in ("cid", "parentCid", "name", "level", "leaf")
+                        }
+                    collect(row.get("children"))
+            collect(payload.get("data"))
+        except Exception:
+            return
+
+    async def _category_json_node(self, path: Sequence[str]) -> Optional[Mapping[str, Any]]:
+        """Resolve the DOM path through observed PDD parent IDs, never cached IDs."""
+        tasks = tuple(getattr(self, "_api_capture_tasks", ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        tree = getattr(self, "_category_tree_nodes", {})
+        if not tree:
+            return None
+        parent = "0"
+        selected = None
+        for level, label in enumerate(path, 1):
+            candidates = [row for row in tree.values()
+                          if str(row["parentCid"]) == parent
+                          and str(row["level"]) == str(level)
+                          and normalize_label(row["name"]) == normalize_label(label)]
+            if len(candidates) != 1:
+                raise PddFormListingError(
+                    f"拼多多类目 JSON 与 DOM 路径不一致或有歧义：{' > '.join(path)}"
+                )
+            selected = candidates[0]
+            parent = str(selected["cid"])
+        return selected
 
     async def _capture_api_response(self, response: Any) -> None:
         observation: Dict[str, Any] = {
@@ -394,6 +465,310 @@ class PddFormListing(TaobaoListing):
             return lines[0] if lines else text
         except TaobaoListingError as exc:
             raise PddFormListingError(str(exc).replace("淘宝", "拼多多")) from exc
+
+    @staticmethod
+    def _normalize_category_path(value: object) -> str:
+        # Preserve level boundaries, including adjacent identical labels.
+        return " > ".join(category_path_parts(value))
+
+    async def _resolve_category_uncertainty(
+        self, paths: Sequence[str], *, parent_path: Sequence[str] = ()
+    ) -> str:
+        """Use current category paths with the existing knowledge/review gate."""
+        runtime = self.attribute_runtime
+        if runtime is None:
+            raise PddFormListingError("拼多多类目候选不明确，需要启用审核中心后选择")
+        normalized = sorted({self._normalize_category_path(path) for path in paths if path.strip()})
+        if not normalized:
+            raise PddFormListingError("拼多多类目搜索未返回可审核候选，请检查 Excel 类目")
+        candidates = tuple(CandidateValue("path:" + canonical_sha256(path)[:24], path)
+                           for path in normalized)
+        scope = "category-path:" + canonical_sha256(tuple(parent_path))[:24]
+        resolved = await runtime.resolve(AttributeRequest(
+            platform_id="pdd", category_leaf_id=scope,
+            field_id="category_path", field_label="商品类目",
+            candidates=candidates,
+            excel_value=" / ".join(self.category_hints),
+            evidence={"excel": True, "live_dom": True,
+                      "excel_category_hints": list(self.category_hints),
+                      "parent_path": list(parent_path),
+                      "candidate_paths": normalized,
+                      "category_required_before_attributes": True},
+            custom_allowed=False,
+            schema_version=canonical_sha256({"scope": scope, "paths": normalized}),
+            control_type="category",
+        ))
+        if resolved is None:
+            # Category is a prerequisite: do not collect properties from the
+            # previous category while waiting for the standard review queue.
+            runtime.raise_deferred_reviews()
+            raise PddFormListingError("拼多多类目等待审核，暂不能填写属性或保存")
+        if getattr(resolved, "is_no_fill", False):
+            raise PddFormListingError("拼多多商品类目不可留空，当前商品未保存")
+        matches = [candidate for candidate in candidates
+                   if candidate.label == resolved.label and candidate.value_id == resolved.value_id]
+        if len(matches) != 1:
+            raise PddFormListingError("拼多多知识库/审核类目不在当前页面候选中")
+        if self.logger is not None:
+            self.logger.info("拼多多类目根据知识库/审核选择：%s（%s）", resolved.label, resolved.source)
+        return resolved.label
+
+    async def _visible_category_result_nodes(self) -> Tuple[Tuple[str, Any], ...]:
+        # Read complete autocomplete rows, not highlighted leaf-name spans.
+        rows = self.page.locator(
+            ".el-popper:visible .categoryList-wrap .item:visible, "
+            ".el-autocomplete-suggestion:visible li:visible"
+        )
+        if not await rows.count():
+            return await super()._visible_category_result_nodes()
+        result = []
+        for index in range(await rows.count()):
+            row = rows.nth(index)
+            result.append((re.sub(r"\s+", " ", await row.inner_text()).strip(), row))
+        return tuple(result)
+
+    async def _apply_excel_category_search(self) -> str:
+        """Search and select the Excel category when predictions do not match.
+
+        PDD's recommendation rows are only hints.  Selecting an unrelated
+        male category because it shares the gender branch can render a form
+        for the wrong product.  Use the same exact-path proof as the other
+        platform adapters before confirming a manual search result.
+        """
+        if self.panel is None:
+            raise PddFormListingError("请先调用 open() 打开拼多多资料")
+        hints = tuple(self.category_hints)
+        if not hints:
+            raise PddFormListingError("拼多多缺少 Excel 商品分类")
+        modify = self.panel.get_by_role("button", name="修改类目", exact=True)
+        if await modify.count() != 1:
+            raise PddFormListingError(
+                "拼多多推荐类目与 Excel 不匹配，且页面找不到唯一的“修改类目”按钮"
+            )
+        await modify.click(timeout=30_000)
+        dialog = self.page.get_by_role("dialog", name="修改类目", exact=True)
+        try:
+            await dialog.wait_for(state="visible", timeout=10_000)
+        except Exception as exc:
+            raise PddFormListingError("拼多多修改类目弹窗未出现") from exc
+        search = dialog.get_by_placeholder(
+            "请输入类目关键词，支持模糊查询", exact=True
+        )
+        if await search.count() != 1:
+            raise PddFormListingError("拼多多修改类目弹窗缺少搜索框")
+
+        selected_text = ""
+        selected_node: Any = None
+        selected_hint = ""
+        for hint in _pdd_category_search_terms(hints):
+            await search.fill(hint)
+            deadline = asyncio.get_running_loop().time() + 10
+            while asyncio.get_running_loop().time() < deadline:
+                nodes = await self._visible_category_result_nodes()
+                chosen, strategy = choose_category_candidate(
+                    tuple(text for text, _node in nodes), hints
+                )
+                if chosen:
+                    matches = [
+                        (text, node) for text, node in nodes
+                        if self._normalize_category_path(text)
+                        == self._normalize_category_path(chosen)
+                    ]
+                    if len(matches) == 1:
+                        selected_text, selected_node = matches[0]
+                        selected_hint = hint
+                        if self.logger is not None:
+                            self.logger.info(
+                                "拼多多类目按 Excel 搜索选中：%s；搜索词：%s（%s）",
+                                selected_text, selected_hint, strategy,
+                            )
+                        break
+                await asyncio.sleep(0.05)
+            if selected_node is None and nodes and self.attribute_runtime is not None:
+                chosen = await self._resolve_category_uncertainty(tuple(text for text, _node in nodes))
+                matches = [(text, node) for text, node in nodes
+                           if self._normalize_category_path(text) == chosen]
+                if len(matches) != 1:
+                    raise PddFormListingError("拼多多审核类目无法唯一定位到当前搜索结果")
+                selected_text, selected_node = matches[0]
+            if selected_node is not None:
+                break
+        if selected_node is None:
+            raise PddFormListingError(
+                "拼多多修改类目搜索中没有与 Excel 商品分类唯一匹配的项"
+            )
+
+        await selected_node.scroll_into_view_if_needed()
+        await selected_node.click(timeout=10_000)
+        # PDD search results select a branch, not necessarily the final
+        # category.  Walk the visible cascader menus until a node without
+        # ``aria-haspopup`` is reached.  In the live taxonomy, for example,
+        # ``男装 > 牛仔裤`` may open its same-name child.  Menu position,
+        # rather than label deduplication, determines the actual level.
+        menus = dialog.locator(".el-cascader-menu:visible")
+
+        async def read_selected_path() -> str:
+            lines = [line.strip() for line in (await dialog.inner_text()).splitlines()]
+            selected_lines = [line for line in lines if line.startswith("已选")]
+            if not selected_lines:
+                return ""
+            return selected_lines[-1].split("：", 1)[-1].strip()
+
+        async def wait_for_path(expected_path: str, timeout_seconds: float = 3.0) -> str:
+            deadline = asyncio.get_running_loop().time() + timeout_seconds
+            current = ""
+            while asyncio.get_running_loop().time() < deadline:
+                current = await read_selected_path()
+                if self._normalize_category_path(current) == self._normalize_category_path(expected_path):
+                    return current
+                await asyncio.sleep(0.05)
+            return current
+
+        async def menu_nodes(menu: Any) -> List[Tuple[str, Any, bool]]:
+            nodes = menu.locator(".el-cascader-node:visible")
+            result: List[Tuple[str, Any, bool]] = []
+            for index in range(await nodes.count()):
+                node = nodes.nth(index)
+                label_node = node.locator(".el-cascader-node__label").first
+                label = (
+                    await label_node.inner_text()
+                    if await label_node.count()
+                    else await node.inner_text()
+                )
+                aria_has_popup = await node.get_attribute("aria-haspopup")
+                has_popup = aria_has_popup == "true" or bool(
+                    await node.locator(".el-cascader-node__postfix").count()
+                )
+                result.append((re.sub(r"\s+", " ", label).strip(), node, has_popup))
+            return result
+
+        async def click_cascader_node(node: Any) -> None:
+            label_node = node.locator(".el-cascader-node__label").first
+            targets: List[Any] = [node]
+            if await label_node.count():
+                targets.append(label_node)
+            last_error: Optional[Exception] = None
+            for target in targets:
+                try:
+                    await target.scroll_into_view_if_needed()
+                    await target.hover(timeout=10_000, force=True)
+                    await target.click(timeout=10_000, force=True)
+                    return
+                except Exception as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
+
+        path_parts = [
+            part.strip()
+            for part in re.split(r"\s*[>＞/／]\s*", selected_text)
+            if part.strip()
+        ]
+        target_terms = {
+            normalize_label(category_path_parts(term)[-1])
+            for term in category_search_terms(hints) if category_path_parts(term)
+        }
+        target_terms.add(normalize_label(path_parts[-1]))
+        selected_path = ""
+        expected_path = ""
+        search_parts = tuple(path_parts)
+        path_parts = []
+        for depth in range(8):
+            menu_count = 0
+            nodes: List[Tuple[str, Any, bool]] = []
+            deadline = asyncio.get_running_loop().time() + 10
+            while asyncio.get_running_loop().time() < deadline:
+                menu_count = await menus.count()
+                if menu_count > depth:
+                    nodes = await menu_nodes(menus.nth(depth))
+                    if nodes:
+                        break
+                await asyncio.sleep(0.05)
+            if not nodes:
+                raise PddFormListingError(
+                    "拼多多类目级联菜单未渲染下一级节点："
+                    + " > ".join(path_parts)
+                )
+            wanted = {normalize_label(search_parts[depth])} if depth < len(search_parts) else target_terms
+            matching = [item for item in nodes if normalize_label(item[0]) in wanted]
+            if len(matching) != 1 and self.attribute_runtime is not None:
+                choices = matching or nodes
+                chosen = await self._resolve_category_uncertainty(
+                    tuple(" > ".join(path_parts + [item[0]]) for item in choices),
+                    parent_path=path_parts,
+                )
+                matching = [item for item in choices
+                            if self._normalize_category_path(" > ".join(path_parts + [item[0]])) == chosen]
+            if len(matching) != 1:
+                available = "、".join(item[0] for item in nodes[:20])
+                raise PddFormListingError(
+                    "拼多多类目下一级候选不唯一或不存在："
+                    f"路径 {' > '.join(path_parts)!r}，候选 {available!r}"
+                )
+            label, node, has_popup = matching[0]
+            # Start at the root even when search only partially renders the
+            # tree. Never mistake a transient rightmost/root menu for a child.
+            level = depth
+            path_parts.append(label)
+            json_node = await self._category_json_node(path_parts)
+            if json_node is not None and (str(json_node["leaf"]) == "1") == has_popup:
+                raise PddFormListingError(
+                    f"拼多多类目 JSON 与 DOM 末级标记不一致：{' > '.join(path_parts)}"
+                )
+            expected_path = " > ".join(path_parts)
+            if json_node is not None and self.logger is not None:
+                self.logger.info("拼多多类目 JSON+DOM 校验：%s；cid=%s，parentCid=%s，leaf=%s",
+                                 expected_path, json_node["cid"], json_node["parentCid"], json_node["leaf"])
+            if self.logger is not None:
+                try:
+                    outer_html = await node.evaluate("element => element.outerHTML")
+                except Exception:
+                    outer_html = "<无法读取类目节点 outerHTML>"
+                self.logger.info(
+                    "拼多多类目级联节点（第 %s 级）：%s",
+                    level + 1,
+                    re.sub(r"\s+", " ", str(outer_html))[:2_000],
+                )
+            await click_cascader_node(node)
+            if not has_popup:
+                if depth + 1 < len(search_parts):
+                    raise PddFormListingError("拼多多类目在完整搜索路径之前提前到达末级")
+                selected_path = await wait_for_path(expected_path)
+                if self._normalize_category_path(selected_path) == self._normalize_category_path(expected_path):
+                    break
+                raise PddFormListingError(
+                    f"拼多多类目末级回读不一致：期望 {expected_path!r}，页面为 {selected_path!r}"
+                )
+            # The next iteration waits for its own column, including when
+            # lazy-loaded child labels are identical to the parent label.
+        else:
+            raise PddFormListingError("拼多多类目级联菜单超过 8 级，未找到末级类目")
+        if not selected_path:
+            raise PddFormListingError("拼多多类目末级选择后没有生成“已选”路径")
+        if self._normalize_category_path(selected_path) != self._normalize_category_path(expected_path):
+            raise PddFormListingError(
+                f"拼多多类目末级回读不一致：期望 {expected_path!r}，页面为 {selected_path!r}"
+            )
+        selected_text = selected_path
+        confirm = dialog.get_by_role("button", name=re.compile(r"确\s*定"))
+        if await confirm.count() != 1:
+            raise PddFormListingError("拼多多修改类目弹窗找不到唯一“确定”按钮")
+        await confirm.click(timeout=10_000)
+        await dialog.wait_for(state="hidden", timeout=30_000)
+        self.category_clicked = True
+        await self._wait_for_loading_masks()
+        try:
+            await self._attribute_items()
+        except PddFormListingError as exc:
+            raise PddFormListingError("拼多多 Excel 类目应用后，类目属性未渲染") from exc
+        actual = await self._category_text()
+        if self._normalize_category_path(actual) != self._normalize_category_path(selected_text):
+            raise PddFormListingError(
+                f"拼多多类目应用后校验失败：期望 {selected_text!r}，页面为 {actual!r}"
+            )
+        if self.logger is not None:
+            self.logger.info("已应用拼多多 Excel 类目：%s", actual)
+        return actual
 
     async def _attribute_items(self) -> Dict[str, Tuple[str, Any]]:
         if self.panel is None:
@@ -678,12 +1053,12 @@ class PddFormListing(TaobaoListing):
                 )
                 if chosen:
                     return current
-                raise PddFormListingError(
-                    f"拼多多已选类目与 Excel 商品分类不匹配：{current!r}"
-                )
+                return await self._apply_excel_category_search()
             await asyncio.sleep(0.25)
 
         if not recommended:
+            if self.category_hints:
+                return await self._apply_excel_category_search()
             raise PddFormListingError("拼多多页面在 45 秒内没有可用推荐类目")
         if self.category_hints:
             chosen, strategy = choose_category_candidate(
@@ -696,10 +1071,7 @@ class PddFormListing(TaobaoListing):
                 == self._normalize_category_path(chosen)
             ] if chosen else []
             if len(matches) != 1:
-                raise PddFormListingError(
-                    "拼多多预测类目中没有与 Excel 商品分类唯一匹配的项："
-                    f"{len(matches)}"
-                )
+                return await self._apply_excel_category_search()
             button, expected = matches[0]
             if self.logger is not None:
                 self.logger.info(
@@ -723,7 +1095,7 @@ class PddFormListing(TaobaoListing):
         except PddFormListingError as exc:
             raise PddFormListingError("拼多多推荐类目应用后，类目属性未渲染") from exc
         actual = await self._category_text()
-        if self._normalize_category_path(actual) != self._normalize_category_path(expected):
+        if not _pdd_recommended_path_matches(expected, actual):
             raise PddFormListingError(
                 "拼多多类目应用后校验失败：推荐 {0!r}，页面为 {1!r}".format(
                     expected, actual

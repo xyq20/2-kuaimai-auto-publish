@@ -179,15 +179,23 @@ def choose_category_candidate(
             return "", "ambiguous_hint"
 
     scored = []
+    # A gender root is a branch constraint, not a category leaf.  When the
+    # Excel value also contains a concrete leaf (for example ``牛仔裤``), do
+    # not let the shared ``男装`` segment score an unrelated candidate such
+    # as ``男装 > 休闲裤``.
+    scoring_terms = tuple(term for term in terms if term not in gender_roots) or terms
     for text in paths:
         parts = category_path_parts(text)
         if not has_gender_root(parts):
             continue
         score = 0
-        for index, wanted in enumerate(terms):
+        for index, wanted in enumerate(scoring_terms):
             if wanted in parts:
                 score += 1000 - index * 10 + len(wanted)
-        if gender_roots and any(root in parts for root in gender_roots):
+        # Gender narrows a category match; it cannot create one by itself.
+        # Otherwise any male category would match an unrelated Excel leaf
+        # such as “牛仔裤” vs “休闲裤”.
+        if score and gender_roots and any(root in parts for root in gender_roots):
             score += 5000
         if score:
             # When the Excel hint only identifies a lower branch (for example

@@ -379,9 +379,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         require(path is not None, 404, "image_not_found")
         return FileResponse(path, headers={"cache-control": "private, max-age=60", "x-content-type-options": "nosniff"})
 
+    @app.post("/api/launcher/products/{product_id}/open-folder")
+    async def launcher_open_folder(product_id: str, request: Request):
+        _same_origin(request)
+        _require_admin(_require_user(request))
+        return _response(await run_in_threadpool(request.app.state.launcher.catalog.open_folder, product_id))
+
     @app.get("/api/launcher/jobs")
     def launcher_jobs(request: Request):
         _require_user(request)
+        query = request.query_params.get("search", "").strip()
+        require(len(query) <= 100, 422, "invalid_search")
+        if query:
+            return _response(request.app.state.launcher.search_history(query))
         return _response({"jobs": request.app.state.launcher.history()})
 
     @app.get("/api/launcher/jobs/{job_id}")

@@ -549,11 +549,15 @@ def classify_image_indices_by_color(
 class JdFormListing(YouzanFormListing):
     """Fill and verify JD category, attributes, SKU data and delivery time."""
 
+    attribute_platform_id = "jd"
     allow_created_exact_dom_option = True
     attribute_wait_timeout_seconds = 30.0
     attribute_stable_seconds = 0.75
 
     def _start_api_capture(self) -> None:
+        previous_request_handler = getattr(self, "_api_request_handler", None)
+        if previous_request_handler is not None:
+            self.page.remove_listener("request", previous_request_handler)
         previous_handler = getattr(self, "_api_response_handler", None)
         if previous_handler is not None:
             try:
@@ -562,6 +566,14 @@ class JdFormListing(YouzanFormListing):
                 pass
         self._api_observations: List[Mapping[str, Any]] = []
         self._api_capture_tasks: List[asyncio.Task[Any]] = []
+        self._api_request_sequence: Dict[int, int] = {}
+
+        def handle_request(request: Any) -> None:
+            if urlsplit(request.url).path == JD_PROPERTIES_ENDPOINT:
+                self._api_request_sequence[id(request)] = len(self._api_request_sequence) + 1
+
+        self._api_request_handler = handle_request
+        self.page.on("request", handle_request)
 
         def handle_response(response: Any) -> None:
             try:
@@ -583,6 +595,7 @@ class JdFormListing(YouzanFormListing):
             "body": "unavailable",
             "attribute_fields": (),
             "category_id": "",
+            "request_sequence": getattr(self, "_api_request_sequence", {}).get(id(getattr(response, "request", None)), 0),
         }
         try:
             payload = await response.json()
@@ -598,16 +611,26 @@ class JdFormListing(YouzanFormListing):
             pass
         self._api_observations.append(observation)
 
-    async def _captured_api_field_definition(self, page_label: str) -> FieldSchema:
+    async def _active_api_observation(self) -> Mapping[str, Any]:
         tasks = tuple(getattr(self, "_api_capture_tasks", ()))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        observations = sorted(enumerate(getattr(self, "_api_observations", ())),
+                              key=lambda pair: (pair[1].get("request_sequence", 0), pair[0]))
+        active_category = next((str(item.get("category_id") or "")
+                                for _, item in reversed(observations) if item.get("category_id")), "")
+        for _, item in reversed(observations):
+            if str(item.get("category_id") or "") == active_category and item.get("attribute_fields"):
+                return item
+        return {"category_id": active_category, "attribute_fields": ()}
+
+    async def _captured_api_field_definition(self, page_label: str) -> FieldSchema:
+        observation = await self._active_api_observation()
         wanted = normalize_label(page_label)
         matches: Dict[Tuple[str, str], FieldSchema] = {}
-        for observation in getattr(self, "_api_observations", ()):
-            for field in observation.get("attribute_fields", ()):
-                if normalize_label(field.label) == wanted:
-                    matches[(str(field.source_id or ""), field.schema_key)] = field
+        for field in observation.get("attribute_fields", ()):
+            if normalize_label(field.label) == wanted:
+                matches[(str(field.source_id or ""), field.schema_key)] = field
         if len(matches) != 1:
             raise JdFormListingError(
                 "京东属性“{0}”缺少唯一的接口 JSON 字段定义".format(
@@ -618,16 +641,12 @@ class JdFormListing(YouzanFormListing):
 
     async def _captured_api_field(self, page_label: str) -> Tuple[FieldSchema, str]:
         field = await self._captured_api_field_definition(page_label)
-        category_ids: List[str] = []
-        for observation in getattr(self, "_api_observations", ()):
-            category_id = str(observation.get("category_id") or "").strip()
-            if category_id and category_id not in category_ids:
-                category_ids.append(category_id)
-        if len(category_ids) != 1:
+        category_id = str((await self._active_api_observation()).get("category_id") or "").strip()
+        if not category_id:
             raise JdFormListingError(
                 "京东属性“{0}”缺少唯一的接口类目 ID".format(page_label)
             )
-        return field, category_ids[0]
+        return field, category_id
 
     async def _select_numeric_material_option(
         self,
@@ -2072,31 +2091,14 @@ class JdFormListing(YouzanFormListing):
             if not fabric_names:
                 fabric_names = (str(expected).strip(),)
 
-            async def write_jd_fabric(value: str, values: Sequence[str]) -> Optional[Tuple[str, ...]]:
-                # 京东“面料”是单值数字下拉；多面料不能直接塞数组，
-                # 交给公共方法继续尝试 Excel 原值和“其他”。
-                if len(values) > 1:
-                    raise JdFormListingError("京东属性面料为单值数字下拉，不能同时选择多个面料")
-                target_name = str(values[0] if values else value).strip()
-                return await self._select_numeric_material_option(
-                    select,
-                    _material_option_desired(target_name),
-                    field_label=page_label,
-                    review_unmatched=False,
-                )
-
-            try:
-                return await self._fill_fabric_attribute(
-                    page_label,
-                    fabric_names,
-                    item=item,
-                    raw_value=expected,
-                    writer=write_jd_fabric,
-                )
-            except (JdFormListingError, TaobaoListingError) as exc:
-                raise JdFormListingError(
-                    str(exc).replace("淘宝", "京东")
-                ) from exc
+            # JD is a numeric single-select. Do not invoke Taobao's
+            # multi-material -> free text -> Other fallback: missing schema
+            # is an adapter error, not evidence that Other is appropriate.
+            desired = (_material_option_desired(fabric_names[0]) if len(fabric_names) == 1
+                       else "，".join(fabric_names))
+            return await self._select_numeric_material_option(
+                select, desired, field_label=page_label, review_unmatched=True,
+            )
 
         selects = item.locator(":scope > .el-form-item__content .el-select:visible")
         inputs = await self._editable_inputs(item)
@@ -2203,6 +2205,14 @@ class JdFormListing(YouzanFormListing):
                     )
                 except JdFormListingError:
                     raise
+                if (
+                    actual is None
+                    and self.attribute_runtime is not None
+                    and self.attribute_runtime.review_pending_or_omitted(
+                        self.attribute_platform_id, page_label
+                    )
+                ):
+                    return None
                 if actual is None and normalized in {
                     normalize_label(label) for label in
                     ("鞋面材质", "鞋面内里材质", "鞋里材质", "鞋底材质", "鞋垫材质")
@@ -3754,6 +3764,50 @@ class JdFormListing(YouzanFormListing):
 
         reports: List[Mapping[str, Any]] = []
         source_count = counts[0][1]
+        if self.logger is not None:
+            self.logger.info(
+                "京东图片追加计数：公共图=%s，追加前颜色图=%s，追加后颜色图=%s，目标分类=%s",
+                public_before,
+                initial_counts,
+                counts,
+                tuple(len(indices) for indices in requested_indices)
+                if requested_indices is not None else None,
+            )
+        # 单色商品可精确知道本次追加的商品图数量。页面可能在展示图和
+        # 长图两组都预置一张颜色图；先清除各组原有的前缀，再校验新增图。
+        if requested_indices is not None and len(groups) == 1 and requested_indices[0]:
+            expected_added = max(requested_indices[0]) + 1
+            display_before_append, long_before_append = initial_counts[0]
+            display_after_append, long_after_append = counts[0]
+            if (
+                display_after_append == display_before_append + expected_added
+                and long_after_append == long_before_append + expected_added
+            ):
+                for _ in range(display_before_append):
+                    await self._delete_first_uploaded_image(groups[0]["display"])
+                for _ in range(long_before_append):
+                    await self._delete_first_uploaded_image(groups[0]["long"])
+                counts = [
+                    (
+                        await groups[0]["display"].locator(".file-img").count(),
+                        await groups[0]["long"].locator(".file-img").count(),
+                    )
+                ]
+                if counts[0] != (expected_added, expected_added):
+                    raise JdFormListingError(
+                        "京东单色图片清理旧图后数量不一致：{0}/{1}".format(*counts[0])
+                    )
+                source_count = expected_added
+            elif counts[0] != (expected_added, expected_added):
+                raise JdFormListingError(
+                    "京东单色图片追加后数量异常：原有 {0}/{1}，当前 {2}/{3}，预期新增 {4}".format(
+                        display_before_append,
+                        long_before_append,
+                        display_after_append,
+                        long_after_append,
+                        expected_added,
+                    )
+                )
         if any(long_count != source_count for _display, long_count in counts):
             raise JdFormListingError("京东各颜色规格长图数量不一致")
         if requested_indices is None:
