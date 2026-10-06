@@ -440,7 +440,8 @@ _CLOTHING_MEASUREMENT_ALIASES = {
     "length": ("衣长", "LENGTH", "GARMENTLENGTH", "BODYLENGTH", "BACKLENGTH"),
     "chest": ("胸围", "BUST", "CHEST"),
     "shoulder": ("肩宽", "SHOULDERWIDTH", "SHOULDER"),
-    "sleeve": ("袖长", "SLEEVELENGTH", "SLEEVE"),
+    # Vision OCR occasionally reads 袖 as 神 in this bilingual row.
+    "sleeve": ("袖长", "神长", "SLEEVELENGTH", "SLEEVE"),
 }
 _CLOTHING_EXTRA_ROW_ALIASES = {
     "cuff": ("袖口", "CUFF"),

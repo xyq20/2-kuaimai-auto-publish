@@ -210,6 +210,20 @@ class VisionOCRUnitTests(unittest.TestCase):
         self.assertEqual(actual["S"]["sleeve"], 63)
         self.assertEqual(actual["M"]["sleeve"], 64)
 
+    def test_douyin_clothing_accepts_common_ocr_misread_for_sleeve(self):
+        tokens = (
+            _token("S", 0.47, 0.075), _token("M", 0.57, 0.075),
+            _token("L", 0.67, 0.075), _token("XL", 0.76, 0.075),
+            _token("衣长/LENGTH", 0.22, 0.17),
+            _token("肩宽/SHOULDER WIDTH", 0.17, 0.245),
+            _token("胸围/BUST", 0.23, 0.32),
+            _token("神长/SLEEVE LENGTH", 0.18, 0.393),
+            _token("袖口/CUFF", 0.23, 0.468),
+            *(_token(value, x, y) for y, values in ((0.17, ("66.5", "68.5", "70.5", "72.5")), (0.245, ("48", "49.5", "51", "52.5")), (0.32, ("114", "118", "122", "126")), (0.393, ("63", "64", "65", "66"))) for x, value in zip((0.47, 0.57, 0.67, 0.76), values)),
+        )
+        actual = parse_clothing_measurement_table(tokens, ("S", "M", "L", "XL"), source="真实 OCR 尺码表")
+        self.assertEqual([actual[size]["sleeve"] for size in ("S", "M", "L", "XL")], [63, 64, 65, 66])
+
     def test_douyin_clothing_ignores_extra_cuff_row_when_bounding_cells(self):
         tokens = (
             _token("S", 0.46, 0.07),
