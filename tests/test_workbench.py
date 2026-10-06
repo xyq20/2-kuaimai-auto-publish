@@ -75,6 +75,15 @@ class WorkbenchTests(unittest.TestCase):
         (folder/'1.png').symlink_to(self.root/'data/review.sqlite3')
         self.assertIsNone(self.launcher.catalog.image(self.product_id))
 
+    def test_health_reports_product_root_state(self):
+        self.login()
+        response = self.client.get('/api/health')
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body['ok'])
+        self.assertTrue(body['products_root_exists'])
+        self.assertEqual(body['products_root'], str(self.settings.products_root))
+
     def test_catalog_missing_mount_is_clear_error(self):
         with self.assertRaises(ApiError) as error:
             ProductCatalog(self.root/'not-mounted').listing()

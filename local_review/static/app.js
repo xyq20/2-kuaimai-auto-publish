@@ -69,7 +69,7 @@ const platformName = id => platform(id)?.name || (id === 'base' ? '基础资料'
 const operationName = id => ({platforms:'平台资料',base:'基础资料',create:'新建商品'}[id] || id);
 const isActive = job => job && ['running','waiting_review','stopping'].includes(job.status);
 const uuid = () => crypto.randomUUID().replaceAll('-','');
-let toastTimer, pollTimer, historySearchTimer, productRequest = 0, historyRequest = 0, actionBusy = false;
+let toastTimer, pollTimer, productRetryTimer, historySearchTimer, productRequest = 0, historyRequest = 0, actionBusy = false;
 
 async function api(path, data) {
   const response = await fetch(path, {method:data === undefined ? 'GET' : 'POST', credentials:'same-origin',
@@ -251,6 +251,7 @@ function renderProducts() {
   $('product-empty').textContent = terms.length ? '没有匹配的商品，试试其他关键词或切换到“全部”。' : state.productFilter === 'unprocessed' ? '当前商品都有保存记录了，可到“已处理”查看或继续处理其他平台。' : '这个分组暂时没有商品。';
 }
 async function loadProducts(preferred, refreshOnly = false) {
+  clearTimeout(productRetryTimer); productRetryTimer = null;
   $('refresh-products').disabled = true;
   try {
     const data = await api('/api/launcher/products'); state.products = data.products; renderProducts();
@@ -259,7 +260,13 @@ async function loadProducts(preferred, refreshOnly = false) {
     if (!refreshOnly) {
       if (selected) await chooseProduct(selected.id); else { state.product = null; renderProduct(); }
     }
-  } catch (e) { state.product = null; renderProduct(); notice(e.message); }
+  } catch (e) {
+    state.product = null; renderProduct(); notice(e.message);
+    if (e.message === errors.products_unavailable) {
+      productRetryTimer = setTimeout(() => loadProducts(preferred, refreshOnly), 5000);
+      notice(`${e.message} 正在自动重试…`);
+    }
+  }
   finally { $('refresh-products').disabled = false; }
 }
 $('change-product').onclick = () => { $('product-search').value=''; renderProducts(); openDialog('product-dialog'); $('product-search').focus(); loadProducts(undefined, true); };

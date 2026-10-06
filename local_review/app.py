@@ -362,6 +362,15 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return _response({"user": {"username": user["username"], "role": user["role"]},
                           "platforms": PLATFORMS, "learning_available": bool(configured.device_token)})
 
+    @app.get("/api/health")
+    def health(request: Request):
+        _require_user(request)
+        products_root = _settings(request).products_root
+        mounted = products_root.parent.parent.is_dir()
+        readable = products_root.is_dir()
+        return _response({"ok": True, "products_root": str(products_root),
+                          "products_root_exists": readable, "share_available": mounted})
+
     @app.get("/api/launcher/products")
     def launcher_products(request: Request):
         _require_user(request)
