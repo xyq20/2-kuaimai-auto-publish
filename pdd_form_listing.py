@@ -46,11 +46,12 @@ class PddFormListingError(RuntimeError):
     """A PDD form issue that can be shown directly to the operator."""
 
 
-# 暂按页面路径差异兼容，不推断是否新增类目，也不硬编码类目 ID。
-# 键为推荐路径，值为允许的完整回读路径；旧路径仍按精确匹配接受。
-# 后续平台调整时只维护此表。不要全局去重同名层级或跨平台套用。
+# 拼多多已确认新增“男装 > 牛仔裤 > 牛仔裤”叶类目。页面在不同
+# 商品/店铺状态下可能回读旧的两级路径，因此两种路径都作为同一类目
+# 的兼容写法保留；不硬编码平台 ID，也不跨平台套用。
 PDD_CATEGORY_PATH_COMPATIBILITY: Mapping[Tuple[str, ...], Tuple[Tuple[str, ...], ...]] = {
     ("男装", "牛仔裤"): (("男装", "牛仔裤", "牛仔裤"),),
+    ("男装", "牛仔裤", "牛仔裤"): (("男装", "牛仔裤"),),
 }
 
 def _pdd_category_search_terms(hints: Sequence[str]) -> Tuple[str, ...]:
