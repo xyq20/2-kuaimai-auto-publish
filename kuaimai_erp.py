@@ -5697,12 +5697,27 @@ async def run_browser_automation(
                         tmall_report["initial_listing_date"] = (
                             await tmall.fill_leather_shoe_listing_date(category)
                         )
-                        initial_product_publish = {"clicked": False, "matched_existing_product": True} if matched_existing else (
-                            await tmall.publish_product_information(
-                                timeout_seconds=args.timeout,
-                                expected_image_count=len(product.main_images),
+                        if matched_existing:
+                            initial_product_publish = {
+                                "clicked": False,
+                                "matched_existing_product": True,
+                            }
+                        else:
+                            # 部分类目（尤其针织衫/毛衣）会在首次产品信息页
+                            # 直接校验“材质成分”，必须在点击蓝色“发布”前完成。
+                            tmall_stage = "initial_product_materials"
+                            tmall_report["initial_product_materials"] = (
+                                await tmall.fill_initial_product_materials(
+                                    product.tmall_fields
+                                )
                             )
-                        )
+                            tmall_stage = "initial_product_publish"
+                            initial_product_publish = (
+                                await tmall.publish_product_information(
+                                    timeout_seconds=args.timeout,
+                                    expected_image_count=len(product.main_images),
+                                )
+                            )
                         tmall_report.update(
                             {
                                 "form_mode": "matched_existing" if matched_existing else "initial",

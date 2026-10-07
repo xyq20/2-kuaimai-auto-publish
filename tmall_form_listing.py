@@ -1595,6 +1595,50 @@ class TmallFormListing(TaobaoListing):
                 str(exc).replace("淘宝", "天猫")
             ) from exc
 
+    async def fill_initial_product_materials(self, fields: Any) -> Mapping[str, Any]:
+        """填写首次产品信息页的材质成分前置项。
+
+        针织衫/毛衣等天猫类目会在点击首次“发布”前就要求材质成分。
+        该组件和完整表单中的售后材质共用 DOM 协议，但出现时机不同；
+        首次页必须先填写，否则页面会拦截发布而停留在产品信息页。
+        """
+        source_fields = _fields_mapping(fields)
+        try:
+            materials = parse_taobao_materials(source_fields)
+        except TaobaoListingError as exc:
+            raise TmallFormListingError(
+                str(exc).replace("淘宝", "天猫")
+            ) from exc
+        if not materials:
+            return {"filled": False, "materials": ()}
+
+        items = await self._attribute_items()
+        records = tuple(
+            (page_label, item)
+            for key, (page_label, item) in items.items()
+            if key.split("#", 1)[0] == normalize_label("材质成分")
+        )
+        compatible = []
+        for page_label, item in records:
+            components = item.locator(".multi-complex-items")
+            add_buttons = item.get_by_role("button", name="添加", exact=True)
+            if await components.count() == 1 and await add_buttons.count() == 1:
+                compatible.append((page_label, item))
+        if len(compatible) != 1:
+            raise TmallFormListingError(
+                "天猫首次产品信息中的“材质成分”组件不唯一或未渲染："
+                f"匹配 {len(compatible)} 个"
+            )
+        page_label, item = compatible[0]
+        actual = await self.fill_materials(materials, item=item)
+        if self.logger is not None:
+            self.logger.info(
+                "天猫首次产品信息“%s”已填写并回读材质成分：%s",
+                page_label,
+                actual,
+            )
+        return {"filled": True, "label": page_label, "materials": actual}
+
     async def _read_materials(self, item: Any) -> Tuple[Tuple[str, int], ...]:
         actual = []
         for index, row in enumerate(await self._material_rows(item)):
