@@ -1522,12 +1522,29 @@ class WxsphFormListing(YouzanFormListing):
                     groups,
                 )
                 if resolved_values == ():
-                    skipped_optional[page_label] = "等待运营审核"
-                    if self.logger is not None:
-                        self.logger.info(
-                            "微信小店属性“%s”已加入本平台待审核汇总，继续填写后续字段",
-                            page_label,
+                    reviewed_no_fill = False
+                    if self.attribute_runtime is not None:
+                        checker = getattr(
+                            self.attribute_runtime, "intentionally_omitted", None
                         )
+                        if checker is not None:
+                            reviewed_no_fill = bool(
+                                checker(self.attribute_platform_id, page_label)
+                            )
+                    skipped_optional[page_label] = (
+                        "审核明确不填写" if reviewed_no_fill else "等待运营审核"
+                    )
+                    if self.logger is not None:
+                        if reviewed_no_fill:
+                            self.logger.info(
+                                "微信小店属性“%s”按审核结论保持空白，继续填写后续字段",
+                                page_label,
+                            )
+                        else:
+                            self.logger.info(
+                                "微信小店属性“%s”已加入本平台待审核汇总，继续填写后续字段",
+                                page_label,
+                            )
                     continue
                 if resolved_values is not None:
                     exact_values = resolved_values
@@ -2028,6 +2045,7 @@ class WxsphFormListing(YouzanFormListing):
         assignments = await self._attribute_assignments(fields.fields, page_items)
         persisted: Dict[str, Tuple[str, ...]] = {}
         skipped_optional: Dict[str, str] = {}
+        skipped_reviewed_no_fill: Dict[str, str] = {}
         rules: Dict[str, str] = {}
         errors: List[str] = []
 
@@ -2035,6 +2053,59 @@ class WxsphFormListing(YouzanFormListing):
             page_label, item = page_items[normalized_page]
             is_select = await self._is_select(item)
             required = await self._attribute_is_required(item)
+
+            # A reviewed ``不填写`` decision is part of the saved value
+            # contract.  The saved-readback adapter is a new instance, so it
+            # must consult the same runtime decision before falling back to
+            # the Excel value.  Otherwise an intentionally blank control is
+            # reported as a false mismatch against the original Excel text.
+            intentionally_omitted = False
+            if self.attribute_runtime is not None:
+                checker = getattr(self.attribute_runtime, "intentionally_omitted", None)
+                if checker is not None:
+                    intentionally_omitted = bool(
+                        checker(self.attribute_platform_id, page_label)
+                    )
+            if intentionally_omitted:
+                rules[page_label] = "reviewed_no_fill"
+                if is_select:
+                    selects = item.locator(
+                        ":scope > .el-form-item__content .el-select:visible"
+                    )
+                    if await selects.count() != 1:
+                        errors.append("{0}=下拉控件不唯一".format(page_label))
+                        continue
+                    select = selects.first
+                    multi = await select.locator(".el-select__tags").count() > 0
+                    actual = await self._read_select_values(select, multi=multi)
+                    if any(str(value).strip() for value in actual):
+                        errors.append(
+                            "{0}=审核明确不填写，但页面为 {1}".format(
+                                page_label, actual
+                            )
+                        )
+                        continue
+                else:
+                    inputs = await self._editable_value_inputs(item)
+                    if len(inputs) != 1:
+                        errors.append("{0}=输入控件不唯一".format(page_label))
+                        continue
+                    actual_text = (await inputs[0].input_value()).strip()
+                    if actual_text:
+                        errors.append(
+                            "{0}=审核明确不填写，但页面为 {1!r}".format(
+                                page_label, actual_text
+                            )
+                        )
+                        continue
+                skipped_reviewed_no_fill[page_label] = "审核明确不填写"
+                if self.logger is not None:
+                    self.logger.info(
+                        "微信小店保存后回读跳过审核明确不填写属性：%s",
+                        page_label,
+                    )
+                continue
+
             value, exact_values, rule = self._resolved_attribute_value(
                 fields.fields,
                 page_label,
@@ -2124,6 +2195,7 @@ class WxsphFormListing(YouzanFormListing):
         return {
             "attributes": persisted,
             "skipped_optional_percentages": skipped_optional,
+            "skipped_reviewed_no_fill": skipped_reviewed_no_fill,
             "rules": rules,
         }
 

@@ -56,6 +56,44 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
             await listing._verify_persisted_attributes(
                 fields, expected_attributes={'面料材质': ('棉',)})
 
+    async def test_persisted_readback_honors_reviewed_no_fill(self):
+        class Runtime:
+            @staticmethod
+            def intentionally_omitted(platform_id, field_label):
+                return platform_id == "wxsph" and field_label == "上市时间"
+
+        listing = await self._listing(Runtime())
+        await self.page.locator("[role=tabpanel]").evaluate(
+            """root => root.querySelector('h3').insertAdjacentHTML(
+              'afterend',
+              '<div class="el-form-item is-required" id="listing-date">'
+              + '<label class="el-form-item__label">上市时间</label>'
+              + '<div class="el-form-item__content"><div class="el-select">'
+              + '<input class="el-input__inner" readonly value="">'
+              + '<div class="el-select-dropdown" style="display:none"><ul></ul></div>'
+              + '</div></div></div>'
+            )"""
+        )
+        report = await listing._verify_persisted_attributes(
+            parse_wxsph_fields({"上市时间": "2026/2026年秋季/2026.10.07"}),
+            expected_attributes={},
+        )
+
+        self.assertEqual(
+            report["skipped_reviewed_no_fill"]["上市时间"],
+            "审核明确不填写",
+        )
+        self.assertNotIn("上市时间", report["attributes"])
+
+        await self.page.locator("#listing-date .el-select input").evaluate(
+            "element => element.value = '2026年春季'"
+        )
+        with self.assertRaises(WxsphFormListingError):
+            await listing._verify_persisted_attributes(
+                parse_wxsph_fields({"上市时间": "2026/2026年秋季/2026.10.07"}),
+                expected_attributes={},
+            )
+
     async def test_collapsed_multi_clears_actual_selection_by_dom(self):
         await self.page.set_content('''<div id="select" class="el-select">
           <div class="el-select__tags"><span class="el-tag">已选择 1</span></div>

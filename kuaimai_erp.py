@@ -6132,6 +6132,7 @@ async def run_browser_automation(
                     page,
                     persisted_drawer,
                     logger,
+                    attribute_runtime=attribute_runtime,
                     category_hints=product.category_hints,
                 )
                 await persisted_wxsph.open()
