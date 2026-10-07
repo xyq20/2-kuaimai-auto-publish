@@ -774,6 +774,22 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
             "休闲风 / 简约风",
         )
 
+    async def test_style_cascader_finds_leaf_in_unselected_parent_menu(self):
+        html = STYLE_CASCADER_FIXTURE.replace(
+            "'工装': ['机能']",
+            "'工装': ['机能'], '潮流风': ['街头风', '嘻哈风']",
+        )
+        listing = await self._open(html)
+        item = self.page.locator(".el-form-item").first
+        actual = await listing._fill_attribute_item(
+            "风格", item, "街头风", required=True
+        )
+        self.assertEqual(actual, ("潮流风", "街头风"))
+        self.assertEqual(
+            await self.page.locator(".el-cascader input").input_value(),
+            "潮流风 / 街头风",
+        )
+
     async def test_learning_uses_jd_api_ids_and_dom_cross_check(self):
         class Runtime:
             def __init__(self):

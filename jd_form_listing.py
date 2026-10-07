@@ -1246,6 +1246,102 @@ class JdFormListing(YouzanFormListing):
                 return
             await asyncio.sleep(0.05)
 
+    async def _select_cascader_from_all_menus(
+        self,
+        cascader: Any,
+        candidates: Sequence[str],
+        label: str,
+    ) -> Optional[Tuple[str, ...]]:
+        """展开级联控件的完整一、二级菜单后按叶子精确筛选。
+
+        京东风格等字段的 Excel 值通常只有二级叶子（例如“街头风”），
+        而首屏只展示父菜单（例如“潮流风”）。只读取当前菜单会误报
+        “没有候选”；这里先列出所有父子路径，再重新打开并点击命中的
+        完整路径。
+        """
+        await self._open_cascader(cascader)
+        menus = self.page.locator(".el-cascader-menu:visible")
+        if await menus.count() == 0:
+            return None
+        root_menu = menus.first
+        root_nodes = root_menu.locator(":scope > .el-cascader-node")
+        roots = await root_menu.evaluate(
+            """element => Array.from(element.querySelectorAll(':scope > .el-cascader-node'))
+              .map((node, index) => ({
+                name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
+                index: String(index),
+                hasChildren: Boolean(node.querySelector('.el-icon-arrow-right'))
+              }))
+              .filter(item => item.name.trim())"""
+        )
+        paths: List[Tuple[str, ...]] = []
+        for root in roots:
+            node = root_nodes.nth(int(root["index"]))
+            await node.click(timeout=2_000)
+            if not root.get("hasChildren"):
+                paths.append((str(root["name"]).strip(),))
+                continue
+            deadline = asyncio.get_running_loop().time() + 3
+            while asyncio.get_running_loop().time() < deadline:
+                menus = self.page.locator(".el-cascader-menu:visible")
+                if await menus.count() >= 2:
+                    break
+                await asyncio.sleep(0.05)
+            menus = self.page.locator(".el-cascader-menu:visible")
+            if await menus.count() < 2:
+                continue
+            child_menu = menus.last
+            children = await child_menu.evaluate(
+                """element => Array.from(element.querySelectorAll(':scope > .el-cascader-node'))
+                  .map(node => ({
+                    name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
+                    hasChildren: Boolean(node.querySelector('.el-icon-arrow-right'))
+                  }))
+                  .filter(item => item.name.trim())"""
+            )
+            paths.extend(
+                (str(root["name"]).strip(), str(child["name"]).strip())
+                for child in children
+            )
+
+        wanted = {normalize_option(value) for value in candidates if str(value).strip()}
+        chosen_path = next(
+            (path for path in paths if normalize_option(path[-1]) in wanted),
+            None,
+        )
+        if chosen_path is None:
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return None
+
+        # 重新打开后按刚才列出的完整路径提交，避免依赖当前活动父菜单。
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await self._open_cascader(cascader)
+        for depth, expected in enumerate(chosen_path):
+            options = await self._visible_cascader_options(cascader)
+            chosen = self._match_cascader_option(options, (expected,))
+            if chosen is None:
+                raise JdFormListingError(
+                    f"京东属性{label}完整菜单回选失败：{' > '.join(chosen_path)}"
+                )
+            await self._click_cascader_option(chosen)
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        if self.logger is not None:
+            self.logger.info(
+                "京东属性%s已展开完整一二级菜单并选中：%s",
+                label,
+                " > ".join(chosen_path),
+            )
+        return chosen_path
+
     async def _select_cascader_values(
         self,
         cascader: Any,
@@ -1259,6 +1355,18 @@ class JdFormListing(YouzanFormListing):
         if not groups:
             return None
         await cascader.scroll_into_view_if_needed()
+        flattened_candidates = tuple(
+            candidate
+            for group in groups
+            for candidate in _expand_cascader_candidates(label, group)
+        )
+        expanded_path = await self._select_cascader_from_all_menus(
+            cascader,
+            flattened_candidates,
+            label,
+        )
+        if expanded_path is not None:
+            return expanded_path
         await self._open_cascader(cascader)
         chosen_values: List[str] = []
         leftover: Tuple[str, ...] = ()
