@@ -804,6 +804,25 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][2], (Path("wash-label.jpg"),))
         self.assertEqual(calls[0][3], "抖音水洗标/吊牌图")
 
+    async def test_material_selection_reopens_transiently_hidden_dropdown(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+
+        with patch.object(
+            self.listing,
+            "_select_values",
+            new=AsyncMock(side_effect=DouyinListingError("下拉层首次未渲染")),
+        ):
+            actual = await self.listing.apply_materials(
+                (MaterialComponent("棉", 100),), ()
+            )
+
+        self.assertEqual(actual, (("棉", 100),))
+        self.assertEqual(
+            await self.listing.panel.locator("#material-rows .el-input__inner").first.input_value(),
+            "棉",
+        )
+
     async def test_material_component_is_skipped_when_category_has_no_field(self):
         await self.listing.open()
         await self.listing.apply_first_recommended_category()

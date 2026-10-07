@@ -1850,6 +1850,75 @@ class DouyinListing:
             await asyncio.sleep(0.05)
         return None
 
+    async def _recover_material_select_value(
+        self,
+        select: Any,
+        expected: str,
+        *,
+        label: str,
+    ) -> Optional[Tuple[str, ...]]:
+        """Retry a material option when the first popper render was transient.
+
+        The material editor uses a local Element UI popper.  During category
+        refreshes the first click can leave that popper hidden even though the
+        select is in its opened state; the generic option reader then reports
+        an empty/absent dropdown.  Reopen the same control and click its exact
+        local option before falling back to allow-create input.
+        """
+        wanted = normalize_option(expected)
+        for attempt in range(2):
+            try:
+                current = await self._read_select_values(select, multi=False)
+            except Exception:
+                current = ()
+            if current and normalize_option(current[0]) == wanted:
+                return current
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+            try:
+                await self._open_select(select, multi=False)
+            except Exception:
+                continue
+
+            dropdown = await self._active_select_dropdown(select)
+            if dropdown is None:
+                dropdown = select.locator(".el-select-dropdown").first
+            options = dropdown.locator(".el-select-dropdown__item")
+            for index in range(await options.count()):
+                option = options.nth(index)
+                try:
+                    name = (await option.inner_text()).strip()
+                except Exception:
+                    continue
+                if normalize_option(name) != wanted:
+                    continue
+                try:
+                    await option.click(force=True, timeout=2000)
+                except Exception:
+                    try:
+                        await option.evaluate("element => element.click()")
+                    except Exception:
+                        continue
+                deadline = asyncio.get_running_loop().time() + 1.5
+                while asyncio.get_running_loop().time() < deadline:
+                    try:
+                        actual = await self._read_select_values(select, multi=False)
+                    except Exception:
+                        actual = ()
+                    if actual and normalize_option(actual[0]) == wanted:
+                        if self.logger is not None:
+                            self.logger.info(
+                                "%s：首次下拉未渲染，重试后已选择并回读 %s",
+                                label,
+                                actual[0],
+                            )
+                        return actual
+                    await asyncio.sleep(0.05)
+                break
+        return None
+
     async def _select_values(
         self,
         select: Any,
@@ -2884,32 +2953,40 @@ class DouyinListing:
                             committed_values[0],
                         )
                 else:
-                    editor = selects.first.locator(
-                        'input:not([type="hidden"]):not([readonly]):visible'
+                    recovered_values = await self._recover_material_select_value(
+                        selects.first,
+                        value,
+                        label=material_label,
                     )
-                    if await editor.count() != 1:
-                        raise
-                    # Element UI replaces the searchable input as soon as Enter or
-                    # Tab commits an allow-create value.  Reading the old locator
-                    # after that replacement waits for Playwright's 300s default
-                    # timeout and leaves the material row empty.  Re-query the
-                    # select after the commit and use the stable, readonly display
-                    # input for the readback instead.
-                    await editor.fill(value, timeout=4000)
-                    await editor.press("Enter", timeout=2000)
-                    await editor.press("Tab", timeout=2000)
-                    current_values = await asyncio.wait_for(
-                        self._read_select_values(selects.first, multi=False),
-                        timeout=4,
-                    )
-                    actual = current_values[0].strip() if current_values else ""
-                    if normalize_option(actual) != normalize_option(value):
-                        raise DouyinListingError(
-                            f"{material_label}候选和直接输入均未回读到 {value!r}"
-                        ) from exc
-                    selected = (actual,)
-                    if self.logger is not None:
-                        self.logger.info("%s：候选不可见，已直接输入并回读 %s", material_label, actual)
+                    if recovered_values is not None:
+                        selected = recovered_values
+                    else:
+                        editor = selects.first.locator(
+                            'input:not([type="hidden"]):not([readonly]):visible'
+                        )
+                        if await editor.count() != 1:
+                            raise
+                        # Element UI replaces the searchable input as soon as Enter or
+                        # Tab commits an allow-create value.  Reading the old locator
+                        # after that replacement waits for Playwright's 300s default
+                        # timeout and leaves the material row empty.  Re-query the
+                        # select after the commit and use the stable, readonly display
+                        # input for the readback instead.
+                        await editor.fill(value, timeout=4000)
+                        await editor.press("Enter", timeout=2000)
+                        await editor.press("Tab", timeout=2000)
+                        current_values = await asyncio.wait_for(
+                            self._read_select_values(selects.first, multi=False),
+                            timeout=4,
+                        )
+                        actual = current_values[0].strip() if current_values else ""
+                        if normalize_option(actual) != normalize_option(value):
+                            raise DouyinListingError(
+                                f"{material_label}候选和直接输入均未回读到 {value!r}"
+                            ) from exc
+                        selected = (actual,)
+                        if self.logger is not None:
+                            self.logger.info("%s：候选不可见，已直接输入并回读 %s", material_label, actual)
             percent_input = await self._percentage_input(row)
             raw_percentage = (await percent_input.input_value()).strip()
             if raw_percentage != str(percentages[index]):
