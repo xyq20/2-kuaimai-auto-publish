@@ -1087,6 +1087,8 @@ class TmallFormListing(TaobaoListing):
     ) -> Mapping[str, Any]:
         """等待类目激活后异步渲染的首批产品信息字段。"""
         deadline = asyncio.get_running_loop().time() + 60
+        sync_deadline = asyncio.get_running_loop().time() + 2
+        sync_attempted = False
         last_error: Optional[Exception] = None
         while asyncio.get_running_loop().time() < deadline:
             scope = await self._product_identity_scope()
@@ -1099,6 +1101,32 @@ class TmallFormListing(TaobaoListing):
                 last_error = exc
                 if not str(exc).endswith("：0"):
                     raise
+            if not sync_attempted and asyncio.get_running_loop().time() >= sync_deadline:
+                sync_buttons = self.panel.get_by_role(
+                    "button", name="同步平台类目", exact=True
+                )
+                visible_sync = []
+                for index in range(await sync_buttons.count()):
+                    button = sync_buttons.nth(index)
+                    if await button.is_visible() and await button.is_enabled():
+                        visible_sync.append(button)
+                if len(visible_sync) == 1:
+                    await visible_sync[0].click()
+                    sync_attempted = True
+                    if self.logger is not None:
+                        self.logger.info(
+                            "天猫产品信息字段未出现，已点击“同步平台类目”重新激活"
+                        )
+                    try:
+                        await self._wait_for_loading_masks(timeout_seconds=10)
+                    except TmallFormListingError:
+                        # 字段本身仍由下面的轮询确认；同步按钮的加载遮罩
+                        # 不应覆盖真实字段渲染结果。
+                        pass
+                elif len(visible_sync) > 1:
+                    raise TmallFormListingError(
+                        f"天猫“同步平台类目”入口不唯一：{len(visible_sync)}"
+                    )
             await asyncio.sleep(0.1)
         rendered = "、".join(labels)
         raise TmallFormListingError(

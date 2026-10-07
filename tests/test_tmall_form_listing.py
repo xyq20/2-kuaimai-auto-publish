@@ -473,6 +473,34 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await items["货号"].get_attribute("id"), "late-code")
         self.assertEqual(await items["品牌"].get_attribute("id"), "late-brand")
 
+    async def test_syncs_platform_category_when_identity_fields_stay_empty(self):
+        listing = await self._listing(
+            """
+            <section class="tm-product-info" id="product-info">
+              <button id="sync-category">同步平台类目</button>
+            </section>
+            <script>
+              document.querySelector('#sync-category').onclick = function() {
+                this.disabled = true;
+                document.querySelector('#product-info').innerHTML = `
+                <div class="el-form-item" id="synced-code">
+                  <label class="el-form-item__label">货号</label>
+                  <div class="el-form-item__content"><input></div>
+                </div>
+                <div class="el-form-item" id="synced-brand">
+                  <label class="el-form-item__label">品牌</label>
+                  <div class="el-form-item__content"><input></div>
+                </div>`;
+              };
+            </script>
+            """
+        )
+
+        items = await listing._wait_for_product_identity_items()
+
+        self.assertEqual(await items["货号"].get_attribute("id"), "synced-code")
+        self.assertEqual(await items["品牌"].get_attribute("id"), "synced-brand")
+
     async def test_product_image_slots_can_be_outside_identity_form(self):
         listing = await self._listing('''
           <form class="product-form"><input value="NGBL-10588"></form>
