@@ -4671,13 +4671,24 @@ class TaobaoListing:
         )
 
     @staticmethod
-    def _sku_column_index(headers: Sequence[str], label: str) -> int:
+    def _sku_column_index(
+        headers: Sequence[str], label: str, *, prefer_last_duplicate: bool = False
+    ) -> int:
         wanted = normalize_label(label)
         matches = [
             index
             for index, header in enumerate(headers)
             if normalize_label(header) == wanted or normalize_label(header).startswith(wanted)
         ]
+        if (
+            prefer_last_duplicate
+            and normalize_label(label) == normalize_label("裤型")
+            and len(matches) > 1
+        ):
+            # 部分类目把同名字段同时输出为普通展示列和下拉字段列。
+            # 批量区已经优先选择下拉框，表格对应列通常是同名列中的最后一列；
+            # 使用该列完成回读，避免把展示列误判成重复字段。
+            return matches[-1]
         if len(matches) != 1:
             raise TaobaoListingError(
                 f"淘宝 SKU 表格列“{label}”不是唯一项：{matches}"
@@ -4701,7 +4712,10 @@ class TaobaoListing:
         if not raw_rows:
             raise TaobaoListingError("淘宝 SKU 表格没有可校验的明细行")
         indices = {
-            label: self._sku_column_index(headers, label) for label in expected
+            label: self._sku_column_index(
+                headers, label, prefer_last_duplicate=True
+            )
+            for label in expected
         }
         result = []
         errors = []
@@ -4748,9 +4762,9 @@ class TaobaoListing:
         deferred_fields: List[str] = []
         batch_items = row.locator(":scope > .sku-batch-item")
         fixed_labels = {normalize_label(value) for value in ("价格", "数量", "平台规格编码")}
-        # 淘宝部分类目会把同一个字段渲染两次：一个是真正的下拉框，
-        # 另一个是兼容残留的普通输入框。全局优先使用下拉框，避免先
-        # 填写同名文本框后又把它误判成字段重复或错误回读。
+        # 淘宝裤装类目会把“裤型”渲染两次：一个是真正的下拉框，
+        # 另一个是兼容残留的普通输入框。该兼容规则只针对裤型，
+        # 其他同名字段继续严格报错，避免误选。
         select_labels = set()
         for item_index in range(await batch_items.count()):
             candidate = batch_items.nth(item_index)
@@ -4759,7 +4773,7 @@ class TaobaoListing:
                 continue
             candidate_label = (await label_node.inner_text()).strip().rstrip("：:").strip()
             if (
-                candidate_label
+                normalize_label(candidate_label) == normalize_label("裤型")
                 and await candidate.locator(".el-select").count() == 1
             ):
                 select_labels.add(normalize_label(candidate_label))
