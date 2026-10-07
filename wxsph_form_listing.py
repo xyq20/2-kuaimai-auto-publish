@@ -1059,6 +1059,47 @@ class WxsphFormListing(YouzanFormListing):
             await asyncio.sleep(0.1)
         raise WxsphFormListingError(f"微信小店类目回读不一致：期望 {expected!r}，实际 {actual!r}")
 
+    async def _category_dialog(self) -> Any:
+        """Locate the visible WeChat category dialog without relying on ARIA.
+
+        The live SCM dialog is rendered as an ``.el-dialog`` whose accessible
+        name is not consistently exposed.  A role/name-only locator therefore
+        times out even though the dialog is visibly open.  Prefer the visible
+        Element dialog and use the title or search input as the identity, then
+        fall back to a visible role dialog for the test and older page variants.
+        """
+        deadline = asyncio.get_running_loop().time() + 10
+        last_count = 0
+        while asyncio.get_running_loop().time() < deadline:
+            matches = []
+            dialogs = self.page.locator(".el-dialog:visible")
+            for index in range(await dialogs.count()):
+                dialog = dialogs.nth(index)
+                text = normalize_label(await dialog.inner_text())
+                if normalize_label("修改类目") in text or await dialog.locator(
+                    'input[placeholder="请输入类目关键词，支持模糊查询"]:visible'
+                ).count():
+                    matches.append(dialog)
+            last_count = len(matches)
+            if len(matches) == 1:
+                return matches[0]
+
+            role_dialogs = self.page.locator('[role="dialog"]:visible')
+            role_matches = []
+            for index in range(await role_dialogs.count()):
+                dialog = role_dialogs.nth(index)
+                text = normalize_label(await dialog.inner_text())
+                if normalize_label("修改类目") in text or await dialog.locator(
+                    'input[placeholder="请输入类目关键词，支持模糊查询"]:visible'
+                ).count():
+                    role_matches.append(dialog)
+            if len(role_matches) == 1:
+                return role_matches[0]
+            await asyncio.sleep(0.1)
+        raise WxsphFormListingError(
+            f"微信小店修改类目弹窗未出现或不唯一：{last_count}"
+        )
+
     async def apply_recommended_category(self) -> str:
         """Validate recommendations first, then current path, then Excel search."""
         if self.panel is None:
@@ -1095,8 +1136,7 @@ class WxsphFormListing(YouzanFormListing):
             return current
         modify = self.panel.get_by_role("button", name="修改类目", exact=True)
         await modify.click()
-        dialog = self.page.get_by_role("dialog", name="修改类目", exact=True)
-        await dialog.wait_for(state="visible", timeout=10000)
+        dialog = await self._category_dialog()
         search = dialog.get_by_placeholder("请输入类目关键词，支持模糊查询", exact=True)
         selected = None
         for term in dict.fromkeys(hints):
