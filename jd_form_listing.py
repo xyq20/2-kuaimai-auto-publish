@@ -1216,6 +1216,34 @@ class JdFormListing(YouzanFormListing):
             await asyncio.sleep(0.05)
         raise JdFormListingError("打开京东属性下拉框后未找到可见选项")
 
+    async def _visible_cascader_menu_options(
+        self, menu_index: int, timeout_seconds: float = 5
+    ) -> List[Mapping[str, Any]]:
+        """读取指定可见菜单；级联重新打开后第一个菜单始终是一级目录。"""
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            menus = self.page.locator(".el-cascader-menu:visible")
+            menu_count = await menus.count()
+            if menu_index >= 0 and menu_count <= menu_index:
+                await asyncio.sleep(0.05)
+                continue
+            menu = menus.last if menu_index < 0 else menus.nth(menu_index)
+            result = await menu.evaluate(
+                """element => Array.from(element.querySelectorAll('.el-cascader-node'))
+                  .map((node, index) => ({
+                    name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
+                    index: String(index),
+                    hasChildren: Boolean(node.querySelector('.el-icon-arrow-right')),
+                    isActive: node.classList.contains('is-active'),
+                    disabled: node.classList.contains('is-disabled')
+                  }))
+                  .filter(item => item.name.trim() && !item.disabled)"""
+            )
+            if result:
+                return result
+            await asyncio.sleep(0.05)
+        raise JdFormListingError("打开京东属性下拉框后未找到指定级联菜单选项")
+
     @staticmethod
     def _match_cascader_option(
         options: Sequence[Mapping[str, Any]], candidates: Sequence[str]
@@ -1230,6 +1258,43 @@ class JdFormListing(YouzanFormListing):
                 return matches[0]
         return None
 
+    async def _click_cascader_node_stably(self, node: Any, *, timeout: float = 3) -> None:
+        """等待级联节点完成 Vue 过渡后再点击。"""
+        deadline = asyncio.get_running_loop().time() + timeout
+        previous_box = None
+        stable_checks = 0
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                visible = await node.is_visible()
+                box = await node.bounding_box() if visible else None
+            except Exception:
+                box = None
+            if box is not None:
+                # 京东菜单带有 Vue 过渡，节点可能在整个过渡期间都无法
+                # 通过 Playwright 的 actionability 稳定检查。节点已可见时
+                # 直接触发原生 click，交给页面自己的事件处理器完成重绘。
+                try:
+                    await node.evaluate("element => element.click()")
+                    return
+                except Exception:
+                    pass
+                normalized_box = tuple(
+                    round(float(value), 2) for value in box.values()
+                )
+                if normalized_box == previous_box:
+                    stable_checks += 1
+                else:
+                    previous_box = normalized_box
+                    stable_checks = 0
+                if stable_checks >= 2:
+                    try:
+                        await node.click(timeout=500)
+                        return
+                    except Exception:
+                        stable_checks = 0
+            await asyncio.sleep(0.05)
+        raise JdFormListingError("京东级联菜单节点在重绘后未稳定，无法点击")
+
     async def _click_cascader_option(self, option: Mapping[str, Any]) -> None:
         menus = self.page.locator(".el-cascader-menu:visible")
         if await menus.count() == 0:
@@ -1237,7 +1302,7 @@ class JdFormListing(YouzanFormListing):
         last_menu = menus.last
         before_menus = await menus.count()
         nodes = last_menu.locator(".el-cascader-node")
-        await nodes.nth(int(option["index"])).click(timeout=2000)
+        await self._click_cascader_node_stably(nodes.nth(int(option["index"])))
         if not option.get("hasChildren"):
             return
         deadline = asyncio.get_running_loop().time() + 3
@@ -1260,6 +1325,12 @@ class JdFormListing(YouzanFormListing):
         完整路径。
         """
         await self._open_cascader(cascader)
+        # 京东会在点击输入框后异步挂载菜单；不能用一次性的 count()
+        # 判断，否则首轮返回 0 就会错误回退到旧的单路径逻辑。
+        try:
+            await self._visible_cascader_options(cascader, timeout_seconds=5)
+        except JdFormListingError:
+            return None
         menus = self.page.locator(".el-cascader-menu:visible")
         if await menus.count() == 0:
             return None
@@ -1268,7 +1339,6 @@ class JdFormListing(YouzanFormListing):
         # compatible builds place them directly under the menu.  Use the same
         # descendant selector for both shapes; the old direct-child selector
         # silently produced no paths and fell back to the incomplete menu walk.
-        root_nodes = root_menu.locator(".el-cascader-node")
         roots = await root_menu.evaluate(
             """element => Array.from(element.querySelectorAll('.el-cascader-node'))
               .map((node, index) => ({
@@ -1279,9 +1349,34 @@ class JdFormListing(YouzanFormListing):
               .filter(item => item.name.trim())"""
         )
         paths: List[Tuple[str, ...]] = []
-        for root in roots:
-            node = root_nodes.nth(int(root["index"]))
-            await node.click(timeout=2_000)
+        for root_index, root in enumerate(roots):
+            # 选择一个父项后京东会重建/虚拟化一级菜单；每个候选都重新
+            # 打开并按文本定位，避免复用上一轮的旧节点或初始索引。
+            if root_index:
+                try:
+                    await self.page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                deadline = asyncio.get_running_loop().time() + 2
+                while asyncio.get_running_loop().time() < deadline:
+                    if await self.page.locator(".el-cascader-menu:visible").count() == 0:
+                        break
+                    await asyncio.sleep(0.05)
+                await self._open_cascader(cascader)
+            # 重新打开后若控件保留上次活动路径，最后一个可见菜单可能是
+            # 旧的二级菜单；一级目录必须固定从第一个菜单读取。
+            options = await self._visible_cascader_menu_options(0)
+            chosen_root = self._match_cascader_option(
+                options, (str(root["name"]).strip(),)
+            )
+            if chosen_root is None:
+                raise JdFormListingError(
+                    f"京东级联一级菜单重绘后找不到“{root['name']}”"
+                )
+            root_menu = self.page.locator(".el-cascader-menu:visible").first
+            await self._click_cascader_node_stably(
+                root_menu.locator(".el-cascader-node").nth(int(chosen_root["index"]))
+            )
             if not root.get("hasChildren"):
                 paths.append((str(root["name"]).strip(),))
                 continue
@@ -1327,13 +1422,17 @@ class JdFormListing(YouzanFormListing):
             pass
         await self._open_cascader(cascader)
         for depth, expected in enumerate(chosen_path):
-            options = await self._visible_cascader_options(cascader)
+            options = await self._visible_cascader_menu_options(0 if depth == 0 else -1)
             chosen = self._match_cascader_option(options, (expected,))
             if chosen is None:
                 raise JdFormListingError(
                     f"京东属性{label}完整菜单回选失败：{' > '.join(chosen_path)}"
                 )
-            await self._click_cascader_option(chosen)
+            menu = self.page.locator(".el-cascader-menu:visible")
+            menu = menu.first if depth == 0 else menu.last
+            await self._click_cascader_node_stably(
+                menu.locator(".el-cascader-node").nth(int(chosen["index"]))
+            )
         try:
             await self.page.keyboard.press("Escape")
         except Exception:

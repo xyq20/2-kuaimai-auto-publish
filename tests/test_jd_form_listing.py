@@ -808,6 +808,39 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(actual, ("潮流风", "街头风"))
 
+    async def test_style_cascader_waits_for_async_menu_render(self):
+        html = STYLE_CASCADER_FIXTURE.replace(
+            "dropdown.style.display = 'block';\n    dropdown.innerHTML",
+            "dropdown.style.display = 'none';\n    dropdown.innerHTML",
+        ).replace(
+            "dropdown.innerHTML = menu(Object.keys(children), true);",
+            "dropdown.innerHTML = menu(Object.keys(children), true);\n    setTimeout(() => dropdown.style.display = 'block', 150);",
+        ).replace(
+            "'工装': ['机能']",
+            "'工装': ['机能'], '潮流风': ['街头风', '嘻哈风']",
+        )
+        listing = await self._open(html)
+        cascader = self.page.locator(".el-cascader").first
+        actual = await listing._select_cascader_from_all_menus(
+            cascader, ("街头风",), "风格"
+        )
+        self.assertEqual(actual, ("潮流风", "街头风"))
+
+    async def test_style_cascader_relocates_root_after_parent_rerender(self):
+        html = STYLE_CASCADER_FIXTURE.replace(
+            "const second = dropdown.querySelectorAll('.el-cascader-menu')[1];\n    if (second) second.remove();\n    dropdown.insertAdjacentHTML('beforeend', menu(children[name], false));",
+            "dropdown.innerHTML = menu(Object.keys(children), true) + menu(children[name], false);",
+        ).replace(
+            "'工装': ['机能']",
+            "'工装': ['机能'], '潮流风': ['街头风', '嘻哈风']",
+        )
+        listing = await self._open(html)
+        cascader = self.page.locator(".el-cascader").first
+        actual = await listing._select_cascader_from_all_menus(
+            cascader, ("街头风",), "风格"
+        )
+        self.assertEqual(actual, ("潮流风", "街头风"))
+
     async def test_learning_uses_jd_api_ids_and_dom_cross_check(self):
         class Runtime:
             def __init__(self):
