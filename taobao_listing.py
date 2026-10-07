@@ -669,6 +669,89 @@ class TaobaoListing:
         except Exception as exc:
             raise TaobaoListingError("淘宝类目应用后，类目属性未渲染") from exc
 
+    async def _resolve_category_review(
+        self,
+        labels: Sequence[str],
+        *,
+        source: str,
+    ) -> str:
+        """Resolve an uncertain category through the shared learning review.
+
+        Category values have no stable platform field id in the editor.  Use
+        the shared ``category_path``/``category`` review protocol so confirmed
+        choices can become learning evidence across products.
+        """
+        runtime = self.attribute_runtime
+        if runtime is None or not callable(getattr(runtime, "resolve", None)):
+            return ""
+        unique: List[str] = []
+        seen = set()
+        for label in labels:
+            text = re.sub(r"\s+", " ", str(label or "")).strip()
+            key = self._normalize_category_path(text)
+            if text and key and key not in seen:
+                seen.add(key)
+                unique.append(text)
+        if not unique:
+            return ""
+        candidates = tuple(
+            CandidateValue(
+                "path:" + canonical_sha256(self._normalize_category_path(label))[:24],
+                label,
+            )
+            for label in unique
+        )
+        schema_version = canonical_sha256({
+            "platform_id": "tb",
+            "category_leaf_id": "category-path:hints:" + canonical_sha256(tuple(self.category_hints))[:20],
+            "field_id": "category_path",
+            "options": [
+                {"value_id": value.value_id, "label": value.label}
+                for value in candidates
+            ],
+        })
+        resolved = await runtime.resolve(AttributeRequest(
+            platform_id="tb",
+            category_leaf_id="category-path:hints:" + canonical_sha256(tuple(self.category_hints))[:20],
+            field_id="category_path",
+            field_label="商品类目",
+            candidates=candidates,
+            excel_value=" / ".join(self.category_hints),
+            evidence={
+                "excel": True,
+                "live_dom": True,
+                "category_source": source,
+                "excel_category_hints": list(self.category_hints),
+                "candidate_paths": list(unique),
+                "category_required_before_attributes": True,
+            },
+            custom_allowed=False,
+            schema_version=schema_version,
+            control_type="category",
+        ))
+        if resolved is None:
+            # During a platform pass AttributeRuntime queues the review and
+            # defers the batch until the boundary. Stop before filling fields
+            # under an unconfirmed category.
+            raise_deferred = getattr(runtime, "raise_deferred_reviews", None)
+            if callable(raise_deferred):
+                raise_deferred()
+            return ""
+        if getattr(resolved, "is_no_fill", False):
+            return ""
+        value_id = str(getattr(resolved, "value_id", ""))
+        label = str(getattr(resolved, "label", ""))
+        matches = [
+            candidate.label
+            for candidate in candidates
+            if value_id == candidate.value_id
+            or self._normalize_category_path(label)
+            == self._normalize_category_path(candidate.label)
+        ]
+        if len(matches) != 1:
+            raise TaobaoListingError("淘宝类目审核结果不在当前候选范围内")
+        return matches[0]
+
     async def apply_excel_category(self) -> str:
         """Apply the Taobao category using the Excel 商品分类 hints."""
         if self.panel is None:
@@ -677,39 +760,26 @@ class TaobaoListing:
         if not hints:
             return await self.apply_recommended_category()
 
-        current = ""
-        try:
-            current = await self._category_text()
-        except TaobaoListingError:
-            pass
-        if current and self._choose_category_hint_text((current,), hints)[0]:
-            if self.logger is not None:
-                self.logger.info("淘宝商品分类已匹配 Excel，跳过修改：%s", current)
-            return current
-
         # The ERP can show several one-click predictions.  The first row may
         # carry the red “推荐” badge while a later row is the Excel match.
         # Inspect every visible prediction before opening the manual search.
-        buttons = self.panel.get_by_role("button", name="点击使用", exact=True)
-        predictions: List[Tuple[Any, str]] = []
-        for index in range(await buttons.count()):
-            button = buttons.nth(index)
-            if not await button.is_visible():
-                continue
-            row = button.locator("xpath=..")
-            if not await row.count() or not (await row.inner_text()).strip():
-                row = button.locator(
-                    "xpath=ancestor::*[contains(@class, 'prediction-item')][1]"
-                )
-            row_text = re.sub(r"\s+", " ", (await row.inner_text()).strip())
-            expected = re.sub(r"^\s*推荐\s*", "", row_text)
-            expected = re.sub(r"\s*点击使用\s*$", "", expected).strip()
-            if expected:
-                predictions.append((button, expected))
+        predictions = list(await self._prediction_candidates())
         if predictions:
-            chosen, strategy = self._choose_category_hint_text(
-                tuple(expected for _button, expected in predictions), hints
+            recommended: List[Tuple[Any, str]] = []
+            for button, expected in predictions:
+                row = button.locator("xpath=..")
+                marker = row.get_by_text("推荐", exact=True)
+                if await marker.count() and await marker.first.is_visible():
+                    recommended.append((button, expected))
+            recommended_choice, recommended_strategy = choose_category_candidate(
+                tuple(expected for _button, expected in recommended), hints
             )
+            if recommended_choice:
+                chosen, strategy = recommended_choice, recommended_strategy
+            else:
+                chosen, strategy = choose_category_candidate(
+                    tuple(expected for _button, expected in predictions), hints
+                )
             if chosen:
                 matches = [
                     (button, expected)
@@ -734,6 +804,23 @@ class TaobaoListing:
                         strategy,
                     )
                 return await self._apply_category_prediction(button, expected, "Excel 推荐")
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝页面推荐类目未通过 Excel 校验，转入 Excel 类目搜索：%s",
+                    "/".join(hints),
+                )
+
+        current = ""
+        try:
+            current = await self._category_text()
+        except TaobaoListingError:
+            pass
+        if current:
+            current_choice, _current_strategy = choose_category_candidate((current,), hints)
+            if current_choice:
+                if self.logger is not None:
+                    self.logger.info("淘宝商品分类已匹配 Excel，跳过修改：%s", current)
+                return current
 
         modify = self.panel.get_by_role("button", name="修改类目", exact=True)
         if await modify.count() != 1:
@@ -753,6 +840,7 @@ class TaobaoListing:
         selected_text = ""
         selected_node: Any = None
         selected_hint = ""
+        observed_rows: Dict[str, Tuple[str, Any]] = {}
         search_terms = category_search_terms(hints)
         # 裤类平台通常把“牛仔裤/男士直筒牛仔裤”拆成叶类目和供应商
         # 描述。先搜 Excel 中的基础叶类目，避免每次先走一个平台不存在
@@ -766,7 +854,9 @@ class TaobaoListing:
             deadline = asyncio.get_running_loop().time() + 20
             while asyncio.get_running_loop().time() < deadline:
                 rows = await self._visible_category_result_nodes()
-                chosen, strategy = self._choose_category_hint_text(
+                for text, node in rows:
+                    observed_rows.setdefault(self._normalize_category_path(text), (text, node))
+                chosen, strategy = choose_category_candidate(
                     tuple(text for text, _node in rows), hints
                 )
                 if chosen:
@@ -780,13 +870,40 @@ class TaobaoListing:
                         selected_text, selected_node = matches[0]
                         selected_hint = f"{hint} ({strategy})"
                         break
-                    if len(matches) > 1:
-                        raise TaobaoListingError(
-                            f"淘宝类目搜索结果 DOM 不是唯一项：{len(matches)}"
-                        )
                 await asyncio.sleep(0.1)
             if selected_node is not None:
                 break
+        if selected_node is None:
+            reviewed = await self._resolve_category_review(
+                tuple(dict.fromkeys(
+                    [expected for _button, expected in predictions]
+                    + [text for text, _node in observed_rows.values()]
+                )),
+                source="excel_search_ambiguous",
+            )
+            if reviewed:
+                selected = observed_rows.get(self._normalize_category_path(reviewed))
+                if selected is not None:
+                    selected_text, selected_node = selected
+                    selected_hint = "审核确认"
+                else:
+                    prediction = next(
+                        (
+                            (button, expected)
+                            for button, expected in predictions
+                            if self._normalize_category_path(expected)
+                            == self._normalize_category_path(reviewed)
+                        ),
+                        None,
+                    )
+                    if prediction is not None:
+                        cancel = dialog.get_by_role("button", name=re.compile(r"取\s*消"))
+                        if await cancel.count() == 1:
+                            await cancel.click(timeout=10_000)
+                            await dialog.wait_for(state="hidden", timeout=30_000)
+                        return await self._apply_category_prediction(
+                            prediction[0], prediction[1], "审核确认"
+                        )
         if selected_node is None:
             raise TaobaoListingError(
                 "淘宝类目搜索结果中没有 Excel 的唯一精确分类提示："

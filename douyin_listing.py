@@ -799,6 +799,82 @@ class DouyinListing:
         text = (await display.inner_text()).strip()
         return text.split("同步平台类目", 1)[0].strip()
 
+    async def _resolve_category_review(
+        self,
+        labels: Sequence[str],
+        *,
+        source: str,
+    ) -> str:
+        """Send an uncertain recommended category through attribute learning."""
+        runtime = self.attribute_runtime
+        if runtime is None or not callable(getattr(runtime, "resolve", None)):
+            return ""
+        unique: List[str] = []
+        seen = set()
+        for label in labels:
+            text = re.sub(r"\s+", " ", str(label or "")).strip()
+            key = re.sub(r"[\s>]", "", text).casefold()
+            if text and key and key not in seen:
+                seen.add(key)
+                unique.append(text)
+        if not unique:
+            return ""
+        candidates = tuple(
+            CandidateValue(
+                "path:" + canonical_sha256(re.sub(r"[\s>]", "", label).casefold())[:24],
+                label,
+            )
+            for label in unique
+        )
+        category_leaf_id = "category-path:hints:" + canonical_sha256(tuple(self.category_hints))[:20]
+        schema_version = canonical_sha256({
+            "platform_id": "douyin",
+            "category_leaf_id": category_leaf_id,
+            "field_id": "category_path",
+            "options": [
+                {"value_id": value.value_id, "label": value.label}
+                for value in candidates
+            ],
+        })
+        resolved = await runtime.resolve(AttributeRequest(
+            platform_id="douyin",
+            category_leaf_id=category_leaf_id,
+            field_id="category_path",
+            field_label="商品类目",
+            candidates=candidates,
+            excel_value=" / ".join(self.category_hints),
+            evidence={
+                "excel": True,
+                "live_dom": True,
+                "category_source": source,
+                "excel_category_hints": list(self.category_hints),
+                "candidate_paths": list(unique),
+                "category_required_before_attributes": True,
+            },
+            custom_allowed=False,
+            schema_version=schema_version,
+            control_type="category",
+        ))
+        if resolved is None:
+            raise_deferred = getattr(runtime, "raise_deferred_reviews", None)
+            if callable(raise_deferred):
+                raise_deferred()
+            return ""
+        if getattr(resolved, "is_no_fill", False):
+            return ""
+        value_id = str(getattr(resolved, "value_id", ""))
+        label = str(getattr(resolved, "label", ""))
+        matches = [
+            candidate.label
+            for candidate in candidates
+            if value_id == candidate.value_id
+            or re.sub(r"[\s>]", "", label).casefold()
+            == re.sub(r"[\s>]", "", candidate.label).casefold()
+        ]
+        if len(matches) != 1:
+            raise DouyinListingError("抖音类目审核结果不在当前候选范围内")
+        return matches[0]
+
     async def apply_first_recommended_category(self) -> str:
         """Use the Excel-matching prediction and verify the final path."""
         if self.panel is None:
@@ -851,32 +927,73 @@ class DouyinListing:
                 raise DouyinListingError("抖音页面没有可用的预测类目") from exc
 
         if self.category_hints and predictions:
+            recommended = []
+            for candidate, _expected in predictions:
+                row = candidate.locator("xpath=..")
+                marker = row.get_by_text("推荐", exact=True)
+                if await marker.count() and await marker.first.is_visible():
+                    recommended.append((candidate, _expected))
             chosen, strategy = choose_category_candidate(
-                tuple(expected for _button, expected in predictions),
+                tuple(expected for _button, expected in recommended),
                 self.category_hints,
             )
             if not chosen:
-                raise DouyinListingError(
-                    "抖音预测类目中没有与 Excel 商品分类匹配的项"
+                chosen, strategy = choose_category_candidate(
+                    tuple(expected for _button, expected in predictions),
+                    self.category_hints,
                 )
-            matches = [
-                (candidate, expected)
-                for candidate, expected in predictions
-                if re.sub(r"[\s>]", "", expected).casefold()
-                == re.sub(r"[\s>]", "", chosen).casefold()
-            ]
-            if len(matches) != 1:
-                raise DouyinListingError(
-                    f"抖音 Excel 类目匹配结果不是唯一项：{len(matches)}"
+            if not chosen:
+                # A currently selected path may already satisfy Excel.  Keep it
+                # before asking the operator to choose among bad predictions.
+                if current_is_selected and choose_category_candidate(
+                    (current,), self.category_hints
+                )[0]:
+                    if self.logger is not None:
+                        self.logger.info("抖音已选类目匹配 Excel，跳过错误推荐：%s", current)
+                    return current
+                if self.logger is not None:
+                    self.logger.info(
+                        "抖音页面推荐类目未通过 Excel 校验，提交类目学习审核：%s",
+                        "/".join(self.category_hints),
+                    )
+                reviewed = await self._resolve_category_review(
+                    tuple(expected for _button, expected in predictions),
+                    source="recommendation_mismatch",
                 )
-            button, expected = matches[0]
-            if self.logger is not None:
-                self.logger.info(
-                    "抖音预测类目与 Excel 匹配，选择第 %s 个：%s（%s）",
-                    next(index + 1 for index, item in enumerate(predictions) if item[0] == button),
-                    expected,
-                    strategy,
-                )
+                if reviewed:
+                    matches = [
+                        (candidate, expected)
+                        for candidate, expected in predictions
+                        if re.sub(r"[\s>]", "", expected).casefold()
+                        == re.sub(r"[\s>]", "", reviewed).casefold()
+                    ]
+                    if len(matches) == 1:
+                        button, expected = matches[0]
+                    else:
+                        raise DouyinListingError("抖音类目审核结果不在预测候选范围内")
+                else:
+                    raise DouyinListingError(
+                        "抖音预测类目中没有与 Excel 商品分类匹配的项"
+                    )
+            if chosen:
+                matches = [
+                    (candidate, expected)
+                    for candidate, expected in predictions
+                    if re.sub(r"[\s>]", "", expected).casefold()
+                    == re.sub(r"[\s>]", "", chosen).casefold()
+                ]
+                if len(matches) != 1:
+                    raise DouyinListingError(
+                        f"抖音 Excel 类目匹配结果不是唯一项：{len(matches)}"
+                    )
+                button, expected = matches[0]
+                if self.logger is not None:
+                    self.logger.info(
+                        "抖音预测类目与 Excel 匹配，选择第 %s 个：%s（%s）",
+                        next(index + 1 for index, item in enumerate(predictions) if item[0] == button),
+                        expected,
+                        strategy,
+                    )
         else:
             expected = ""
 

@@ -660,6 +660,29 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             "服装 > 男装 > 休闲裤",
         )
 
+    async def test_mismatched_recommendation_enters_category_learning_review(self):
+        await self.listing.open()
+        self.listing.category_hints = ("服装 > 男装 > 牛仔裤",)
+
+        async def approve_first(request):
+            self.assertEqual(request.field_id, "category_path")
+            self.assertEqual(request.field_label, "商品类目")
+            self.assertEqual(request.control_type, "category")
+            self.assertEqual(request.evidence["category_source"], "recommendation_mismatch")
+            self.assertEqual(len(request.candidates), 1)
+            candidate = request.candidates[0]
+            return ResolvedAttribute(
+                candidate.value_id, candidate.label, "human_override", request.schema_version
+            )
+
+        self.listing.attribute_runtime = SimpleNamespace(
+            resolve=AsyncMock(side_effect=approve_first)
+        )
+
+        actual = await self.listing.apply_first_recommended_category()
+
+        self.assertEqual(actual, "服装 > 男装 > 休闲裤")
+
     async def test_existing_category_is_reapplied_to_capture_live_api_schema(self):
         await self.listing.open()
         self.assertEqual(

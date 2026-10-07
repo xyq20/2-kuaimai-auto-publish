@@ -1061,7 +1061,10 @@ async def write_tmall_review_required(
 def resolve_taobao_category_mode(product: ProductData, category_mode: str) -> str:
     if category_mode != "auto":
         return category_mode
-    return "casual-pants" if product.garment_kind == "pants" else "recommended"
+    # 自动模式统一走“平台推荐先校验 -> Excel 类目匹配 -> 人工学习审核”。
+    # 过去按服装类型把所有裤子强制成“男装 > 休闲裤”，会跳过淘宝动态
+    # 推荐和 Excel 的牛仔裤等真实叶类目。
+    return "recommended"
 
 
 def taobao_garment_kind(product: ProductData, category_mode: str) -> str:

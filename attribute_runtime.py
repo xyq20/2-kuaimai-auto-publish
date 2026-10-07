@@ -758,7 +758,11 @@ class AttributeRuntime:
                     ),
                 )
             if (
-                snapshot.custom_allowed or request.field_id != "__category__"
+                snapshot.custom_allowed
+                or (
+                    request.field_id != "__category__"
+                    and request.control_type.casefold() != "category"
+                )
             ):
                 return self._remember_resolved(
                     request,

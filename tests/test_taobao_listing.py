@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from attribute_runtime import ResolvedAttribute
+from kuaimai_erp import resolve_taobao_category_mode
 from learning_models import CandidateValue
 from taobao_data import parse_taobao_fields
 from taobao_listing import (
@@ -403,6 +404,13 @@ function openTaobao() {
 
 
 class TaobaoPureFunctionTests(unittest.TestCase):
+    def test_auto_category_mode_keeps_dynamic_recommendation_flow_for_pants(self):
+        product = SimpleNamespace(garment_kind="pants")
+        self.assertEqual(resolve_taobao_category_mode(product, "auto"), "recommended")
+        self.assertEqual(
+            resolve_taobao_category_mode(product, "casual-pants"), "casual-pants"
+        )
+
     def test_shoe_craft_excel_alias_matches_live_choice(self):
         self.assertEqual(
             value_candidates("鞋制作工艺", "胶粘"),
@@ -831,6 +839,14 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         actual = await self.listing.apply_category("recommended")
 
         self.assertEqual(actual, "服饰 > 动态测试类目")
+
+    async def test_recommended_category_is_checked_against_excel_before_current_value(self):
+        self.listing.category_hints = ("服饰 > 动态测试类目",)
+
+        actual = await self.listing.apply_category("recommended")
+
+        self.assertEqual(actual, "服饰 > 动态测试类目")
+        self.assertTrue(self.listing.category_clicked)
 
     async def test_category_search_does_not_join_separate_shoe_paths(self):
         await self.page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
