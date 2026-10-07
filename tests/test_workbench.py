@@ -184,8 +184,8 @@ class WorkbenchTests(unittest.TestCase):
                 'output_dir': str(directory),
             })
         recent = self.client.get('/api/launcher/jobs').json()['jobs']
-        self.assertEqual(len(recent), 100)
-        self.assertFalse(any(job['style_code'] == 'MY019-1' for job in recent))
+        self.assertEqual(len(recent), 101)
+        self.assertTrue(any(job['style_code'] == 'MY019-1' for job in recent))
         searched = self.client.get('/api/launcher/jobs', params={'search': 'MY019-1 小红书'}).json()
         self.assertEqual(searched['total_matches'], 1)
         self.assertEqual(searched['jobs'][0]['style_code'], 'MY019-1')

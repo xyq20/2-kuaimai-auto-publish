@@ -373,7 +373,7 @@ class Launcher:
 
     def history(self) -> list:
         with self.locked():
-            return [self._public(job) for job in self._jobs()[:100]]
+            return [self._public(job) for job in self._jobs()]
 
     def search_history(self, query: str) -> dict:
         terms = [part.casefold() for part in unicodedata.normalize("NFKC", query).split()]
@@ -391,7 +391,7 @@ class Launcher:
                 )).casefold()
                 if all(term in haystack for term in terms):
                     matches.append(job)
-            return {"jobs": [self._public(job) for job in matches[:100]], "total_matches": len(matches)}
+            return {"jobs": [self._public(job) for job in matches], "total_matches": len(matches)}
 
     def get(self, job_id: str) -> dict:
         with self.locked():

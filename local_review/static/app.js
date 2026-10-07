@@ -306,7 +306,7 @@ function renderHistory() {
   const searching = !!$('history-search').value.trim();
   const jobs = searching ? state.historySearchResults : state.history;
   $('history-results').textContent = searching
-    ? jobs === null ? '正在搜索运行记录…' : `找到 ${state.historySearchTotal} 条记录${state.historySearchTotal > jobs.length ? '，显示最近 100 条' : ''}`
+    ? jobs === null ? '正在搜索运行记录…' : `找到 ${state.historySearchTotal} 条记录`
     : `最近 ${state.history.length} 条运行记录`;
   $('history-list').innerHTML = jobs?.length ? jobs.map(job => `<button class="history-row" data-job="${job.id}"><div><strong>${escapeHTML(job.style_code)} · ${escapeHTML(job.title)}</strong><p>${escapeHTML(job.platforms.map(platformName).join(' → '))} · ${modes.find(m=>m.id===job.mode)?.name || ''}<br>${escapeHTML(new Date(job.created_at).toLocaleString('zh-CN'))} · ${escapeHTML(job.created_by)}</p></div><span class="history-status ${job.status}">${labels[job.status] || job.status} ${icon('chevron')}</span></button>`).join('') : `<p class="empty-message">${searching ? jobs === null ? '正在搜索…' : '没有匹配的运行记录。' : '还没有网页运行记录。开始一次任务后会记录在这里。'}</p>`;
 }
