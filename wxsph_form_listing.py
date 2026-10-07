@@ -590,6 +590,26 @@ class WxsphFormListing(YouzanFormListing):
         api_is_usable = api_is_usable and bool(set(api_labels).intersection(dom_labels))
         candidates = api_candidates if api_is_usable else visible_candidates
         multi = await select.locator(".el-select__tags").count() > 0
+        if normalize_label(page_label) == normalize_label("适用对象"):
+            universal = preferred_exact_candidate_label(
+                tuple(value.label for value in candidates), ("通用",)
+            )
+            has_universal_group = any(
+                normalize_option("通用") in {
+                    normalize_option(value) for value in group
+                }
+                for group in groups
+            )
+            if universal is not None and has_universal_group:
+                # “通用”与青年/中年等细分人群互斥。Excel 可能同时保留
+                # 历史细分值，但平台已有“通用”时只填这个确定候选，避免
+                # 无法匹配的第二组把整个字段错误送入人工审核。
+                groups = ((universal,),)
+                if self.logger is not None:
+                    self.logger.info(
+                        "微信小店属性“%s”：已有“通用”候选，忽略互斥细分人群值",
+                        page_label,
+                    )
         if not multi and len(groups) > 1:
             # A single-select can consume only one Excel alternative. Keep the
             # first alternative that is an actual platform candidate; this is
