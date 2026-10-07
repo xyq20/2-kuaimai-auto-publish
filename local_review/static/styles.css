@@ -60,3 +60,10 @@
 #review-view{min-height:0}
 #review-frame{height:calc(100vh - 150px);min-height:0}
 @media(max-width:650px){#review-frame{height:calc(100vh - 130px);min-height:0}}
+/* Keep the embedded review workspace fixed to the viewport. */
+body.review-active{overflow:hidden}
+#review-view{height:calc(100vh - 76px);padding:0 40px 20px;display:flex;flex-direction:column;min-height:0;overflow:hidden;max-width:none}
+#review-view .page-heading{flex:0 0 auto;margin:0;padding:28px 0 18px}
+#review-frame{flex:1 1 auto;width:100%;height:auto;min-height:0;display:block;border:0;border-radius:0;background:transparent}
+@media(max-width:1180px){#review-view{padding-left:27px;padding-right:27px}}
+@media(max-width:650px){#review-view{height:calc(100vh - 64px);padding:0 16px 12px}#review-view .page-heading{padding:18px 0 12px}#review-frame{height:auto;min-height:0}}

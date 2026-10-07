@@ -148,6 +148,7 @@ function renderPlan() {
 }
 function setMode(id) { state.mode = id; renderPlan(); remember(); }
 function showView(view) {
+  document.body.classList.toggle('review-active', view === 'review');
   ['home','history','review'].forEach(name => {
     $(name+'-view').hidden = name !== view;
     $('nav-'+name).classList.toggle('active', name === view);
