@@ -628,6 +628,9 @@ class WxsphFormListing(YouzanFormListing):
             approved = (runtime.confirmed_choice(approval_request)
                         if callable(getattr(runtime, "confirmed_choice", None)) else None)
             if approved is not None and getattr(approved, "is_no_fill", False):
+                remember = getattr(runtime, "remember_resolved", None)
+                if callable(remember):
+                    remember(approval_request, approved)
                 return ()
             if approved is not None:
                 if not multi:
@@ -2046,6 +2049,7 @@ class WxsphFormListing(YouzanFormListing):
         persisted: Dict[str, Tuple[str, ...]] = {}
         skipped_optional: Dict[str, str] = {}
         skipped_reviewed_no_fill: Dict[str, str] = {}
+        skipped_pending_review: Dict[str, str] = {}
         rules: Dict[str, str] = {}
         errors: List[str] = []
 
@@ -2105,6 +2109,22 @@ class WxsphFormListing(YouzanFormListing):
                         page_label,
                     )
                 continue
+
+            if self.attribute_runtime is not None:
+                pending_checker = getattr(
+                    self.attribute_runtime, "review_pending_or_omitted", None
+                )
+                if callable(pending_checker) and pending_checker(
+                    self.attribute_platform_id, page_label
+                ):
+                    skipped_pending_review[page_label] = "等待运营审核"
+                    rules[page_label] = "pending_review"
+                    if self.logger is not None:
+                        self.logger.info(
+                            "微信小店保存后回读跳过待审核属性：%s",
+                            page_label,
+                        )
+                    continue
 
             value, exact_values, rule = self._resolved_attribute_value(
                 fields.fields,
@@ -2196,6 +2216,7 @@ class WxsphFormListing(YouzanFormListing):
             "attributes": persisted,
             "skipped_optional_percentages": skipped_optional,
             "skipped_reviewed_no_fill": skipped_reviewed_no_fill,
+            "skipped_pending_review": skipped_pending_review,
             "rules": rules,
         }
 

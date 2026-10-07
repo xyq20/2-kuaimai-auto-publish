@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from attribute_runtime import ResolvedAttribute
+from attribute_runtime import NO_FILL_VALUE_ID, ResolvedAttribute
 from wxsph_data import parse_wxsph_fields
 from wxsph_form_listing import WxsphFormListing, WxsphFormListingError
 
@@ -166,6 +166,39 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
             '面料材质', self.page.locator('#fabric'), (('旧值',),))
         self.assertEqual(result, ('棉',))
         listing._excel_before_review.assert_not_awaited()
+
+    async def test_confirmed_no_fill_is_remembered_for_saved_readback(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        class Runtime:
+            def __init__(self):
+                self.remembered = None
+
+            def confirmed_choice(self, request):
+                return ResolvedAttribute(NO_FILL_VALUE_ID, "", "human_no_fill", "schema")
+
+            def remember_resolved(self, request, resolved):
+                self.remembered = (request, resolved)
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+        listing._captured_api_field = AsyncMock(
+            return_value=(
+                SimpleNamespace(
+                    source_id="fabric",
+                    custom_allowed=False,
+                    option_values=(SimpleNamespace(value_id="cotton", label="棉"),),
+                ),
+                "category",
+            )
+        )
+        result = await listing._resolve_learning_select_groups(
+            "面料材质", self.page.locator("#fabric"), (("旧值",),)
+        )
+
+        self.assertEqual(result, ())
+        self.assertIsNotNone(runtime.remembered)
 
     async def test_registered_choice_survives_option_reordering(self):
         await self.page.set_content('<div id="select"></div>')

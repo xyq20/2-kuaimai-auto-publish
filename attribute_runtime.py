@@ -518,6 +518,12 @@ class AttributeRuntime:
         ] = (request, resolved)
         return resolved
 
+    def remember_resolved(
+        self, request: AttributeRequest, resolved: ResolvedAttribute
+    ) -> ResolvedAttribute:
+        """Remember an approval consumed by an adapter before normal resolve()."""
+        return self._remember_resolved(request, resolved)
+
     def _queue_candidate_snapshot(
         self,
         snapshot: CandidateSnapshot,
