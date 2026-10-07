@@ -453,6 +453,10 @@ _CLOTHING_MEASUREMENT_NAMES = {
     "sleeve": "袖长",
 }
 
+# 肩宽在部分平台的尺码表中不是必填项。缺少整行时使用稳定、可追溯的
+# 顺序值，避免各平台在自己的填表逻辑中重复处理并产生不一致。
+_CLOTHING_REQUIRED_MEASUREMENTS = ("length", "chest", "sleeve")
+
 _TAOBAO_LENGTH_ALIASES = {
     "pants": ("裤长", "LENGTH", "PANTSLENGTH", "TROUSERLENGTH"),
     "clothing": ("衣长", "LENGTH", "GARMENTLENGTH", "BODYLENGTH", "BACKLENGTH"),
@@ -880,8 +884,8 @@ def parse_clothing_measurement_table(
             row_tokens[kind] = token
 
     missing_rows = [
-        display_name
-        for kind, display_name in _CLOTHING_MEASUREMENT_NAMES.items()
+        _CLOTHING_MEASUREMENT_NAMES[kind]
+        for kind in _CLOTHING_REQUIRED_MEASUREMENTS
         if kind not in row_tokens
     ]
     if missing_rows:
@@ -922,6 +926,8 @@ def parse_clothing_measurement_table(
 
     cells: Dict[Tuple[str, str], Number] = {}
     for kind in _CLOTHING_MEASUREMENT_NAMES:
+        if kind not in row_bound_by_kind:
+            continue
         top, bottom = row_bound_by_kind[kind]
         for (size, _header), (left, right) in zip(columns, column_bounds):
             matches = [
@@ -940,10 +946,25 @@ def parse_clothing_measurement_table(
                 raise RecognitionError(f"{source}：单元格 {cell_name}必须是正数")
             cells[(size, kind)] = value
 
+    if "shoulder" in row_bound_by_kind:
+        shoulder_values = {
+            size: cells[(size, "shoulder")]
+            for size in expected_map
+        }
+    else:
+        # 以尺码表中从左到右的列顺序生成默认肩宽。expected_map 保留了
+        # Excel 的尺码顺序，且已在表头校验过集合一致性。
+        shoulder_values = {
+            size: 10 + index
+            for index, size in enumerate(expected_map)
+        }
+
     return {
         size: {
-            kind: cells[(size, kind)]
-            for kind in _CLOTHING_MEASUREMENT_NAMES
+            "length": cells[(size, "length")],
+            "chest": cells[(size, "chest")],
+            "shoulder": shoulder_values[size],
+            "sleeve": cells[(size, "sleeve")],
         }
         for size in expected_map
     }

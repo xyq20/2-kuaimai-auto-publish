@@ -194,6 +194,23 @@ class VisionOCRUnitTests(unittest.TestCase):
             _token("57", 0.60, 0.75),
         )
 
+    def test_douyin_clothing_defaults_missing_shoulder_width(self):
+        tokens = (
+            _token("S", 0.40, 0.10),
+            _token("M", 0.60, 0.10),
+            _token("L", 0.80, 0.10),
+            _token("衣长/LENGTH", 0.05, 0.30, width=0.20),
+            _token("胸围/BUST", 0.05, 0.45, width=0.20),
+            _token("袖长/SLEEVE LENGTH", 0.05, 0.60, width=0.20),
+            _token("63", 0.40, 0.30), _token("65", 0.60, 0.30), _token("67", 0.80, 0.30),
+            _token("110", 0.40, 0.45), _token("114", 0.60, 0.45), _token("118", 0.80, 0.45),
+            _token("56", 0.40, 0.60), _token("57", 0.60, 0.60), _token("58", 0.80, 0.60),
+        )
+
+        actual = parse_clothing_measurement_table(tokens, ("S", "M", "L"), source="缺少肩宽的尺码表")
+
+        self.assertEqual([actual[size]["shoulder"] for size in ("S", "M", "L")], [10, 11, 12])
+
     def test_douyin_clothing_recombines_split_sleeve_label(self):
         tokens = (
             _token("S", 0.40, 0.10), _token("M", 0.60, 0.10),
