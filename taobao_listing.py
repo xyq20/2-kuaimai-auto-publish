@@ -4748,6 +4748,21 @@ class TaobaoListing:
         deferred_fields: List[str] = []
         batch_items = row.locator(":scope > .sku-batch-item")
         fixed_labels = {normalize_label(value) for value in ("价格", "数量", "平台规格编码")}
+        # 淘宝部分类目会把同一个字段渲染两次：一个是真正的下拉框，
+        # 另一个是兼容残留的普通输入框。全局优先使用下拉框，避免先
+        # 填写同名文本框后又把它误判成字段重复或错误回读。
+        select_labels = set()
+        for item_index in range(await batch_items.count()):
+            candidate = batch_items.nth(item_index)
+            label_node = candidate.locator(":scope > .sku-batch-item_label")
+            if not await label_node.count():
+                continue
+            candidate_label = (await label_node.inner_text()).strip().rstrip("：:").strip()
+            if (
+                candidate_label
+                and await candidate.locator(".el-select").count() == 1
+            ):
+                select_labels.add(normalize_label(candidate_label))
         for item_index in range(await batch_items.count()):
             item = batch_items.nth(item_index)
             label_node = item.locator(":scope > .sku-batch-item_label")
@@ -4759,6 +4774,14 @@ class TaobaoListing:
             source = _single_source(fields, (label,), f"SKU {label}")
             select_count = await item.locator(".el-select").count()
             if select_count == 0:
+                if normalize_label(label) in select_labels:
+                    if self.logger is not None:
+                        self.logger.info(
+                            "%s SKU 批量字段“%s”存在下拉控件，跳过同名文本框",
+                            self._platform_display_name,
+                            label,
+                        )
+                    continue
                 if source is not None:
                     _source_key, source_value = source
                     dynamic_values[label] = await self._fill_batch_text(
