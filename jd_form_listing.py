@@ -1264,9 +1264,13 @@ class JdFormListing(YouzanFormListing):
         if await menus.count() == 0:
             return None
         root_menu = menus.first
-        root_nodes = root_menu.locator(":scope > .el-cascader-node")
+        # Element UI renders nodes inside a <ul> in production, while some
+        # compatible builds place them directly under the menu.  Use the same
+        # descendant selector for both shapes; the old direct-child selector
+        # silently produced no paths and fell back to the incomplete menu walk.
+        root_nodes = root_menu.locator(".el-cascader-node")
         roots = await root_menu.evaluate(
-            """element => Array.from(element.querySelectorAll(':scope > .el-cascader-node'))
+            """element => Array.from(element.querySelectorAll('.el-cascader-node'))
               .map((node, index) => ({
                 name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
                 index: String(index),
@@ -1292,7 +1296,7 @@ class JdFormListing(YouzanFormListing):
                 continue
             child_menu = menus.last
             children = await child_menu.evaluate(
-                """element => Array.from(element.querySelectorAll(':scope > .el-cascader-node'))
+                """element => Array.from(element.querySelectorAll('.el-cascader-node'))
                   .map(node => ({
                     name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
                     hasChildren: Boolean(node.querySelector('.el-icon-arrow-right'))
