@@ -405,16 +405,36 @@ def jd_category_target(fields: Mapping[str, str]) -> Tuple[Tuple[str, ...], str]
 
 
 def _jd_category_matches(current: str, hints: Sequence[str], target: str) -> bool:
-    if _category_parts(current)[-1:] == (normalize_label(target),):
+    parts = _category_parts(current)
+    if parts[-1:] == (normalize_label(target),):
         return True
     # 男鞋平台类目可使用 Excel 的其它 OR 备选；保留男鞋分支约束。
-    if not any("男鞋" in hint for hint in hints):
+    if any("男鞋" in hint for hint in hints):
+        return bool(
+            len(parts) >= 3
+            and any(part in {"男鞋", "流行男鞋"} for part in parts[:-1])
+            and parts[-1] in {normalize_label(hint) for hint in hints}
+        )
+
+    # JD may already have a compatible leaf selected while its search API
+    # does not expose the supplier's most specific wording (for example,
+    # Excel “毛针织开衫” while the page has “男士套头毛衣/针织衫”). Keep the
+    # existing category when the gender branch matches and one of the final
+    # category segments contains an Excel category hint.
+    hint_text = " ".join(str(hint) for hint in hints)
+    if any(marker in hint_text for marker in ("男装", "男士")) and not any(
+        marker in part for part in parts for marker in ("男装", "男士")
+    ):
         return False
-    parts = _category_parts(current)
-    return bool(
-        len(parts) >= 3
-        and any(part in {"男鞋", "流行男鞋"} for part in parts[:-1])
-        and parts[-1] in {normalize_label(hint) for hint in hints}
+    if any(marker in hint_text for marker in ("女装", "女士")) and not any(
+        marker in part for part in parts for marker in ("女装", "女士")
+    ):
+        return False
+    normalized_hints = tuple(normalize_label(hint) for hint in hints)
+    return any(
+        hint == part or hint in part or part in hint
+        for part in parts[-2:]
+        for hint in normalized_hints
     )
 
 
@@ -1434,6 +1454,11 @@ class JdFormListing(YouzanFormListing):
         except JdFormListingError:
             current = ""
         if _jd_category_matches(current, category_hints, target):
+            if self.logger is not None:
+                self.logger.info(
+                    "京东已有类目与 Excel 类目兼容，保留当前类目：%s",
+                    current,
+                )
             return {
                 "hints": category_hints,
                 "target": target,

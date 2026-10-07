@@ -43,6 +43,26 @@ class JdFormListingHelperTests(unittest.TestCase):
         self.assertFalse(_jd_category_matches("鞋靴 > 流行男鞋 > 男士凉鞋", hints, target))
         self.assertFalse(_jd_category_matches("鞋靴 > 流行男鞋", hints, target))
 
+    def test_mens_sweater_category_accepts_compatible_existing_leaf(self):
+        hints, target = jd_category_target({
+            "商品分类": "服装 > 男装 > 针织衫/毛衣/羊毛衫/毛针织开衫/开衫毛衣"
+        })
+        self.assertEqual(target, "毛针织开衫")
+        self.assertTrue(
+            _jd_category_matches(
+                "服饰内衣 > 男装 > 男士毛衣/针织衫 > 男士套头毛衣/针织衫",
+                hints,
+                target,
+            )
+        )
+        self.assertFalse(
+            _jd_category_matches(
+                "服饰内衣 > 女装 > 女士毛衣/针织衫 > 女士套头毛衣/针织衫",
+                hints,
+                target,
+            )
+        )
+
     def test_numeric_equal(self):
         self.assertTrue(_numeric_equal("100", "100"))
         self.assertTrue(_numeric_equal("100.00", "100"))
