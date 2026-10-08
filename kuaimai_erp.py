@@ -3566,7 +3566,11 @@ async def click_save_and_confirm(
         if await visible(duplicate_dialog.first):
             raise AutomationError("保存时出现编码重复确认框，程序未自动创建新编码，请人工复核")
 
-        if time.monotonic() - started_at > 3:
+        # 保存成功提示可能在页面切回基础资料后才出现；此时抽屉里还会
+        # 留有基础资料的“待完善”错误（例如“价格库存列表必填”）。
+        # 一旦观察到本次保存成功提示，先完成提示稳定确认，不要让这类
+        # 无关的残留错误抢先把已成功的保存判成失败。
+        if time.monotonic() - started_at > 3 and success_toast_seen_at is None:
             errors = await collect_visible_errors(drawer)
             if errors:
                 raise AutomationError(f"“{button_text}”被页面校验拦截：" + "；".join(errors))

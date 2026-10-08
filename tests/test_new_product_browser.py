@@ -182,6 +182,37 @@ class BrowserTemplateTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_save_success_toast_wins_over_stale_form_error(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('''
+                  <div id="drawer">
+                    <div class="el-form-item__error">必填；请正确填写价格库存列表</div>
+                    <div class="drawer-footer">
+                      <button onclick="setTimeout(() => {
+                        const toast = document.createElement('div');
+                        toast.className = 'el-message--success';
+                        toast.textContent = '保存成功';
+                        document.body.append(toast);
+                      }, 3100)">保存</button>
+                    </div>
+                  </div>
+                ''')
+
+                result = await erp.click_save_and_confirm(
+                    page,
+                    page.locator('#drawer'),
+                    False,
+                    6,
+                    logging.getLogger('save-browser-test'),
+                )
+
+                self.assertEqual(result['confirmed_by'], 'toast')
+            finally:
+                await browser.close()
+
     async def test_new_product_colors_follow_excel_order(self):
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(channel='chrome', headless=True)
