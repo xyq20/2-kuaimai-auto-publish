@@ -1311,6 +1311,130 @@ class JdFormListing(YouzanFormListing):
                 return
             await asyncio.sleep(0.05)
 
+    async def _select_cascader_path(
+        self,
+        cascader: Any,
+        path: Sequence[str],
+        label: str,
+    ) -> Tuple[str, ...]:
+        """Select one previously enumerated cascader path by its labels."""
+        chosen_path = tuple(str(value).strip() for value in path if str(value).strip())
+        if not chosen_path:
+            raise JdFormListingError("京东属性{0}审核结果没有有效级联路径".format(label))
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await self._open_cascader(cascader)
+        for depth, expected in enumerate(chosen_path):
+            options = await self._visible_cascader_menu_options(0 if depth == 0 else -1)
+            chosen = self._match_cascader_option(options, (expected,))
+            if chosen is None:
+                raise JdFormListingError(
+                    f"京东属性{label}审核路径回选失败：{' > '.join(chosen_path)}"
+                )
+            menus = self.page.locator(".el-cascader-menu:visible")
+            menu = menus.first if depth == 0 else menus.last
+            await self._click_cascader_node_stably(
+                menu.locator(".el-cascader-node").nth(int(chosen["index"]))
+            )
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return chosen_path
+
+    async def _review_unmatched_cascader_leaves(
+        self,
+        cascader: Any,
+        paths: Sequence[Tuple[str, ...]],
+        expected: str,
+        label: str,
+    ) -> Optional[Tuple[str, ...]]:
+        """Send every discovered leaf path to review when Excel misses it.
+
+        JD's style control is a cascader, so a missing Excel leaf cannot be
+        represented by the ordinary select resolver.  Keep the complete path
+        in the review label (including its parent) and use a stable DOM ID;
+        this lets the operator choose a duplicate leaf unambiguously and lets
+        the confirmed result be clicked back through the real cascader.
+        """
+        runtime = getattr(self, "attribute_runtime", None)
+        if runtime is None:
+            return None
+        unique_paths = tuple(dict.fromkeys(
+            tuple(str(value).strip() for value in path if str(value).strip())
+            for path in paths
+            if any(str(value).strip() for value in path)
+        ))
+        if not unique_paths:
+            return None
+        try:
+            _field, category_id = await self._captured_api_field(label)
+        except JdFormListingError:
+            category_id = "dom:" + canonical_sha256(
+                {"platform_id": "jd", "field_label": label, "paths": unique_paths}
+            )[:20]
+            field_id = "dom:" + normalize_label(label)
+        else:
+            field_id = str(_field.source_id or "").strip() or (
+                "dom:" + normalize_label(label)
+            )
+        candidates = tuple(
+            CandidateValue(
+                "dom:" + canonical_sha256(
+                    {"platform_id": "jd", "field_label": label, "path": path}
+                )[:20],
+                " > ".join(path),
+            )
+            for path in unique_paths
+        )
+        schema_version = canonical_sha256({
+            "platform_id": "jd",
+            "category_leaf_id": category_id,
+            "field_id": field_id,
+            "options": [
+                {"value_id": value.value_id, "label": value.label}
+                for value in candidates
+            ],
+        })
+        self._last_cascader_review_submitted = True
+        resolved = await runtime.resolve(
+            AttributeRequest(
+                platform_id="jd",
+                category_leaf_id=category_id,
+                field_id=field_id,
+                field_label=label,
+                candidates=candidates,
+                excel_value=str(expected).strip(),
+                evidence={
+                    "excel": bool(str(expected).strip()),
+                    "live_dom": True,
+                    "cascader": True,
+                    "force_review": True,
+                },
+                custom_allowed=False,
+                schema_version=schema_version,
+                control_type="select",
+            )
+        )
+        if resolved is None or getattr(resolved, "is_no_fill", False):
+            return None
+        matches = tuple(
+            path
+            for path, candidate in zip(unique_paths, candidates)
+            if str(resolved.value_id) == candidate.value_id
+            or normalize_option(str(resolved.label))
+            == normalize_option(candidate.label)
+        )
+        if len(matches) != 1:
+            raise JdFormListingError(
+                "京东属性{0}审核结果不在当前末级候选中：{1}".format(
+                    label, getattr(resolved, "label", "")
+                )
+            )
+        return await self._select_cascader_path(cascader, matches[0], label)
+
     async def _select_cascader_from_all_menus(
         self,
         cascader: Any,
@@ -1344,9 +1468,10 @@ class JdFormListing(YouzanFormListing):
               .map((node, index) => ({
                 name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
                 index: String(index),
-                hasChildren: Boolean(node.querySelector('.el-icon-arrow-right'))
+                hasChildren: Boolean(node.querySelector('.el-icon-arrow-right')),
+                disabled: node.classList.contains('is-disabled')
               }))
-              .filter(item => item.name.trim())"""
+              .filter(item => item.name.trim() && !item.disabled)"""
         )
         paths: List[Tuple[str, ...]] = []
         for root_index, root in enumerate(roots):
@@ -1394,9 +1519,10 @@ class JdFormListing(YouzanFormListing):
                 """element => Array.from(element.querySelectorAll('.el-cascader-node'))
                   .map(node => ({
                     name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
-                    hasChildren: Boolean(node.querySelector('.el-icon-arrow-right'))
+                    hasChildren: Boolean(node.querySelector('.el-icon-arrow-right')),
+                    disabled: node.classList.contains('is-disabled')
                   }))
-                  .filter(item => item.name.trim())"""
+                  .filter(item => item.name.trim() && !item.disabled)"""
             )
             paths.extend(
                 (str(root["name"]).strip(), str(child["name"]).strip())
@@ -1408,6 +1534,7 @@ class JdFormListing(YouzanFormListing):
             (path for path in paths if normalize_option(path[-1]) in wanted),
             None,
         )
+        self._last_cascader_paths = tuple(dict.fromkeys(paths))
         if chosen_path is None:
             try:
                 await self.page.keyboard.press("Escape")
@@ -1458,6 +1585,8 @@ class JdFormListing(YouzanFormListing):
         if not groups:
             return None
         await cascader.scroll_into_view_if_needed()
+        self._last_cascader_paths = ()
+        self._last_cascader_review_submitted = False
         flattened_candidates = tuple(
             candidate
             for group in groups
@@ -1470,6 +1599,31 @@ class JdFormListing(YouzanFormListing):
         )
         if expanded_path is not None:
             return expanded_path
+        # 风格是平台级联字段。若 Excel 的最后一级名称不在当前完整菜单
+        # 中，保留所有末级路径交给审核，避免把“没有精确候选”直接升级成
+        # 页面错误；审核确认后再按真实父子菜单路径回选。
+        if normalize_label(label) == normalize_label("风格"):
+            reviewed_path = await self._review_unmatched_cascader_leaves(
+                cascader,
+                getattr(self, "_last_cascader_paths", ()),
+                "/".join(
+                    str(value).strip()
+                    for group in groups
+                    for value in group
+                    if str(value).strip()
+                ),
+                label,
+            )
+            if reviewed_path is not None:
+                if self.logger is not None:
+                    self.logger.info(
+                        "京东属性%s审核确认末级候选并回选：%s",
+                        label,
+                        " > ".join(reviewed_path),
+                    )
+                return reviewed_path
+            if getattr(self, "attribute_runtime", None) is not None:
+                return None
         await self._open_cascader(cascader)
         chosen_values: List[str] = []
         leftover: Tuple[str, ...] = ()
@@ -2301,7 +2455,23 @@ class JdFormListing(YouzanFormListing):
                 label=page_label,
             )
             if actual is None:
-                if required:
+                runtime = getattr(self, "attribute_runtime", None)
+                review_pending = bool(
+                    getattr(self, "_last_cascader_review_submitted", False)
+                    or (
+                        runtime is not None
+                        and (
+                            getattr(runtime, "has_deferred_reviews", False)
+                            or (
+                                callable(getattr(runtime, "review_pending_or_omitted", None))
+                                and runtime.review_pending_or_omitted(
+                                    self.attribute_platform_id, page_label
+                                )
+                            )
+                        )
+                    )
+                )
+                if required and not review_pending:
                     raise JdFormListingError("京东属性{0}没有 Excel 精确候选".format(page_label))
                 return None
             return actual

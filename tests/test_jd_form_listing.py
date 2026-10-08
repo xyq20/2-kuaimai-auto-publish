@@ -841,6 +841,62 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(actual, ("潮流风", "街头风"))
 
+    async def test_style_missing_leaf_lists_all_paths_for_review(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                return None
+
+        runtime = Runtime()
+        listing = await self._open(STYLE_CASCADER_FIXTURE)
+        listing.attribute_runtime = runtime
+        item = self.page.locator(".el-form-item").first
+
+        actual = await listing._fill_attribute_item(
+            "风格", item, "美式休闲风", required=True
+        )
+
+        self.assertIsNone(actual)
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertTrue(request.evidence["force_review"])
+        self.assertEqual(
+            tuple(candidate.label for candidate in request.candidates),
+            (
+                "休闲风 > 简约风",
+                "休闲风 > oversize",
+                "工装 > 机能",
+            ),
+        )
+
+    async def test_style_review_choice_reselects_confirmed_full_path(self):
+        class Runtime:
+            async def resolve(self, request):
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == "工装 > 机能"
+                )
+                return ResolvedAttribute(
+                    chosen.value_id, chosen.label, "human_override", "snapshot"
+                )
+
+        listing = await self._open(STYLE_CASCADER_FIXTURE)
+        listing.attribute_runtime = Runtime()
+        actual = await listing._fill_attribute_item(
+            "风格", self.page.locator(".el-form-item").first,
+            "美式休闲风", required=True
+        )
+
+        self.assertEqual(actual, ("工装", "机能"))
+        self.assertEqual(
+            await self.page.locator(".el-cascader input").input_value(),
+            "工装 / 机能",
+        )
+
     async def test_learning_uses_jd_api_ids_and_dom_cross_check(self):
         class Runtime:
             def __init__(self):
