@@ -1063,14 +1063,24 @@ class WxsphFormListing(YouzanFormListing):
     async def _category_text(self) -> str:
         if self.panel is None:
             raise WxsphFormListingError("请先打开微信小店资料")
-        container = self.panel.locator(".platform-category-input")
+        container = self.panel.locator(".platform-category-input:visible")
         if await container.count() == 1:
             text = await container.evaluate("""node => Array.from(node.childNodes)
                 .filter(n => n.nodeType === Node.TEXT_NODE)
                 .map(n => n.textContent).join(' ').trim()""")
             if text:
                 return re.sub(r"\s+", " ", text).strip()
-        return await super()._category_text()
+            # An existing but empty category control is normal on first use.
+            # Let recommendation/Excel selection initialize it instead of
+            # delegating zero paths to Youzan's strict persisted-path reader.
+            paths = container.locator(".current:visible, .category-path:visible")
+            values = {
+                re.sub(r"\s+", " ", (await paths.nth(i).inner_text()).strip())
+                for i in range(await paths.count())
+            } - {""}
+            if not values:
+                return ""
+        return await self._raise_as_wxsph(super()._category_text())
 
     async def _validate_category_readback(self, expected: str) -> str:
         deadline = asyncio.get_running_loop().time() + 10

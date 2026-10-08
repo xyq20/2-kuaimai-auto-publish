@@ -42,6 +42,28 @@ class WxsphCategoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.evaluate('window.terms'), [])
         self.assertEqual(self.listing.category_selection['source'], 'validated_recommendation')
 
+    async def test_empty_current_category_uses_recommendation(self):
+        await self.page.locator('.current').evaluate("n=>n.textContent=''")
+        self.assertEqual(await self.listing.apply_recommended_category(),
+                         '服饰内衣 > 男装 > 裤装 > 牛仔裤')
+        self.assertEqual(self.listing.category_selection['previous'], '')
+        self.assertEqual(self.listing.category_selection['source'], 'validated_recommendation')
+        self.assertEqual(await self.page.evaluate('window.terms'), [])
+
+    async def test_empty_current_category_without_recommendation_searches_excel(self):
+        await self.page.locator('.current').evaluate("n=>n.textContent=''")
+        await self.page.locator('.recommendation').evaluate('n=>n.remove()')
+        self.assertEqual(await self.listing.apply_recommended_category(),
+                         '服饰内衣 > 男装 > 裤装 > 牛仔裤')
+        self.assertEqual(await self.page.evaluate('window.terms'), ['牛仔裤'])
+        self.assertEqual(self.listing.category_selection['source'], 'excel_search')
+
+    async def test_ambiguous_current_category_reports_wechat_error(self):
+        await self.page.locator('.platform-category-input').evaluate(
+            "n=>n.insertAdjacentHTML('beforeend', '<span class=category-path>服饰内衣 > 男装 > 毛衣</span>')")
+        with self.assertRaisesRegex(WxsphFormListingError, '微信小店'):
+            await self.listing._category_text()
+
     async def test_wrong_recommendation_does_not_preserve_wrong_current(self):
         await self.page.locator('.path').evaluate("n=>n.textContent='服饰内衣 > 男装 > 裤装 > 工装裤'")
         self.assertEqual(await self.listing.apply_recommended_category(), '服饰内衣 > 男装 > 裤装 > 牛仔裤')
