@@ -789,38 +789,122 @@ class WxsphFormListing(YouzanFormListing):
             value for value in await self._read_select_values(select, multi=False)
             if str(value).strip()
         )
-        if not current:
+        bound_before = await select.evaluate("""element => {
+          const component = element.__vue__
+            || element.__vueParentComponent?.proxy
+            || element.__vueParentComponent?.ctx;
+          if (!component) return [];
+          const result = [];
+          const append = value => {
+            if (value === undefined || value === null || value === '') return;
+            if (Array.isArray(value)) { value.forEach(append); return; }
+            if (typeof value === 'object') {
+              append(value.value ?? value.id ?? value.valueId);
+              append(value.currentLabel ?? value.label);
+              return;
+            }
+            result.push(String(value).trim());
+          };
+          append(component.value);
+          append(component.selected);
+          append(component.selectedLabel);
+          return [...new Set(result.filter(Boolean))];
+        }""")
+        if not current and not bound_before:
             return
-        clear = select.locator(".el-select__clear:visible")
-        if await clear.count() == 1:
-            await clear.click(timeout=3000)
-        else:
-            # The clear icon is often virtualized or duplicated by Element UI.
-            # Clear the live control through the DOM and emit the same events
-            # used by the form, so the model and subsequent validation see an
-            # intentional blank rather than the previous run's value.
-            await select.evaluate("""element => {
-              const input = element.querySelector('input.el-input__inner');
-              if (!input) return false;
-              const setter = Object.getOwnPropertyDescriptor(
-                HTMLInputElement.prototype, 'value'
-              )?.set;
-              if (setter) setter.call(input, '');
-              else input.value = '';
-              element.querySelectorAll('.el-select-dropdown__item.selected')
-                .forEach(option => option.classList.remove('selected'));
-              for (const type of ['input', 'change', 'blur']) {
-                input.dispatchEvent(new Event(type, {bubbles: true}));
-              }
-              return true;
-            }""")
+        # Element UI serializes the save request from its bound value. Clearing
+        # only the visible input lets a stale Vue value restore itself after
+        # the form is reopened, so clear the component model first.
+        cleared_bound_value = await select.evaluate("""async element => {
+          const component = element.__vue__
+            || element.__vueParentComponent?.proxy
+            || element.__vueParentComponent?.ctx;
+          if (!component) return false;
+          if (typeof component.deleteSelected === 'function') {
+            component.deleteSelected({stopPropagation() {}});
+          } else {
+            const nextValue = component.multiple ? [] : '';
+            component.value = nextValue;
+            if ('selected' in component) {
+              component.selected = component.multiple ? [] : {};
+            }
+            if ('selectedLabel' in component) component.selectedLabel = '';
+            if (typeof component.$emit === 'function') {
+              component.$emit('input', nextValue);
+              component.$emit('change', nextValue);
+              component.$emit('clear');
+            } else if (!('value' in component)) {
+              return false;
+            }
+          }
+          if (typeof component.$nextTick === 'function') {
+            await new Promise(resolve => component.$nextTick(resolve));
+          }
+          const input = element.querySelector('input.el-input__inner');
+          if (input && input.value) {
+            const setter = Object.getOwnPropertyDescriptor(
+              HTMLInputElement.prototype, 'value'
+            )?.set;
+            if (setter) setter.call(input, '');
+            else input.value = '';
+          }
+          element.querySelectorAll('.el-select-dropdown__item.selected')
+            .forEach(option => option.classList.remove('selected'));
+          return true;
+        }""")
+        if not cleared_bound_value:
+            clear = select.locator(".el-select__clear:visible")
+            if await clear.count() == 1:
+                await clear.click(timeout=3000)
+            else:
+                # The clear icon is often virtualized or duplicated by
+                # Element UI. Clear the live control through the DOM and emit
+                # the same events as a final fallback.
+                await select.evaluate("""element => {
+                  const input = element.querySelector('input.el-input__inner');
+                  if (!input) return false;
+                  const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                  )?.set;
+                  if (setter) setter.call(input, '');
+                  else input.value = '';
+                  element.querySelectorAll('.el-select-dropdown__item.selected')
+                    .forEach(option => option.classList.remove('selected'));
+                  for (const type of ['input', 'change', 'blur']) {
+                    input.dispatchEvent(new Event(type, {bubbles: true}));
+                  }
+                  return true;
+                }""")
         actual = tuple(
             value for value in await self._read_select_values(select, multi=False)
             if str(value).strip()
         )
-        if actual:
+        bound = await select.evaluate("""element => {
+          const component = element.__vue__
+            || element.__vueParentComponent?.proxy
+            || element.__vueParentComponent?.ctx;
+          if (!component) return [];
+          const result = [];
+          const append = value => {
+            if (value === undefined || value === null || value === '') return;
+            if (Array.isArray(value)) { value.forEach(append); return; }
+            if (typeof value === 'object') {
+              append(value.value ?? value.id ?? value.valueId);
+              append(value.currentLabel ?? value.label);
+              return;
+            }
+            result.push(String(value).trim());
+          };
+          append(component.value);
+          append(component.selected);
+          append(component.selectedLabel);
+          return [...new Set(result.filter(Boolean))];
+        }""")
+        if actual or bound:
             raise WxsphFormListingError(
-                "微信小店清空已审核不填写的单选属性失败：仍有 {0!r}".format(actual)
+                "微信小店清空已审核不填写的单选属性失败：仍有 {0!r}".format(
+                    actual or tuple(bound)
+                )
             )
 
     async def _apply_resolved_api_options(

@@ -132,6 +132,43 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         await listing._clear_single_select(self.page.locator(".el-select"))
         self.assertEqual(await self.page.locator(".el-input__inner").input_value(), "")
 
+    async def test_no_fill_clears_bound_value_before_save(self):
+        listing = await self._listing()
+        await self.page.set_content('<div class="el-select"><input class="el-input__inner" readonly value="2026年春季"></div>')
+        select = self.page.locator('.el-select')
+        await select.evaluate("""element => {
+          window.savedValue = 'spring';
+          element.__vue__ = {
+            value: 'spring',
+            deleteSelected() {
+              this.value = '';
+              window.savedValue = '';
+              element.querySelector('input').value = '';
+            }
+          };
+        }""")
+        await listing._clear_single_select(select)
+        self.assertEqual(await self.page.evaluate('window.savedValue'), '')
+        self.assertEqual(await select.evaluate('e => e.__vue__.value'), '')
+
+    async def test_no_fill_clears_hidden_bound_value_when_input_is_blank(self):
+        listing = await self._listing()
+        await self.page.set_content('<div class="el-select"><input class="el-input__inner" readonly value=""></div>')
+        select = self.page.locator('.el-select')
+        await select.evaluate("""element => {
+          window.savedValue = 'spring';
+          element.__vue__ = {
+            value: 'spring',
+            deleteSelected() {
+              this.value = '';
+              window.savedValue = '';
+            }
+          };
+        }""")
+        await listing._clear_single_select(select)
+        self.assertEqual(await self.page.evaluate('window.savedValue'), '')
+        self.assertEqual(await select.evaluate('e => e.__vue__.value'), '')
+
     async def test_collapsed_multi_clears_actual_selection_by_dom(self):
         await self.page.set_content('''<div id="select" class="el-select">
           <div class="el-select__tags"><span class="el-tag">已选择 1</span></div>
