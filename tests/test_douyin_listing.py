@@ -1854,6 +1854,28 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DouyinListingError, "SKU 行数不一致"):
             await self.listing.verify_persisted_values(*expected, 7)
 
+    async def test_saved_readback_ignores_reviewed_no_fill_attribute(self):
+        await self.listing.open()
+        fields = SimpleNamespace(short_title="复古工装裤", attributes={})
+        applied = await self.listing.apply_category_and_fields(fields)
+        await self.listing.fill_text_field("商品标题", "复古水洗工装裤")
+        await self.listing.fill_sku_price_inventory("586", 0, 100)
+
+        attributes = dict(applied["attributes"])
+        attributes["适用年龄"] = None
+        persisted = await self.listing.verify_persisted_values(
+            applied["category"],
+            "复古水洗工装裤",
+            applied["short_title"],
+            attributes,
+            "586",
+            0,
+            100,
+            5,
+        )
+
+        self.assertNotIn("适用年龄", persisted["attributes"])
+
     async def test_apply_category_and_fields_maps_historical_trouser_fly_typo(self):
         await self.listing.open()
         fields = SimpleNamespace(

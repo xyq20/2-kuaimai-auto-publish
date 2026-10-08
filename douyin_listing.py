@@ -2200,7 +2200,9 @@ class DouyinListing:
             self.logger.info("抖音属性“%s”：回读完成", label)
         return actual
 
-    async def fill_attribute(self, label: str, expected: str) -> Tuple[str, ...]:
+    async def fill_attribute(
+        self, label: str, expected: str
+    ) -> Optional[Tuple[str, ...]]:
         """在指定属性内精确选择；斜杠表示从左到右的 OR 候选。"""
         item = await self._attribute_item(label)
         await item.scroll_into_view_if_needed()
@@ -2517,7 +2519,7 @@ class DouyinListing:
         category: object,
         product_title: object,
         short_title: object,
-        attributes: Mapping[str, Sequence[object]],
+        attributes: Mapping[str, Optional[Sequence[object]]],
         price: object,
         spot_stock: object,
         presale_stock: object,
@@ -2546,6 +2548,15 @@ class DouyinListing:
 
         actual_attributes: Dict[str, Tuple[str, ...]] = {}
         for label, expected_values in attributes.items():
+            if expected_values is None:
+                # Backward-compatible guard for reports created before
+                # reviewed “不填写” values were removed from ``attributes``.
+                if self.logger is not None:
+                    self.logger.info(
+                        "抖音字段“%s”没有回读目标值，按审核不填写处理",
+                        label,
+                    )
+                continue
             expected = tuple(str(value) for value in expected_values)
             if _normalize_label(str(label)) == _normalize_label("货号"):
                 actual = (await self.read_plain_text_field(str(label)),)
@@ -2670,10 +2681,23 @@ class DouyinListing:
             if self.logger is not None:
                 self.logger.info("正在填写抖音属性：%s", page_label)
             try:
-                applied[page_label] = await asyncio.wait_for(
+                resolved_value = await asyncio.wait_for(
                     self.fill_attribute(page_label, str(value)),
                     timeout=ATTRIBUTE_OPERATION_TIMEOUT_SECONDS,
                 )
+                if resolved_value is None:
+                    # An explicit review decision may be “不填写”. Keep this
+                    # field out of the persisted-value contract; representing
+                    # it as ``None`` makes saved readback crash before it can
+                    # report the actual page state.
+                    skipped_values[page_label] = str(value)
+                    if self.logger is not None:
+                        self.logger.info(
+                            "抖音属性“%s”按审核结果不填写，已从回读目标移除",
+                            page_label,
+                        )
+                else:
+                    applied[page_label] = resolved_value
             except asyncio.TimeoutError as exc:
                 raise DouyinListingError(
                     f"抖音属性“{page_label}”填写或回读超过 "
