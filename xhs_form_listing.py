@@ -981,6 +981,34 @@ class XhsFormListing(TaobaoListing):
             and re.match(r"^\s*\*", (await label.inner_text()).strip())
         )
 
+    async def _find_attribute_item_anywhere(self, page_label: str) -> Any:
+        """Find a uniquely labelled attribute even when it is outside the
+        normal 商品属性/价格库存 bounds.
+
+        XHS moves some category-dependent fields (notably 裤长) into a
+        separate SKU/details block.  The bounded attribute scan intentionally
+        ignores that block, so use an exact visible label lookup as a
+        compatibility fallback rather than treating the missing field as an
+        optional omission.
+        """
+        if self.panel is None:
+            raise XhsFormListingError("请先调用 open() 打开小红书资料")
+        target = normalize_label(page_label)
+        matches = []
+        for index in range(await self.panel.locator(".el-form-item:visible").count()):
+            item = self.panel.locator(".el-form-item:visible").nth(index)
+            label = item.locator(".el-form-item__label").first
+            if not await label.count() or not await label.is_visible():
+                continue
+            text = re.sub(r"^\s*\*\s*", "", (await label.inner_text()).strip())
+            if normalize_label(text) == target:
+                matches.append(item)
+        if len(matches) > 1:
+            raise XhsFormListingError(
+                "小红书属性“{0}”输入项不是唯一项：{1}".format(page_label, len(matches))
+            )
+        return matches[0] if matches else None
+
     async def _attribute_assignments(
         self,
         fields: Mapping[str, str],
@@ -1373,6 +1401,41 @@ class XhsFormListing(TaobaoListing):
                 skipped[page_label] = expected
             else:
                 applied[page_label] = actual
+
+        # Some XHS pants categories render 裤长 outside the bounded category
+        # attribute section.  It still remains a required page field, so fill
+        # it by its unique label when the normal scan did not see it.
+        pants_label = "裤长"
+        pants_value = next(
+            (
+                str(value).strip()
+                for key, value in fields.fields.items()
+                if normalize_label(str(key)) == normalize_label(pants_label)
+                and str(value).strip()
+            ),
+            "",
+        )
+        if pants_value and normalize_label(pants_label) not in {
+            normalize_label(label) for label in applied
+        }:
+            pants_item = await self._find_attribute_item_anywhere(pants_label)
+            if pants_item is not None:
+                actual = await self._fill_attribute(
+                    pants_label,
+                    pants_item,
+                    pants_value,
+                    exact_values=self._special_attribute_values(
+                        fields.fields, pants_label, pants_value
+                    ),
+                    required=True,
+                )
+                if actual is not None:
+                    applied[pants_label] = actual
+                    if self.logger is not None:
+                        self.logger.info(
+                            "小红书属性“裤长”已通过跨区域兼容定位填写：%s",
+                            "/".join(actual),
+                        )
         if self.logger is not None:
             self.logger.info("小红书类目属性填写完成：已填 %s 项", len(applied))
         return {
