@@ -792,11 +792,28 @@ class WxsphFormListing(YouzanFormListing):
         if not current:
             return
         clear = select.locator(".el-select__clear:visible")
-        if await clear.count() != 1:
-            raise WxsphFormListingError(
-                "微信小店无法清空已审核不填写的单选属性：清空按钮不是唯一项"
-            )
-        await clear.click(timeout=3000)
+        if await clear.count() == 1:
+            await clear.click(timeout=3000)
+        else:
+            # The clear icon is often virtualized or duplicated by Element UI.
+            # Clear the live control through the DOM and emit the same events
+            # used by the form, so the model and subsequent validation see an
+            # intentional blank rather than the previous run's value.
+            await select.evaluate("""element => {
+              const input = element.querySelector('input.el-input__inner');
+              if (!input) return false;
+              const setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype, 'value'
+              )?.set;
+              if (setter) setter.call(input, '');
+              else input.value = '';
+              element.querySelectorAll('.el-select-dropdown__item.selected')
+                .forEach(option => option.classList.remove('selected'));
+              for (const type of ['input', 'change', 'blur']) {
+                input.dispatchEvent(new Event(type, {bubbles: true}));
+              }
+              return true;
+            }""")
         actual = tuple(
             value for value in await self._read_select_values(select, multi=False)
             if str(value).strip()

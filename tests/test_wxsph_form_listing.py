@@ -123,6 +123,15 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
             await self.page.locator("#listing-date .el-select input").input_value(), ""
         )
 
+    async def test_reviewed_no_fill_clears_single_select_without_clear_icon(self):
+        listing = await self._listing()
+        await self.page.set_content(
+            '<div class="el-select"><input class="el-input__inner" readonly value="2026年春季">'
+            '<div class="el-select-dropdown"><ul><li class="el-select-dropdown__item selected">2026年春季</li></ul></div></div>'
+        )
+        await listing._clear_single_select(self.page.locator(".el-select"))
+        self.assertEqual(await self.page.locator(".el-input__inner").input_value(), "")
+
     async def test_collapsed_multi_clears_actual_selection_by_dom(self):
         await self.page.set_content('''<div id="select" class="el-select">
           <div class="el-select__tags"><span class="el-tag">已选择 1</span></div>
