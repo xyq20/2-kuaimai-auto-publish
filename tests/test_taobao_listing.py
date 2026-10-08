@@ -1656,6 +1656,19 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual["values"]["裤长"], "长裤")
         self.assertTrue(all(row["裤长"] == "长裤" for row in actual["rows"]))
 
+    async def test_sku_batch_validation_uses_duplicate_pants_column_with_value(self):
+        snapshot = {
+            "headers": ("价格", "数量", "裤型", "裤型"),
+            "rows": (("399", "100", "直筒裤", ""),),
+        }
+
+        rows = self.listing._validate_sku_snapshot(
+            snapshot,
+            {"价格": "399", "数量": "100", "裤型": "直筒裤"},
+        )
+
+        self.assertEqual(rows[0]["裤型"], "直筒裤")
+
     async def test_sku_batch_collects_every_unprovided_live_select_before_review(self):
         class Runtime:
             def __init__(self):

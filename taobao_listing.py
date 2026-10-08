@@ -4695,6 +4695,46 @@ class TaobaoListing:
             )
         return matches[0]
 
+    @classmethod
+    def _sku_column_index_for_snapshot(
+        cls,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        label: str,
+        expected: str,
+    ) -> int:
+        """Choose a duplicate pants column from the values actually rendered.
+
+        淘宝裤装 SKU 表格会同时输出同名的展示列和下拉列。列顺序并不
+        固定，单纯取最后一列会在某些类目读到空的兼容列。
+        """
+        wanted = normalize_label(label)
+        matches = [
+            index
+            for index, header in enumerate(headers)
+            if normalize_label(header) == wanted
+            or normalize_label(header).startswith(wanted)
+        ]
+        if wanted != normalize_label("裤型") or len(matches) <= 1:
+            return cls._sku_column_index(headers, label, prefer_last_duplicate=True)
+
+        expected_value = normalize_option(expected)
+        scores = []
+        for index in matches:
+            score = sum(
+                1
+                for row in rows
+                if index < len(row)
+                and normalize_option(row[index]) == expected_value
+            )
+            scores.append((score, index))
+        best_score = max(score for score, _index in scores)
+        if best_score > 0:
+            best = [index for score, index in scores if score == best_score]
+            return best[0]
+        # 保持原有错误路径，确保所有候选都为空时仍能报告真实回读失败。
+        return matches[-1]
+
     @staticmethod
     def _numeric_equal(actual: str, expected: str) -> bool:
         try:
@@ -4712,8 +4752,12 @@ class TaobaoListing:
         if not raw_rows:
             raise TaobaoListingError("淘宝 SKU 表格没有可校验的明细行")
         indices = {
-            label: self._sku_column_index(
-                headers, label, prefer_last_duplicate=True
+            label: (
+                self._sku_column_index_for_snapshot(
+                    headers, raw_rows, label, expected[label]
+                )
+                if normalize_label(label) == normalize_label("裤型")
+                else self._sku_column_index(headers, label)
             )
             for label in expected
         }
