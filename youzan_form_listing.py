@@ -19,7 +19,11 @@ from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest
 from canonical_fields import is_learning_managed_field
-from category_profile import category_search_terms
+from category_profile import (
+    category_input_levels,
+    category_path_levels,
+    category_search_terms,
+)
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from platform_candidate_source import (
@@ -140,10 +144,15 @@ def _required_excel_value(
 
 def _category_parts(value: object) -> Tuple[str, ...]:
     return tuple(
-        normalize_label(part)
-        for part in re.split(r"[>＞/／]", str(value or ""))
-        if normalize_label(part)
+        "/".join(normalize_label(option) for option in level)
+        for level in category_path_levels(value)
+        if level
     )
+
+
+def _category_leaf_options(value: object) -> Tuple[str, ...]:
+    levels = category_path_levels(value)
+    return tuple(levels[-1]) if levels else ()
 
 
 def choose_youzan_category_text(
@@ -163,7 +172,10 @@ def choose_youzan_category_text(
 
 
 def matching_youzan_category_texts(
-    result_texts: Sequence[str], category_hints: Sequence[str]
+    result_texts: Sequence[str],
+    category_hints: Sequence[str],
+    *,
+    leaf_hints: Optional[Sequence[str]] = None,
 ) -> Tuple[str, Tuple[str, ...]]:
     """Return the first non-empty exact-leaf candidate group.
 
@@ -172,14 +184,14 @@ def matching_youzan_category_texts(
     unclassified error or guessing one path.
     """
 
-    for hint in category_search_terms(category_hints):
+    hints = leaf_hints if leaf_hints is not None else category_hints
+    for hint in category_search_terms(hints):
         wanted = normalize_label(hint)
         matches = tuple(
             dict.fromkeys(
                 text
                 for text in result_texts
-                if _category_parts(text)
-                and _category_parts(text)[-1] == wanted
+                if wanted in _category_leaf_options(text)
             )
         )
         if matches:
@@ -530,7 +542,7 @@ class YouzanFormListing(TaobaoListing):
                     walk(child)
                 return
             if isinstance(value, str) and len(_category_parts(value)) >= 2:
-                add(re.split(r"[>＞/／]", value))
+                add(re.split(r"[>＞]", value))
 
         walk(payload)
         return tuple(paths)
@@ -590,7 +602,18 @@ class YouzanFormListing(TaobaoListing):
             raise YouzanFormListingError("有赞“修改类目”按钮不是唯一项：{0}".format(await buttons.count()))
         await buttons.first.click()
         dialog = await self._category_dialog()
-        search_term = path[0]
+        levels = category_input_levels(" > ".join(path))
+        expanded_expression = any("/" in item for item in path)
+        leaf_hints = (
+            levels[-1]
+            if expanded_expression and levels
+            else path
+        )
+        search_term = (
+            str(leaf_hints[0]).strip()
+            if expanded_expression and leaf_hints
+            else path[0]
+        )
         search = await self._category_search_input(dialog)
         api_paths: List[str] = []
         api_urls: List[str] = []
@@ -625,9 +648,13 @@ class YouzanFormListing(TaobaoListing):
         try:
             while asyncio.get_running_loop().time() < deadline:
                 rows = await self._visible_category_rows()
-                api_hint, api_group = matching_youzan_category_texts(api_paths, path)
+                api_hint, api_group = matching_youzan_category_texts(
+                    api_paths, path, leaf_hints=leaf_hints
+                )
                 dom_hint, dom_group = matching_youzan_category_texts(
-                    tuple(text for text, _node in rows), path
+                    tuple(text for text, _node in rows),
+                    path,
+                    leaf_hints=leaf_hints,
                 )
                 api_by_path = {_category_parts(text): text for text in api_group}
                 dom_by_path = {
@@ -1734,13 +1761,37 @@ class YouzanFormListing(TaobaoListing):
         """Read critical values after save without changing the form."""
 
         actual_category = await self._category_text()
-        target = self._category_target_parts(fields.category_path[0])
+        expected_levels = category_input_levels(" > ".join(fields.category_path))
+        actual_levels = category_input_levels(actual_category)
         actual_parts = _category_parts(actual_category)
-        category_matches = (
-            actual_parts == target
-            if len(target) > 1
-            else bool(actual_parts) and actual_parts[-1] == target[0]
-        )
+        expected_leaf = {
+            normalize_label(option)
+            for option in (expected_levels[-1] if expected_levels else ())
+        }
+        actual_leaf = {
+            normalize_label(option)
+            for option in (actual_levels[-1] if actual_levels else ())
+        }
+        if not actual_leaf and actual_parts:
+            actual_leaf = {actual_parts[-1]}
+        # A supplier category can contain several same-level alternatives while
+        # the marketplace stores only the chosen leaf (for example
+        # ``休闲裤/男士休闲直筒裤/工装休闲裤`` -> ``休闲裤``).  Verify the
+        # persisted leaf against that candidate set instead of treating the
+        # alternatives as fabricated parent levels.
+        category_matches = bool(expected_leaf & actual_leaf)
+        if len(expected_levels) > 1 and category_matches:
+            expected_root = {
+                normalize_label(option) for option in expected_levels[0]
+            }
+            actual_flat = {
+                normalize_label(option)
+                for level in actual_levels
+                for option in level
+            }
+            category_matches = bool(expected_root & actual_flat) or (
+                len(expected_levels) == 1
+            )
         if not category_matches:
             raise YouzanFormListingError(
                 "有赞保存后类目回读失败：{0!r}".format(actual_category)

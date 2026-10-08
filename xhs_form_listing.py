@@ -21,7 +21,15 @@ from urllib.parse import parse_qs, urlsplit
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from attribute_runtime import AttributeRequest
-from category_profile import category_search_terms, is_footwear_category
+from category_profile import (
+    category_gender_roots,
+    category_input_hints,
+    category_input_levels,
+    category_input_variants,
+    category_path_levels,
+    category_search_terms,
+    is_footwear_category,
+)
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
@@ -611,13 +619,55 @@ class XhsFormListing(TaobaoListing):
         unique final leaf is still deterministic and is explicitly recorded in
         the report.  Any duplicate or incomplete result remains an error.
         """
-        expected = tuple(normalize_label(part) for part in category_path)
-        if len(expected) > 1 and "男鞋" in expected[0]:
-            result_texts = tuple(text for text in result_texts if len(_category_parts(text)) > 1)
+        expression = " > ".join(
+            str(part).strip() for part in category_path if str(part).strip()
+        )
+        expected_levels = category_input_levels(expression)
+        expected_variants = tuple(
+            tuple(normalize_label(part) for part in variant)
+            for variant in category_input_variants(expression)
+        )
+        if len(expected_levels) > 1 and any(
+            "男鞋" in normalize_label(option) for option in expected_levels[0]
+        ):
+            result_texts = tuple(
+                text for text in result_texts if len(_category_parts(text)) > 1
+            )
+
+        def candidate_levels(text: str):
+            return category_path_levels(text)
+
+        def contains_ordered(levels, expected):
+            cursor = 0
+            for wanted in expected:
+                while cursor < len(levels) and wanted not in levels[cursor]:
+                    cursor += 1
+                if cursor == len(levels):
+                    return False
+                cursor += 1
+            return True
+
+        gender_roots = {
+            normalize_label(root)
+            for root in category_gender_roots(category_input_hints(expression))
+        }
+
+        def has_gender(levels):
+            return not gender_roots or any(
+                root in option
+                for level in levels
+                for option in level
+                for root in gender_roots
+            )
+
         complete = [
             text
             for text in result_texts
-            if _contains_ordered_parts(_category_parts(text), expected)
+            if has_gender(candidate_levels(text))
+            and any(
+                contains_ordered(candidate_levels(text), expected)
+                for expected in expected_variants
+            )
         ]
         if len(complete) == 1:
             return complete[0], "full_ordered_path"
@@ -629,13 +679,21 @@ class XhsFormListing(TaobaoListing):
         # Platform taxonomies can omit a supplier-internal middle layer.  This
         # fallback still requires both Excel endpoints to be exact and unique;
         # it never selects merely because a string contains a category word.
-        if len(expected) >= 2:
+        if len(expected_levels) >= 2:
             root_leaf = [
                 text
                 for text in result_texts
-                if expected[0] in _category_parts(text)
-                and _category_parts(text)
-                and _category_parts(text)[-1] == expected[-1]
+                if candidate_levels(text)
+                and has_gender(candidate_levels(text))
+                and any(
+                    normalize_label(option) in candidate_level
+                    for candidate_level in candidate_levels(text)
+                    for option in expected_levels[0]
+                )
+                and any(
+                    normalize_label(option) in candidate_levels(text)[-1]
+                    for option in expected_levels[-1]
+                )
             ]
             if len(root_leaf) == 1:
                 return root_leaf[0], "first_and_leaf_exact"
@@ -649,26 +707,48 @@ class XhsFormListing(TaobaoListing):
         # New-category workbooks may list cross-platform category hints rather
         # than one marketplace path.  Try the most specific exact leaf first;
         # every accepted leaf must still be unique in the platform JSON.
-        for hint in category_search_terms(category_path):
+        # New Excel expressions keep slash alternatives in the final level.
+        # A legacy caller may still pass an already-expanded tuple; only that
+        # compatibility shape searches every hint, while real expressions stay
+        # constrained to their declared leaf alternatives.
+        has_peer_alternatives = any(
+            "/" in str(part) or "／" in str(part)
+            for part in category_path
+            if str(part).strip()
+        )
+        if has_peer_alternatives and expected_levels:
+            # In the new representation the final ``>`` level contains the
+            # authored same-level alternatives.  Keep that order so the first
+            # exact candidate wins deterministically.
+            fallback_hints = expected_levels[-1]
+        elif expected_levels:
+            # Legacy callers pass a flat hint tuple.  Prefer the most specific
+            # hint first; this preserves the historical outerwear behaviour
+            # without changing the new ``>``/``/`` grammar.
+            fallback_hints = category_search_terms(category_path)
+        else:
+            fallback_hints = category_path
+        for hint in fallback_hints:
             wanted = normalize_label(hint)
             leaf_matches = [
                 text
                 for text in result_texts
-                if _category_parts(text) and _category_parts(text)[-1] == wanted
+                if candidate_levels(text)
+                and has_gender(candidate_levels(text))
+                and wanted in candidate_levels(text)[-1]
             ]
             # Excel 类目有时携带“男士/女士”等供应商层级，而平台结果
             # 只保留“男装/女装”根类目。用人群根类目消除同名末级项，
             # 例如“卫衣”同时出现在女装、童装、运动和男装下。
-            gender_roots = ()
-            expected_text = " ".join(expected)
-            if "男士" in expected_text or "男装" in expected_text:
-                gender_roots = ("男装",)
-            elif "女士" in expected_text or "女装" in expected_text:
-                gender_roots = ("女装",)
             if len(leaf_matches) > 1 and gender_roots:
                 narrowed = [
                     text for text in leaf_matches
-                    if any(root in _category_parts(text) for root in gender_roots)
+                    if any(
+                        root in option
+                        for level in candidate_levels(text)
+                        for option in level
+                        for root in gender_roots
+                    )
                 ]
                 if len(narrowed) == 1:
                     return narrowed[0], "gender_root_exact_hint_leaf"
@@ -829,7 +909,10 @@ class XhsFormListing(TaobaoListing):
             # Only the actual search-result portal is scanned.  The page also
             # keeps a large cascader tree in the DOM; enumerating that tree was
             # the source of a 25+ second delay and is not valid click evidence.
-            search_term = path[-1] if "男鞋" in path[0] else path[0]
+            expected_levels = category_input_levels(" > ".join(path))
+            leaf_options = expected_levels[-1] if expected_levels else path
+            search_terms = category_search_terms(leaf_options)
+            search_term = search_terms[0] if search_terms else path[0]
             await search.fill(search_term, timeout=10_000)
             search_filled_at = asyncio.get_running_loop().time()
             target, target_text, strategy = await self._wait_for_category_result(
@@ -851,31 +934,45 @@ class XhsFormListing(TaobaoListing):
             if selected:
                 break
             await asyncio.sleep(0.1)
-        selected_parts = _category_parts(selected)
-        expected_parts = tuple(normalize_label(segment) for segment in path)
-        selected_ok = _contains_ordered_parts(selected_parts, expected_parts)
-        if strategy in {"first_and_leaf_exact", "gender_root_exact_hint_leaf"}:
-            selected_ok = (
-                (
-                    expected_parts[0] in selected_parts
-                    or (
-                        strategy == "gender_root_exact_hint_leaf"
-                        and any(root in selected_parts for root in ("男装", "女装"))
-                    )
-                )
-                and bool(selected_parts)
-                and (
-                    selected_parts[-1] == expected_parts[-1]
-                    or (
-                        strategy == "gender_root_exact_hint_leaf"
-                        and selected_parts[-1] in expected_parts
-                    )
-                )
-            )
-        elif strategy == "unique_exact_hint_leaf":
-            selected_ok = bool(selected_parts) and selected_parts[-1] in set(
-                expected_parts
-            )
+        selected_levels = category_path_levels(selected)
+        expected_expression = " > ".join(path)
+        expected_variants = tuple(
+            tuple(normalize_label(part) for part in variant)
+            for variant in category_input_variants(expected_expression)
+        )
+
+        def contains_ordered(levels, expected):
+            cursor = 0
+            for wanted in expected:
+                while cursor < len(levels) and wanted not in levels[cursor]:
+                    cursor += 1
+                if cursor == len(levels):
+                    return False
+                cursor += 1
+            return True
+
+        selected_ok = any(
+            contains_ordered(selected_levels, expected)
+            for expected in expected_variants
+        )
+        if not selected_ok and selected_levels:
+            expected_levels = category_input_levels(expected_expression)
+            expected_leaf = {
+                normalize_label(option)
+                for option in (expected_levels[-1] if expected_levels else ())
+            }
+            actual_leaf = set(selected_levels[-1])
+            gender_roots = {
+                normalize_label(root)
+                for root in category_gender_roots(category_input_hints(expected_expression))
+            }
+            actual_flat = {option for level in selected_levels for option in level}
+            root_match = bool(expected_levels and any(
+                normalize_label(option) in selected_levels[0]
+                for option in expected_levels[0]
+            ))
+            gender_match = not gender_roots or bool(gender_roots & actual_flat)
+            selected_ok = bool(expected_leaf & actual_leaf) and (root_match or gender_match)
         if not selected_ok:
             raise XhsFormListingError(
                 "小红书类目确认前路径不匹配：目标 {0}，页面为 {1!r}".format(

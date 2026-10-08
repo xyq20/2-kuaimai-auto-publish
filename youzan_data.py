@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from category_profile import is_footwear_category
+from category_profile import category_input_levels
 
 import re
 from collections.abc import Iterator, Mapping
@@ -75,11 +76,7 @@ def _category_values(fields: Mapping[str, Any]) -> Tuple[str, ...]:
 
 
 def _category_path(value: str) -> Tuple[str, ...]:
-    return tuple(
-        part.strip()
-        for part in re.split(r"[/／>＞]", value)
-        if part.strip()
-    )
+    return tuple("/".join(level) for level in category_input_levels(value))
 
 
 def parse_youzan_fields(fields: Mapping[str, Any]) -> YouzanFields:

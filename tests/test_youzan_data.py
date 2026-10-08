@@ -4,7 +4,7 @@ from youzan_data import parse_youzan_fields
 
 
 class YouzanDataTests(unittest.TestCase):
-    def test_preserves_fields_and_ordered_category(self):
+    def test_preserves_fields_and_same_level_category_alternatives(self):
         parsed = parse_youzan_fields(
             {
                 "商品分类": "休闲裤/男士休闲直筒裤/工装休闲裤",
@@ -15,7 +15,7 @@ class YouzanDataTests(unittest.TestCase):
 
         self.assertEqual(
             parsed.category_path,
-            ("休闲裤", "男士休闲直筒裤", "工装休闲裤"),
+            ("休闲裤/男士休闲直筒裤/工装休闲裤",),
         )
         self.assertEqual(parsed.fields["价格/一口价"], "586")
         self.assertEqual(parsed.fields["数量"], "100")

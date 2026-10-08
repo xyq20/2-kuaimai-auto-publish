@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest
 from canonical_fields import is_learning_managed_field
-from category_profile import preferred_category_leaf
+from category_profile import category_input_hints, preferred_category_leaf
 from douyin_data import MaterialComponent
 from jd_data import JdFields
 from learning_models import CandidateValue, canonical_sha256
@@ -384,11 +384,9 @@ def _category_parts(value: object) -> Tuple[str, ...]:
 
 def _jd_category_hints(fields: Mapping[str, str]) -> Tuple[str, ...]:
     raw_value = _required_excel_value(fields, ("商品分类",), "商品分类")
-    hints = tuple(
-        part.strip()
-        for part in re.split(r"[/／>＞]", raw_value)
-        if part.strip()
-    )
+    # Flatten only after parsing the expression: ``>`` is path context and
+    # ``/`` contributes peer alternatives, never deeper path levels.
+    hints = category_input_hints(raw_value)
     if not hints:
         raise JdFormListingError("Excel 京东商品分类没有可用提示词")
     return hints

@@ -1,6 +1,8 @@
 import unittest
 
 from category_profile import (
+    category_input_levels,
+    category_input_variants,
     category_profile,
     category_search_terms,
     choose_category_candidate,
@@ -11,6 +13,21 @@ from category_profile import (
 
 
 class CategoryProfileTests(unittest.TestCase):
+    def test_category_syntax_distinguishes_path_levels_from_peer_options(self):
+        expression = "服装 > 男装 > 针织衫/毛衣/羊毛衫"
+        self.assertEqual(
+            category_input_levels(expression),
+            (("服装",), ("男装",), ("针织衫", "毛衣", "羊毛衫")),
+        )
+        self.assertEqual(
+            category_input_variants(expression),
+            (
+                ("服装", "男装", "针织衫"),
+                ("服装", "男装", "毛衣"),
+                ("服装", "男装", "羊毛衫"),
+            ),
+        )
+
     def test_matching_gender_alone_does_not_accept_an_unrelated_category(self):
         for hints in (
             ("牛仔裤", "男士直筒牛仔裤"),

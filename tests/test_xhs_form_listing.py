@@ -19,7 +19,7 @@ class XhsDataTests(unittest.TestCase):
             ('流行男鞋', '流行男鞋 > 时尚单鞋 > 休闲皮鞋'), path)
         self.assertEqual(chosen, '流行男鞋 > 时尚单鞋 > 休闲皮鞋')
 
-    def test_category_slashes_are_an_ordered_route(self):
+    def test_category_slashes_are_alternatives_within_one_level(self):
         fields = parse_xhs_fields(
             {
                 "商品分类": "休闲裤/男士休闲直筒裤/工装休闲裤",
@@ -29,7 +29,7 @@ class XhsDataTests(unittest.TestCase):
 
         self.assertEqual(
             fields.category_path,
-            ("休闲裤", "男士休闲直筒裤", "工装休闲裤"),
+            ("休闲裤/男士休闲直筒裤/工装休闲裤",),
         )
         self.assertEqual(fields.fields["价格"], "586")
 
@@ -183,6 +183,21 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
             ("服饰 > 男装 > 男士休闲夹克", "unique_exact_hint_leaf"),
         )
 
+    def test_category_leaf_cannot_match_root_hint_from_wrong_branch(self):
+        from xhs_form_listing import XhsFormListingError
+
+        with self.assertRaises(XhsFormListingError):
+            XhsFormListing._choose_category_text(
+                (
+                    "模玩/动漫/周边/娃圈三坑/桌游 > 卡通/动漫周边 > 动漫T恤/鞋帽/服装",
+                ),
+                (
+                    "服装",
+                    "男装",
+                    "针织衫/毛衣/羊毛衫/毛针织开衫/开衫毛衣",
+                ),
+            )
+
     async def asyncSetUp(self):
         from playwright.async_api import async_playwright
 
@@ -281,11 +296,11 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
               function closeCategory(){ document.querySelector('.el-dialog').style.display='none'; }
               function showRoot(value){
                 const results = document.getElementById('portal-results');
-                results.style.display = value === '休闲裤' ? 'block' : 'none';
-                results.innerHTML = value === '休闲裤'
+                results.style.display = value === '工装休闲裤' ? 'block' : 'none';
+                results.innerHTML = value === '工装休闲裤'
                   ? '<ul><li onclick="choosePortalCategory(this)">男装 > 休闲裤 > 工装休闲裤</li></ul>'
                   : '';
-                if (value === '休闲裤') fetch('https://category.test/category/base/queryCategoryList.json');
+                if (value === '工装休闲裤') fetch('https://category.test/category/base/queryCategoryList.json');
               }
               function choosePortalCategory(node){
                 path=['男装', '休闲裤', '工装休闲裤'];
@@ -346,7 +361,7 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(report["category"]["strategy"], "first_and_leaf_exact")
         self.assertEqual(report["category"]["json_candidate_count"], 1)
-        self.assertEqual(report["category"]["search_term"], "休闲裤")
+        self.assertEqual(report["category"]["search_term"], "工装休闲裤")
         self.assertEqual(
             report["category"]["selected"],
             "男装 > 休闲裤 > 工装休闲裤",

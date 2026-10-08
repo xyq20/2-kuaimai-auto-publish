@@ -128,7 +128,7 @@
 
 菜单选择拼多多的“仅填写/检查”模式时使用 `--platform pdd --no-save`：不会填写或保存基础资料，直接切换拼多多资料，只填写并校验拼多多资料，不保存拼多多资料、不铺货；选择“保存，但不铺货”使用 `--platform pdd --save-only`；选择“保存并铺货”使用 `--platform pdd --save`，程序选择拼多多并只勾选 `NEIGBORL鞋服旗舰店`。
 
-菜单选择小红书的“仅填写/检查”模式时使用 `--platform xhs --no-save`：不会填写或保存基础资料，直接切换小红书资料，再按 Excel `商品分类` 的 `/` 层级选择小红书类目；商品标题移除 `NEIGBORL`，填写货号和可精确匹配的类目属性，选择“全款预售模式 → 时段预售 → 付款后 15 天发货”，填写售价和库存后点击“批量设置”，并把小红书主图替换为本地 `3:4主图`。选择“保存，但不铺货”时使用 `--platform xhs --save-only`，保存成功后会重新打开商品，回读标题、货号、已填类目属性、每行 SKU 售价和库存、全款时段预售及 15 天发货，全部一致才报告完成；选择“保存并铺货”使用 `--platform xhs --save`，程序选择小红书，只勾选 `钊叔的店`、`啊亮製NEIGBORL的店`、`钊叔制NEIGBORL的店`、`老朱和NEIGBORL的店` 和 `NEIGBORL钊叔劳伦的店`。
+菜单选择小红书的“仅填写/检查”模式时使用 `--platform xhs --no-save`：不会填写或保存基础资料，直接切换小红书资料，按 Excel `商品分类` 的 `>` 路径和 `/` 同级候选选择小红书类目；商品标题移除 `NEIGBORL`，填写货号和可精确匹配的类目属性，选择“全款预售模式 → 时段预售 → 付款后 15 天发货”，填写售价和库存后点击“批量设置”，并把小红书主图替换为本地 `3:4主图`。选择“保存，但不铺货”时使用 `--platform xhs --save-only`，保存成功后会重新打开商品，回读标题、货号、已填类目属性、每行 SKU 售价和库存、全款时段预售及 15 天发货，全部一致才报告完成；选择“保存并铺货”使用 `--platform xhs --save`，程序选择小红书，只勾选 `钊叔的店`、`啊亮製NEIGBORL的店`、`钊叔制NEIGBORL的店`、`老朱和NEIGBORL的店` 和 `NEIGBORL钊叔劳伦的店`。
 
 菜单选择有赞的“仅填写/检查”模式时使用 `--platform youzan --no-save`：选择“实物商品”，根据 Excel `商品分类` 以接口返回的完整路径和 DOM 文本双重校验后选择类目，填写类目属性。下拉候选无精确匹配时直接填写 Excel 第一顺位值并回读；面料含百分比时解析成分，不含百分比时使用面料名。SKU 价格和库存来自 Excel，重量固定为 1，仅点击一次“批量设置”；并选择“付款减库存”、“快递发货”及对应品类的邮费模版。`--platform youzan --save-only` 仅保存不铺货，保存后会重新打开商品，回读类目属性、5 行 SKU、重量、库存扣减、配送方式和运费模版。`--platform youzan --youzan-publish-preview` 会保存资料、打开铺货弹窗，只勾选“有赞 / NEIGBORL官方旗舰店”并截图后关闭，不点击最终“确定”。单平台或全平台的“保存并铺货”模式才会在精确回读店铺勾选状态后点击最终“确定”。
 
@@ -215,7 +215,7 @@ canonical 规则的字段先尝试 Excel 顺序 OR、DOM 精确匹配和直接�
 ### 商品工作台与本机审核中心（当前采用）
 
 当前不使用 D1、R2 或 Render：审核网页、FastAPI、SQLite 和审核图片都运行并保存在这台
-Mac 上，Cloudflare Tunnel 只提供外部 HTTPS 入口。按以下顺序启动：
+Mac 上，Cloudflare Tunnel 只提供外部 HTTPS 入口。首次按以下顺序启动：
 
 1. 双击 `run-review-center.command`。首次启动会要求设置 `admin` 的 4 位数字网页登录密码；设备令牌
    自动生成并保存到 macOS 钥匙串，不会写入项目、SQLite 或日志。
@@ -232,14 +232,18 @@ Mac 上，Cloudflare Tunnel 只提供外部 HTTPS 入口。按以下顺序启动
 这两个网页入口只支持保存快麦商品，不铺货。已有 CLI 的其他参数仍可照常使用。
 自定义端口请设置 `KUAIMAI_REVIEW_PORT` 后启动，以便网页任务回连同一个审核服务。
 
-两个服务窗口都需要保持运行，Mac 需要联网并关闭自动睡眠。关闭 Tunnel 只会让外网入口
-暂时失效，不会删除本地数据；重开后临时网址可能变化。需要固定域名时再把相同的本地
-FastAPI 服务接到命名 Tunnel，无需迁移 SQLite。
+首次初始化并设置管理员密码后，可双击 `install-review-services.command` 安装 macOS 用户服务。
+安装后审核中心和 Tunnel 会在登录时自动启动，异常退出会自动重启，不需要每天手动打开两个窗口。
+项目需放在 macOS 未保护的目录（例如 `~/Projects`）；放在 `~/Desktop` 时，系统会阻止后台服务访问项目。
+Mac 仍需要联网并关闭自动睡眠。网页登录会话默认 8 小时，到期只要求重新登录，不会关闭服务。
+Tunnel 使用临时地址，重启后网址可能变化；需要固定域名时再把相同的本地
+FastAPI 服务接到命名 Tunnel，无需迁移 SQLite。未安装用户服务时，手动运行两个 `.command` 文件仍然有效，
+但必须保持对应窗口运行。
 
 本地权威数据位置：
 
 - `.local-state/review-center/review.sqlite3`：商品、候选快照、审核、续跑状态和规则库。
-- `.local-state/review-center/assets/`：审核图片；原图默认 30 天清理，学习缩略图保留。
+- `.local-state/review-center/assets/`：审核中心上传到本机的图片缓存；`original` 原图默认 30 天清理，`learning_thumbnail` 学习缩略图保留。共享盘商品目录中的原始图片不会被此任务删除。
 - `.local-state/review-center/backups/`：每日 SQLite 备份，默认保留 30 天。
 - `.local-state/review-center/launcher/`：网页任务记录、执行日志与退出结果；服务重启后可继续查看。
 - `output/kuaimai/runs/<时间戳>-<任务编号>/`：网页任务的截图、输入摘要和保存回读报告。

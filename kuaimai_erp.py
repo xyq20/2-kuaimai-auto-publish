@@ -508,11 +508,12 @@ def normalize_cell(value: Any) -> str:
 
 
 def parse_category_hints(value: Any) -> Tuple[str, ...]:
-    return tuple(
-        part.strip()
-        for part in re.split(r"[/／]", normalize_cell(value))
-        if part.strip()
-    )
+    # Category syntax is shared across every platform: ``>`` denotes a path
+    # level and ``/`` denotes an alternative at that level.  Keep the
+    # expression intact here so downstream matchers can preserve that
+    # distinction instead of receiving a fake ordered route.
+    text = normalize_cell(value)
+    return (text,) if text else ()
 
 
 def parse_spec_values(value: Any) -> Tuple[str, ...]:

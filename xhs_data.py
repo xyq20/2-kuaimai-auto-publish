@@ -13,6 +13,8 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
+from category_profile import category_input_levels
+
 
 class XhsDataError(ValueError):
     """The spreadsheet does not contain safe Xiaohongshu inputs."""
@@ -79,11 +81,10 @@ def _category_sources(fields: Mapping[str, Any]) -> Tuple[str, ...]:
 
 
 def _category_path(value: str) -> Tuple[str, ...]:
-    return tuple(
-        part.strip()
-        for part in re.split(r"[/／>＞]", value)
-        if part.strip()
-    )
+    # Keep slash alternatives within their ``>`` level.  The form adapter can
+    # then search the alternatives as peers instead of treating them as a
+    # fabricated deeper route.
+    return tuple("/".join(level) for level in category_input_levels(value))
 
 
 def parse_xhs_fields(fields: Mapping[str, Any]) -> XhsFields:
