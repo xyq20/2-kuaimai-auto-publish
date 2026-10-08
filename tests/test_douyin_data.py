@@ -1,4 +1,5 @@
 import json
+import errno
 import tempfile
 import unittest
 from pathlib import Path
@@ -401,6 +402,36 @@ class KuaimaiIntegrationTests(unittest.TestCase):
 
 
 class ProductDataReadIntegrationTests(unittest.TestCase):
+    def test_file_io_failure_reports_source_path_as_input_error(self):
+        source = Path("/Volumes/共享文件/谭/products/地头蛇+ML1003/产品信息.xlsx")
+        with patch("io.open", side_effect=OSError(errno.EIO, "Input/output error")):
+            with self.assertRaises(Exception) as caught:
+                kuaimai_erp.read_product_data(source)
+        self.assertIsInstance(caught.exception, kuaimai_erp.AutomationError)
+        self.assertIn(str(source), str(caught.exception))
+        self.assertIn("Input/output error", str(caught.exception))
+        self.assertNotIn("File is not a zip file", str(caught.exception))
+
+    def test_new_product_reports_same_file_io_failure(self):
+        source = Path("/Volumes/共享文件/谭/products/地头蛇+ML1003/产品信息.xlsx")
+        with patch("io.open", side_effect=OSError(errno.EIO, "Input/output error")):
+            with self.assertRaises(Exception) as caught:
+                kuaimai_erp.read_new_product_seed(source)
+        self.assertIsInstance(caught.exception, kuaimai_erp.AutomationError)
+        self.assertIn(str(source), str(caught.exception))
+        self.assertIn("Input/output error", str(caught.exception))
+
+    def test_readable_invalid_excel_is_distinct_from_file_io_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source = Path(temporary_directory) / "产品信息.xlsx"
+            source.write_bytes(b"this is not an xlsx workbook")
+            with self.assertRaises(Exception) as caught:
+                kuaimai_erp.read_product_data(source)
+            self.assertIsInstance(caught.exception, kuaimai_erp.AutomationError)
+            self.assertIn(str(source), str(caught.exception))
+            self.assertIn("格式", str(caught.exception))
+            self.assertNotIn("Input/output error", str(caught.exception))
+
     def _write_image(self, directory: Path, name: str = "1.png") -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / name

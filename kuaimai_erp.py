@@ -32,6 +32,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, unquote_to_bytes, urljoin, urlsplit
+from zipfile import BadZipFile
 
 from category_profile import category_profile
 from douyin_data import DouyinAssets, DouyinDataError, DouyinFields, field_lookup, parse_douyin_fields, read_douyin_assets
@@ -659,6 +660,32 @@ def list_images(directory: Path, label: str) -> List[Path]:
     return files
 
 
+def _load_product_workbook(excel_path: Path, load_workbook: Callable[..., Any]) -> Any:
+    """Load an Excel workbook while preserving the real source failure.
+
+    ``zipfile`` converts a network read failure into ``BadZipFile`` after it
+    has already lost the original ``OSError``. A small read probe keeps SMB
+    I/O failures distinguishable from a locally readable, malformed workbook.
+    """
+    try:
+        with excel_path.open("rb") as source:
+            source.read(4)
+    except OSError as exc:
+        raise AutomationError(
+            f"无法读取 Excel 文件：{excel_path}；底层错误：{exc}"
+        ) from exc
+    try:
+        return load_workbook(excel_path, data_only=True, read_only=True)
+    except BadZipFile as exc:
+        raise AutomationError(
+            f"Excel 文件格式无效：{excel_path}；请确认文件完整且为 .xlsx 文件"
+        ) from exc
+    except OSError as exc:
+        raise AutomationError(
+            f"读取 Excel 文件失败：{excel_path}；底层错误：{exc}"
+        ) from exc
+
+
 def read_product_data(
     excel_path: Path,
     *,
@@ -669,7 +696,7 @@ def read_product_data(
     except ImportError as exc:
         raise AutomationError("缺少 openpyxl，请先运行：python3 -m pip install -r requirements.txt") from exc
 
-    workbook = load_workbook(excel_path, data_only=True, read_only=True)
+    workbook = _load_product_workbook(excel_path, load_workbook)
     sheet = workbook[workbook.sheetnames[0]]
     rows = list(sheet.iter_rows(values_only=True))
     if len(rows) < 2:
@@ -769,7 +796,7 @@ def read_new_product_seed(excel_path: Path) -> ProductData:
     """只建基础链接：名称 1、一张主图、Excel 颜色、固定尺码、价格 0。"""
     from openpyxl import load_workbook
 
-    workbook = load_workbook(excel_path, data_only=True, read_only=True)
+    workbook = _load_product_workbook(excel_path, load_workbook)
     try:
         fields = read_excel_fields(workbook.worksheets[0].iter_rows(values_only=True))
     finally:
