@@ -783,6 +783,29 @@ class WxsphFormListing(YouzanFormListing):
             raise TaobaoListingError(f'微信小店清空多选失败，仍有：{remaining!r}')
         await self._dismiss_select_dropdown(select)
 
+    async def _clear_single_select(self, select: Any) -> None:
+        """Clear a stale single-select value after a reviewed no-fill decision."""
+        current = tuple(
+            value for value in await self._read_select_values(select, multi=False)
+            if str(value).strip()
+        )
+        if not current:
+            return
+        clear = select.locator(".el-select__clear:visible")
+        if await clear.count() != 1:
+            raise WxsphFormListingError(
+                "微信小店无法清空已审核不填写的单选属性：清空按钮不是唯一项"
+            )
+        await clear.click(timeout=3000)
+        actual = tuple(
+            value for value in await self._read_select_values(select, multi=False)
+            if str(value).strip()
+        )
+        if actual:
+            raise WxsphFormListingError(
+                "微信小店清空已审核不填写的单选属性失败：仍有 {0!r}".format(actual)
+            )
+
     async def _apply_resolved_api_options(
         self,
         page_label: str,
@@ -1564,6 +1587,20 @@ class WxsphFormListing(YouzanFormListing):
                             reviewed_no_fill = bool(
                                 checker(self.attribute_platform_id, page_label)
                             )
+                    if reviewed_no_fill:
+                        selects = item.locator(
+                            ":scope > .el-form-item__content .el-select:visible"
+                        )
+                        if await selects.count() != 1:
+                            raise WxsphFormListingError(
+                                "微信小店属性“{0}”下拉控件不唯一，无法清空".format(page_label)
+                            )
+                        select = selects.first
+                        multi = await select.locator(".el-select__tags").count() > 0
+                        if multi:
+                            await self._clear_multi_select(select)
+                        else:
+                            await self._clear_single_select(select)
                     skipped_optional[page_label] = (
                         "审核明确不填写" if reviewed_no_fill else "等待运营审核"
                     )

@@ -94,6 +94,35 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
                 expected_attributes={},
             )
 
+    async def test_reviewed_no_fill_clears_existing_single_select(self):
+        class Runtime:
+            @staticmethod
+            def intentionally_omitted(platform_id, field_label):
+                return platform_id == "wxsph" and field_label == "上市时间"
+
+        listing = await self._listing(Runtime())
+        await self.page.locator("[role=tabpanel]").evaluate(
+            """root => root.querySelector('h3').insertAdjacentHTML(
+              'afterend',
+              '<div class="el-form-item is-required" id="listing-date">'
+              + '<label class="el-form-item__label">上市时间</label>'
+              + '<div class="el-form-item__content"><div class="el-select">'
+              + '<input class="el-input__inner" readonly value="2026年春季">'
+              + '<i class="el-select__clear">×</i>'
+              + '<div class="el-select-dropdown" style="display:none"><ul></ul></div>'
+              + '</div></div></div>'
+            )"""
+        )
+        await self.page.locator("#listing-date .el-select__clear").evaluate(
+            "element => element.addEventListener('click', () => element.previousElementSibling.value = '')"
+        )
+        await listing._clear_single_select(
+            listing.panel.locator("#listing-date .el-select")
+        )
+        self.assertEqual(
+            await self.page.locator("#listing-date .el-select input").input_value(), ""
+        )
+
     async def test_collapsed_multi_clears_actual_selection_by_dom(self):
         await self.page.set_content('''<div id="select" class="el-select">
           <div class="el-select__tags"><span class="el-tag">已选择 1</span></div>
