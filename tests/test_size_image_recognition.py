@@ -358,6 +358,36 @@ class VisionOCRUnitTests(unittest.TestCase):
                     vision_ocr(self.image_path)
 
     @patch("size_image_recognition.subprocess.run")
+    def test_clips_small_edge_overflow_without_shifting_opposite_edge(self, run):
+        valid = {"text": "模特：航仔", "confidence": 1, "x": 0.44, "y": 0.2, "width": 0.1, "height": 0.02518016236847065}
+        cases = [
+            ({"y": -0.0003389324337117472}, "y", "height", 0.02518016236847065 - 0.0003389324337117472),
+            ({"x": -0.0004}, "x", "width", 0.0996),
+            ({"x": 0.9004}, "x", "width", 0.0996),
+            ({"y": 0.9752}, "y", "height", 0.0248),
+        ]
+        for overrides, position, extent, expected in cases:
+            with self.subTest(overrides=overrides):
+                run.return_value = _completed_process([{**valid, **overrides}])
+                token, = vision_ocr(self.image_path)
+                self.assertEqual(token.text, valid['text'])
+                self.assertGreaterEqual(getattr(token, position), 0)
+                self.assertAlmostEqual(getattr(token, extent), expected)
+                self.assertLessEqual(token.x + token.width, 1)
+                self.assertLessEqual(token.y + token.height, 1)
+
+    @patch("size_image_recognition.subprocess.run")
+    def test_edge_compatibility_rejects_large_or_empty_boxes(self, run):
+        valid = {"text":"S", "confidence":.9, "x":.1, "y":.2, "width":.1, "height":.1}
+        for overrides in ({'y':-.002}, {'x':.9011}, {'y':1.0001},
+                          {'x':-.0008,'width':.0002}, {'width':0}, {'height':-0.0001},
+                          {'confidence':1.0001}, {'y':math.nan}, {'x':True}):
+            with self.subTest(overrides=overrides):
+                run.return_value = _completed_process([{**valid, **overrides}])
+                with self.assertRaises(RecognitionError):
+                    vision_ocr(self.image_path)
+
+    @patch("size_image_recognition.subprocess.run")
     def test_rejects_nonfinite_and_out_of_range_numbers(self, run):
         valid = {"text": "S", "confidence": 0.9, "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.1}
         invalid_items = [

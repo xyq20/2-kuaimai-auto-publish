@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -16,6 +17,9 @@ import numpy as np
 
 
 MIN_OCR_CONFIDENCE = 0.25
+# Vision may place edge text just outside the image. Limit correction to
+# 0.1% of either image dimension; do not relax confidence validation.
+OCR_EDGE_TOLERANCE = 0.001
 _TOKEN_FIELDS = {"text", "confidence", "x", "y", "width", "height"}
 _DUPLICATE_MODULE_SIGNATURE = "redefinition of module 'SwiftBridging'"
 _SDK_MISMATCH_SIGNATURE = "this SDK is not supported by the compiler"
@@ -343,14 +347,16 @@ def _bridge_command(image_path: Path) -> Iterator[List[str]]:
         raise RecognitionError(f"无法建立临时 Swift OCR 可执行文件：{error}") from error
 
 
-def _finite_number(item: Dict[str, Any], field: str, index: int) -> float:
+def _finite_number(
+    item: Dict[str, Any], field: str, index: int, *, lower: float = 0.0, upper: float = 1.0
+) -> float:
     value = item[field]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RecognitionError(f"OCR 输出格式无效：第 {index + 1} 项的 {field} 不是数字")
     number = float(value)
-    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+    if not math.isfinite(number) or not lower <= number <= upper:
         raise RecognitionError(
-            f"OCR 输出格式无效：第 {index + 1} 项的 {field} 必须是 0 到 1 的有限数"
+            f"OCR 输出格式无效：第 {index + 1} 项的 {field} 必须是 {lower:g} 到 {upper:g} 的有限数，实际为 {number}"
         )
     return number
 
@@ -373,12 +379,25 @@ def _parse_token(item: Any, index: int) -> OCRToken:
         raise RecognitionError(f"OCR 输出格式无效：第 {index + 1} 项 text 必须是非空文本")
 
     confidence = _finite_number(item, "confidence", index)
-    x = _finite_number(item, "x", index)
-    y = _finite_number(item, "y", index)
-    width = _finite_number(item, "width", index)
-    height = _finite_number(item, "height", index)
-    if x + width > 1.000001 or y + height > 1.000001:
+    tolerance = OCR_EDGE_TOLERANCE
+    x = _finite_number(item, "x", index, lower=-tolerance, upper=1 + tolerance)
+    y = _finite_number(item, "y", index, lower=-tolerance, upper=1 + tolerance)
+    width = _finite_number(item, "width", index, upper=1 + 2 * tolerance)
+    height = _finite_number(item, "height", index, upper=1 + 2 * tolerance)
+    right, bottom = x + width, y + height
+    if right > 1 + tolerance or bottom > 1 + tolerance:
         raise RecognitionError(f"OCR 输出格式无效：第 {index + 1} 项坐标框超出图片范围")
+    left, top = max(0.0, x), max(0.0, y)
+    clipped_right, clipped_bottom = min(1.0, right), min(1.0, bottom)
+    if width <= 0 or height <= 0 or clipped_right <= left or clipped_bottom <= top:
+        raise RecognitionError(f"OCR 输出格式无效：第 {index + 1} 项坐标框在图片内没有有效面积")
+    if x < 0 or y < 0 or right > 1 or bottom > 1:
+        original = (x, y, width, height)
+        x, y, width, height = left, top, clipped_right - left, clipped_bottom - top
+        logging.getLogger("kuaimai_erp").info(
+            "OCR 边界兼容：第 %s 项 %r 的文字框轻微越界，已裁剪到图片内；原框=%s，裁剪后=%s",
+            index + 1, text[:80], original, (x, y, width, height),
+        )
 
     return OCRToken(text.strip(), confidence, x, y, width, height)
 
@@ -413,7 +432,10 @@ def vision_ocr(image_path: Path) -> Tuple[OCRToken, ...]:
     if not isinstance(payload, list):
         raise RecognitionError("OCR 输出 JSON 顶层必须是数组")
 
-    parsed_tokens = tuple(_parse_token(item, index) for index, item in enumerate(payload))
+    try:
+        parsed_tokens = tuple(_parse_token(item, index) for index, item in enumerate(payload))
+    except RecognitionError as error:
+        raise RecognitionError(f"{image_path.name}：{error}") from error
     tokens = tuple(token for token in parsed_tokens if token.confidence >= MIN_OCR_CONFIDENCE)
     if not tokens:
         raise RecognitionError(f"OCR 未识别到可信文字：{image_path}")
