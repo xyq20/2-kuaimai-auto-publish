@@ -80,6 +80,8 @@ class OCRSemanticTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("衣身丈", request.evidence["summary"])
                 self.assertEqual(request.platform_id, "base")
                 self.assertFalse(request.custom_allowed)
+                self.assertEqual(session.model_events[-1]['status'], 'unavailable')
+                self.assertIn('reason', session.model_events[-1])
 
     async def test_fabricated_numeric_token_or_meaning_is_rejected(self):
         from ocr_semantics import OCRSemanticSession

@@ -674,6 +674,8 @@ class TaobaoListing:
         labels: Sequence[str],
         *,
         source: str,
+        evidence: Optional[Mapping[str, Any]] = None,
+        excel_value: Optional[str] = None,
     ) -> str:
         """Resolve an uncertain category through the shared learning review.
 
@@ -717,7 +719,7 @@ class TaobaoListing:
             field_id="category_path",
             field_label="商品类目",
             candidates=candidates,
-            excel_value=" / ".join(self.category_hints),
+            excel_value=excel_value if excel_value is not None else " / ".join(self.category_hints),
             evidence={
                 "excel": True,
                 "live_dom": True,
@@ -725,6 +727,7 @@ class TaobaoListing:
                 "excel_category_hints": list(self.category_hints),
                 "candidate_paths": list(unique),
                 "category_required_before_attributes": True,
+                **dict(evidence or {}),
             },
             custom_allowed=False,
             schema_version=schema_version,

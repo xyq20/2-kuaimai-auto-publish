@@ -56,6 +56,7 @@ class OCRSemanticSession:
         self.corrections: dict[str, dict[int, str]] = {}
         self.predictions: dict[str, Mapping[str, Any]] = {}
         self.model_decisions: list[dict[str, Any]] = []
+        self.model_events: list[dict[str, Any]] = []
         self.report_sink = None
 
     def record_decision(self, decision):
@@ -79,7 +80,15 @@ def parse_chart(path: Path, garment_kind: str, parser: Callable):
     error = OCRJudgmentRequired(Path(path), tokens, garment_kind, parser, "")
     applied = session.corrections.get(error.key, {}) if session else {}
     try:
-        return error.validate(applied)
+        result = error.validate(applied)
+        if session is not None:
+            from model_judgments import reason_text, record_event
+            code = "ocr_reused" if applied else "ocr_rule_match"
+            record_event(session, {"key": "skip:" + error.key, "platform_id": "base", "field_id": "ocr:chart",
+                         "field_label": "尺码 OCR", "excel_value": str(path.name), "source_image": str(path),
+                         "status": "skipped", "api_called": False, "reason_code": code,
+                         "reason": reason_text(code)}, sink=session.report_sink)
+        return result
     except RecognitionError as failure:
         if session is None or garment_kind not in MEANINGS:
             raise

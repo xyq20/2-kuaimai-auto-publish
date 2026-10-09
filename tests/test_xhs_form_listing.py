@@ -514,6 +514,36 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(report["selected"], "男装 > 休闲裤 > 工装休闲裤")
 
+    async def test_category_validation_mismatch_uses_model_to_choose_real_full_path(self):
+        listing = await self._ordered_category_listing({
+            '针织衫': [['全新奢侈品', '贸易男装/男士精品', '针织衫/毛衣']],
+            '毛衣': [['服装', '男装', '羊毛开衫']],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory)/'learning.sqlite3'); store.migrate()
+            client = Mock(); client.post_event.return_value = {'ok':True}
+            client.review_learning.return_value = {'status':'review_required'}
+            client.decide.return_value = {'status':'review_required'}
+            def judgment(payload):
+                choice = next(o for o in payload['options'] if o['label'] == '服装 > 男装 > 羊毛开衫')
+                return {'status':'suggested','source':'deepseek','api_called':True,'model':'deepseek-flash',
+                    'snapshot_version':payload['snapshot_version'],'value_ids':[choice['value_id']],
+                    'confidence':.99,'evidence_kinds':['excel','product'],
+                    'reason':'羊毛开衫符合 Excel 毛衣类目，奢侈品分支不符合商品信息'}
+            client.semantic_judge.side_effect = judgment
+            listing.attribute_runtime = AttributeRuntime(store,client,'run','product')
+            listing.category_hints = ('服装','男装','针织衫/毛衣')
+            try:
+                report = await listing.apply_category(('服装','男装','针织衫/毛衣'))
+                await listing.attribute_runtime.drain()
+                self.assertEqual(report['selected'], '服装 > 男装 > 羊毛开衫')
+                trace = listing.attribute_runtime.model_decisions[0]
+                self.assertEqual(trace['status'], 'adopted')
+                self.assertIn('validation_error', trace['input_evidence'])
+                self.assertEqual(self.searches[:2], ['针织衫','毛衣'])
+            finally:
+                store.close()
+
     async def test_flattened_category_alias_does_not_accept_wrong_branch(self):
         listing = await self._ordered_category_listing({
             "休闲裤": [["全新奢侈品", "贸易男装/男士精品", "休闲裤"]],

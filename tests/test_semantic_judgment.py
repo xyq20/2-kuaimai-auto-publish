@@ -91,6 +91,55 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.runtime.resolve(self.request)).source, 'deepseek')
         await self.runtime.drain()
 
+    async def test_failed_model_request_is_visible_in_log_and_report(self):
+        from types import SimpleNamespace
+        import kuaimai_erp as erp
+        from ocr_semantics import OCRSemanticSession
+        self.client.semantic_judge.return_value = {
+            'status': 'review_required', 'source': 'deepseek', 'api_called': True,
+            'reason_code': 'deepseek_timeout', 'model': 'deepseek-flash',
+        }
+        with self.assertLogs('kuaimai_erp', level='INFO') as logs:
+            with self.assertRaises(ReviewRequired):
+                await self.runtime.resolve(self.request)
+        erp.write_model_judgment_report(Path(self.tmp.name), SimpleNamespace(attribute_runtime=self.runtime), OCRSemanticSession())
+        report = json.loads((Path(self.tmp.name)/'model-judgments.json').read_text())
+        self.assertEqual(report['summary']['api_call_count'], 1)
+        self.assertEqual(report['summary']['unavailable_count'], 1)
+        self.assertEqual(report['events'][0]['field_label'], '版型')
+        self.assertIn('超时', '\n'.join(logs.output))
+        self.assertEqual(report['decisions'], [])
+
+    async def test_uncertain_result_logs_suggestion_and_review_reason(self):
+        self.suggestion(.7, api_called=True, model='deepseek-flash')
+        with self.assertLogs('kuaimai_erp', level='INFO') as logs:
+            with self.assertRaises(ReviewRequired):
+                await self.runtime.resolve(self.request)
+        text = '\n'.join(logs.output)
+        self.assertIn('直筒', text)
+        self.assertIn('70.0%', text)
+        self.assertIn('审核', text)
+
+    async def test_excel_match_explains_why_model_is_skipped(self):
+        with self.assertLogs('kuaimai_erp', level='INFO') as logs:
+            await self.runtime.resolve(dataclasses.replace(self.request, excel_value='直筒'))
+            await self.runtime.drain()
+        self.assertIn('Excel', '\n'.join(logs.output))
+        self.assertEqual(self.runtime.model_events[0]['api_called'], False)
+        self.assertEqual(self.runtime.model_events[0]['status'], 'skipped')
+
+    async def test_verified_model_results_are_stored_separately_from_human_votes(self):
+        self.suggestion(api_called=True)
+        await self.runtime.resolve(self.request)
+        self.runtime.record_verified_readbacks('wxsph', {'版型': ['直筒']})
+        await self.runtime.drain()
+        facts = [json.loads(row['payload_json']) for row in self.store.connection.execute(
+            "SELECT payload_json FROM sync_outbox WHERE event_type='text_facts.created'"
+        )]
+        model_facts = [fact for fact in facts if fact.get('source') == 'model_verified']
+        self.assertEqual(model_facts[0]['payload_json']['model_verified']['selected_labels'], ['直筒'])
+        self.assertEqual(self.store.connection.execute('SELECT count(*) FROM review_resolutions').fetchone()[0], 0)
+
 
 class SemanticEndpointTests(unittest.TestCase):
     def test_api_validates_candidate_and_keeps_human_records_as_context(self):

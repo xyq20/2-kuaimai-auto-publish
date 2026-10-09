@@ -36,5 +36,13 @@ def request_json(settings: Settings, system: str, evidence: dict) -> dict:
         return result
     except JudgmentUnavailable:
         raise
+    except httpx.TimeoutException:
+        raise JudgmentUnavailable("deepseek_timeout") from None
+    except httpx.HTTPStatusError as error:
+        code = {401: "deepseek_auth_failed", 403: "deepseek_auth_failed",
+                402: "deepseek_insufficient_balance", 400: "deepseek_invalid_request",
+                422: "deepseek_invalid_request", 429: "deepseek_rate_limited"}.get(
+                    error.response.status_code, "deepseek_request_failed")
+        raise JudgmentUnavailable(code) from None
     except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
         raise JudgmentUnavailable("deepseek_request_failed") from None

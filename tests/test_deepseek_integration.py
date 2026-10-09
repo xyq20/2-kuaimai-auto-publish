@@ -59,6 +59,23 @@ class DeepSeekIntegrationTests(unittest.TestCase):
         with transaction(self.settings) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM review_actions").fetchone()[0], 0)
 
+    def test_verified_model_experience_is_context_and_never_a_human_vote(self):
+        from local_review.service import _condition_signature
+        self.event('excel-evidence', 'text_facts.created', {'product_version':'p', 'source':'excel',
+            'payload_json': {'text_tokens':['羊毛'], 'values':{'fabric':{'value_id':'wool'}}}})
+        with transaction(self.settings) as connection:
+            signature = _condition_signature(connection, 'p')
+        self.event('model-experience', 'text_facts.created', {'product_version':'p', 'source':'model_verified',
+            'payload_json': {'model_verified': {'platform_id':'xhs', 'field_label':'商品类目',
+                'control_type':'category', 'excel_value':'毛衣', 'selected_labels':['男装 > 针织衫'],
+                'readback_verified':True, 'model':'deepseek-flash'}}})
+        context = judgment_context(self.settings, 'p', 'xhs', '商品类目', 'category')
+        self.assertEqual(context['verified_model_examples'][0]['selected_labels'], ['男装 > 针织衫'])
+        self.assertEqual(context['human_examples'], [])
+        self.assertEqual(judgment_context(self.settings, 'p', 'jd', '商品类目', 'category')['verified_model_examples'], [])
+        with transaction(self.settings) as connection:
+            self.assertEqual(_condition_signature(connection, 'p'), signature)
+
     def test_ocr_endpoint_only_accepts_real_non_numeric_row_ids(self):
         payload = {'product_version':'p','garment_kind':'clothing',
                    'tokens':[dataclasses.asdict(t) for t in unfamiliar_tokens()],

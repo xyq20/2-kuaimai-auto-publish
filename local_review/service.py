@@ -593,7 +593,7 @@ def _condition_signature(connection: sqlite3.Connection, product_version: str) -
         "SELECT payload_json FROM visual_facts WHERE product_version=?", (product_version,)
     ).fetchone()
     text = connection.execute(
-        "SELECT payload_json FROM text_facts WHERE product_version=? ORDER BY created_at DESC,id DESC LIMIT 1",
+        "SELECT payload_json FROM text_facts WHERE product_version=? AND source NOT IN ('product_info','model_verified') ORDER BY created_at DESC,id DESC LIMIT 1",
         (product_version,),
     ).fetchone()
     try:
@@ -806,7 +806,7 @@ def decide_attribute(settings: Settings, data: Any) -> dict[str, Any]:
                 )
             if response is None:
                 text_row = connection.execute(
-                    "SELECT payload_json FROM text_facts WHERE product_version=? ORDER BY created_at DESC,id DESC LIMIT 1",
+                    "SELECT payload_json FROM text_facts WHERE product_version=? AND source NOT IN ('product_info','model_verified') ORDER BY created_at DESC,id DESC LIMIT 1",
                     (data["product_version"],),
                 ).fetchone()
                 text_facts = json.loads(text_row["payload_json"]) if text_row else {}

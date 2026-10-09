@@ -97,10 +97,21 @@ async def resolve_ocr_failure(runtime, client, session: OCRSemanticSession,
         except RecognitionError:
             raise RecognitionError(f"OCR 已审核含义后，表格行列或数值仍未通过校验，请修正原图：{error}") from None
         session.corrections[error.key] = decisions
+        from model_judgments import record_event, reason_text
+        record_event(session, {"key": "skip:learned:" + error.key, "platform_id": platform_id,
+                     "field_id": "ocr:chart", "field_label": "尺码 OCR", "excel_value": error.path.name,
+                     "status": "skipped", "api_called": False, "reason_code": "review_learning",
+                     "reason": reason_text("review_learning")}, sink=session.report_sink, logger=logger)
         logger.info("尺码 OCR 已复用人工审核/学习，结构与数值校验通过")
         return
     prediction_key = canonical_sha256({"chart": error.key, "reason": str(error), "decisions": decisions})
+    from model_judgments import api_called, reason_text, record_event
+    event = {"key": prediction_key, "platform_id": platform_id, "field_id": "ocr:chart",
+             "field_label": "尺码 OCR", "excel_value": "、".join(error.tokens[i].text for i in pending),
+             "source_image": str(error.path)}
     if prediction_key not in session.predictions:
+        record_event(session, {**event, "status": "requesting", "api_called": None,
+                     "reason": "OCR 规则和人工学习尚未确定含义，请求模型判断原文"}, sink=session.report_sink, logger=logger)
         judge = getattr(client, "ocr_judge", None)
         try:
             result = await asyncio.to_thread(judge, {
@@ -123,9 +134,14 @@ async def resolve_ocr_failure(runtime, client, session: OCRSemanticSession,
         except RecognitionError:
             valid = False
     if valid and all(suggestions[i][1] >= .98 for i in proposed_ids):
+        record_event(session, {**event, "status": "adopted", "api_called": api_called(response),
+                     "model": response.get("model", ""), "selected_labels": [meanings[proposal[i]] for i in proposed_ids],
+                     "confidence": min(suggestions[i][1] for i in proposed_ids),
+                     "reason": "OCR 原文语义映射通过原表行列和数值校验，自动采用"}, sink=session.report_sink, logger=logger)
         session.corrections[error.key] = proposal
         for ident in proposed_ids:
             session.record_decision({
+                "request_key": prediction_key,
                 "platform_id": platform_id, "field_id": requests[ident].field_id,
                 "field_label": requests[ident].field_label, "excel_value": error.tokens[ident].text,
                 "selected_labels": [meanings[proposal[ident]]], "selected_value_ids": [proposal[ident]],
@@ -138,6 +154,11 @@ async def resolve_ocr_failure(runtime, client, session: OCRSemanticSession,
         logger.info("DeepSeek 尺码 OCR 含义判断通过原表行列/数值校验：%s", "、".join(
             f"{error.tokens[i].text} → {meanings[proposal[i]]}" for i in proposed_ids))
         return
+    code = str(response.get("reason_code") or ("deepseek_invalid_ocr_judgment" if not suggestions else "deepseek_uncertain"))
+    record_event(session, {**event, "status": "review_required" if suggestions else "unavailable",
+                 "api_called": api_called(response), "model": response.get("model", ""), "reason_code": code,
+                 "reason": "模型置信度或原表结构校验未通过，转人工审核" if suggestions else reason_text(code),
+                 "selected_labels": [meanings[suggestions[i][0]] for i in proposed_ids]}, sink=session.report_sink, logger=logger)
     reviews = []
     for ident in pending:
         request = requests[ident]
@@ -146,6 +167,7 @@ async def resolve_ocr_failure(runtime, client, session: OCRSemanticSession,
                                      request.field_label, request.candidates, request.schema_version, False)
         if ident in suggestions:
             session.record_decision({
+                "request_key": prediction_key,
                 "platform_id": platform_id, "field_id": request.field_id, "field_label": request.field_label,
                 "excel_value": error.tokens[ident].text, "selected_labels": [meanings[suggestions[ident][0]]],
                 "selected_value_ids": [suggestions[ident][0]], "confidence": suggestions[ident][1],

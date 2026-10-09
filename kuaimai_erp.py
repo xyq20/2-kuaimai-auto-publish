@@ -6914,13 +6914,17 @@ async def read_product_with_ocr_review(excel_path, args, context, session, error
             error = failure
 
 
-def write_model_judgment_report(artifact_dir, context, session):
+def write_model_judgment_report(artifact_dir, context, session, *, run_status="running", stop_reason=""):
     """Preserve every prediction, including a failed or interrupted run."""
     from html import escape
+    from model_judgments import summarize
     runtime = getattr(context, "attribute_runtime", None)
     rows = list(getattr(runtime, "model_decisions", [])) + list(session.model_decisions)
+    events = list(getattr(runtime, "model_events", [])) + list(session.model_events)
+    summary = summarize(rows, events, run_status=run_status, stop_reason=stop_reason)
     payload = {"run_id": getattr(context, "run_id", ""), "product_version": getattr(context, "product_version", ""),
-               "decisions": rows, "generated_at": datetime.now(timezone.utc).isoformat()}
+               "decisions": rows, "events": events, "summary": summary,
+               "generated_at": datetime.now(timezone.utc).isoformat()}
     artifact_dir.mkdir(parents=True, exist_ok=True)
     report_path = artifact_dir / "model-judgments.json"
     report_temporary = report_path.with_suffix(".json.tmp")
@@ -6933,8 +6937,14 @@ def write_model_judgment_report(artifact_dir, context, session):
         row.get("platform_id", ""), row.get("field_label", ""), row.get("excel_value", ""),
         "、".join(row.get("selected_labels", [])), f'{row.get("confidence", 0):.1%}', row.get("reason", ""),
         row.get("status", ""), row.get("readback_status", "pending"))) + "</tr>" for row in rows)
-    document = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>大模型判断汇总</title><style>body{font:15px system-ui;margin:32px;color:#222}table{width:100%;border-collapse:collapse}td,th{padding:14px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}th{background:#f6f7f9}td{white-space:pre-wrap}h1{font-size:24px}</style><h1>大模型判断汇总</h1><p>自动采用与待审核判断独立记录。置信度为模型判断值；pending 表示尚无保存回读结果。</p><table><thead><tr>' + ''.join('<th>' + escape(h) + '</th>' for h in headers) + '</tr></thead><tbody>' + body + '</tbody></table>' + ('<p>本次没有大模型判断。</p>' if not rows else '') + '</html>'
+    activity = "".join('<tr>' + ''.join(cell(event.get(k, "")) for k in
+        ("platform_id", "field_label", "status", "reason")) + '</tr>' for event in events)
+    document = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>大模型判断汇总</title><style>body{font:15px system-ui;margin:32px;color:#222}table{width:100%;border-collapse:collapse}td,th{padding:14px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}th{background:#f6f7f9}td{white-space:pre-wrap}h1{font-size:24px}</style><h1>大模型判断汇总</h1>'
+    document += '<p>接口调用 ' + str(summary['api_call_count']) + ' 次；自动采用 ' + str(summary['adopted_count']) + ' 项；待审核 ' + str(summary['review_count']) + ' 次；不可用 ' + str(summary['unavailable_count']) + ' 次。</p>'
+    document += '<p>' + escape(summary['not_called_reason']) + '</p><p>置信度为模型自评；保存回读结果单独记录。</p><table><thead><tr>' + ''.join('<th>' + escape(h) + '</th>' for h in headers) + '</tr></thead><tbody>' + body + '</tbody></table>'
+    document += '<h2>调用与未调用原因</h2><table><thead><tr><th>平台</th><th>字段</th><th>状态</th><th>原因</th></tr></thead><tbody>' + activity + '</tbody></table></html>'
     (artifact_dir / "model-judgments.html").write_text(document, encoding="utf-8")
+    return payload
 
 
 def review_requirements(
@@ -7338,8 +7348,11 @@ def main() -> int:
         )
     learning_context: Optional[LearningRunContext] = None
     ocr_session = OCRSemanticSession()
+    model_run_status, model_stop_reason = "running", ""
     if redactor is None:
-        ocr_session.report_sink = lambda: write_model_judgment_report(artifact_dir, learning_context, ocr_session)
+        ocr_session.report_sink = lambda: write_model_judgment_report(artifact_dir, learning_context, ocr_session,
+            run_status=model_run_status, stop_reason=model_stop_reason)
+        ocr_session.report_sink()
     ocr_scope = ocr_session.activate()
     ocr_scope.__enter__()
     try:
@@ -7400,6 +7413,7 @@ def main() -> int:
             assert summary is not None
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             logger.info("dry-run 完成，未打开浏览器")
+            model_run_status = "completed"
             return 0
         if redactor is None:
             if args.platform == "all" or len(selected_platforms) > 1:
@@ -7433,8 +7447,10 @@ def main() -> int:
                     redactor=redactor,
                 )
             )
+        model_run_status = "completed"
         return 0
     except KeyboardInterrupt:
+        model_run_status, model_stop_reason = "interrupted", "用户中止了程序"
         logger.error("用户中止了程序")
         return 130
     except (
@@ -7451,16 +7467,25 @@ def main() -> int:
         XhsFormListingError,
         RecognitionError,
     ) as exc:
+        model_run_status, model_stop_reason = "failed", str(exc)
         logger.error("%s", exc)
         return 2
     except Exception:
+        model_run_status, model_stop_reason = "failed", "程序出现未预期错误，请查看错误日志"
         logger.exception("程序出现未预期错误")
         return 1
     finally:
         if redactor is None:
-            write_model_judgment_report(artifact_dir, learning_context, ocr_session)
-            count = len(getattr(getattr(learning_context, "attribute_runtime", None), "model_decisions", [])) + len(ocr_session.model_decisions)
-            logger.info("大模型判断汇总：%s 项，查看 model-judgments.html / model-judgments.json", count)
+            report = write_model_judgment_report(artifact_dir, learning_context, ocr_session,
+                run_status=model_run_status, stop_reason=model_stop_reason)
+            summary = report["summary"]
+            logger.info("大模型判断汇总：接口调用 %s 次，判断 %s 项，自动采用 %s 项，待审核 %s 次，不可用 %s 次，校验拒绝 %s 次；人工查看工作台运行详情中的“大模型判断”看板",
+                summary["api_call_count"], summary["decision_count"], summary["adopted_count"],
+                summary["review_count"], summary["unavailable_count"], summary["rejected_count"])
+            if summary["not_called_reason"]:
+                logger.info("大模型未调用原因：%s", summary["not_called_reason"])
+            if summary["unknown_call_count"]:
+                logger.info("另有 %s 次判断服务请求未返回调用状态，是否到达 DeepSeek 接口暂无法确认", summary["unknown_call_count"])
         ocr_scope.__exit__(None, None, None)
         if learning_context is not None:
             learning_context.store.close()

@@ -15,6 +15,16 @@ import size_image_recognition as recognition
 
 
 class OCRRunRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_zero_decisions_explain_early_validation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            erp.write_model_judgment_report(root, None, OCRSemanticSession(),
+                run_status='failed', stop_reason='小红书类目确认前路径不匹配')
+            report = json.loads((root/'model-judgments.json').read_text())
+            self.assertEqual(report['summary']['api_call_count'], 0)
+            self.assertIn('路径不匹配', report['summary']['not_called_reason'])
+            self.assertIn('未调用', (root/'model-judgments.html').read_text())
+
     async def test_ocr_recovery_does_not_discard_other_pending_fields(self):
         from tests.test_attribute_runtime import make_length_request
         from learning_models import RunCheckpoint

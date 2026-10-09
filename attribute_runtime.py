@@ -204,6 +204,7 @@ class AttributeRuntime:
             tuple[str, str], tuple[AttributeRequest, ResolvedAttribute]
         ] = {}
         self.model_decisions: list[dict[str, Any]] = []
+        self.model_events: list[dict[str, Any]] = []
         self._model_judgments: dict[str, Mapping[str, Any]] = {}
         self.model_decision_sink = None
 
@@ -402,9 +403,16 @@ class AttributeRuntime:
     ) -> Optional[ResolvedAttribute]:
         """Interpret an unmatched intent; candidate membership is mandatory."""
         judge = getattr(self.client, "semantic_judge", None)
-        if (not callable(judge) or not request.candidates or len(request.candidates) > 1000
-                or request.control_type not in {"select", "category", *MULTI_SELECT_CONTROL_TYPES}
-                or re.search(r"价格|售价|库存|运费|物流|店铺", request.field_label)):
+        from model_judgments import api_called, reason_text, record_event
+        skip_reason = (
+            "judgment_service_unavailable" if not callable(judge) else
+            "no_candidates" if not request.candidates else
+            "too_many_candidates" if len(request.candidates) > 1000 else
+            "unsupported_control" if request.control_type not in {"select", "category", *MULTI_SELECT_CONTROL_TYPES} else
+            "operational_field" if re.search(r"价格|售价|库存|运费|物流|店铺", request.field_label) else ""
+        )
+        if skip_reason:
+            self._record_model_skip(request, skip_reason)
             return None
         payload = {
             "product_version": self.product_version, "platform_id": request.platform_id,
@@ -415,13 +423,17 @@ class AttributeRuntime:
             "evidence": dict(request.evidence),
         }
         key = canonical_sha256(payload)
+        event = {"key": key, "platform_id": canonical_platform_name(request.platform_id),
+                 "field_id": request.field_id, "field_label": request.field_label,
+                 "excel_value": request.excel_value, "snapshot_version": snapshot.snapshot_version}
         if key not in self._model_judgments:
+            record_event(self, {**event, "status": "requesting", "api_called": None,
+                         "reason": "Excel 和学习库尚未确定候选，请求模型辅助判断"}, sink=self.model_decision_sink)
             try:
                 await self._flush()
                 answer = await asyncio.to_thread(judge, payload)
-            except LearningClientError as failure:
-                logging.getLogger("kuaimai_erp").warning("DeepSeek 辅助判断不可用，转人工审核：%s", failure)
-                answer = {}
+            except LearningClientError:
+                answer = {"reason_code": "judgment_service_unavailable"}
             self._model_judgments[key] = answer if isinstance(answer, Mapping) else {}
         answer = self._model_judgments[key]
         ids, confidence = answer.get("value_ids"), answer.get("confidence")
@@ -440,6 +452,13 @@ class AttributeRuntime:
             and isinstance(answer.get("reason"), str) and bool(answer["reason"].strip())
         )
         if not valid:
+            code = str(answer.get("reason_code") or "deepseek_invalid_judgment")
+            status = "review_required" if code == "deepseek_uncertain" else (
+                "rejected" if code in {"deepseek_invalid_judgment", "deepseek_invalid_ocr_judgment"} else "unavailable")
+            record_event(self, {**event, "status": status, "api_called": api_called(answer),
+                         "model": answer.get("model", ""), "reason_code": code,
+                         "reason": reason_text(code) + ("；模型说明：" + str(answer["reason"])[:2000] if answer.get("reason") else "")},
+                         sink=self.model_decision_sink)
             if answer.get("source") == "deepseek" and answer.get("status") == "suggested" and not any(row["key"] == key for row in self.model_decisions):
                 self.model_decisions.append({
                     "key": key, "platform_id": canonical_platform_name(request.platform_id),
@@ -456,12 +475,19 @@ class AttributeRuntime:
             return None
         labels = [next(c.label for c in request.candidates if c.value_id == ident) for ident in ids]
         ready = allow_auto and confidence >= .98 and not request.evidence.get("selection_only")
+        treatment = ("自动采用" if ready else
+                     "模型置信度不足 98%，转人工审核" if confidence < .98 else
+                     "已有审核冲突或页面写入失败，模型仅提供建议，转人工审核")
+        record_event(self, {**event, "status": "adopted" if ready else "review_required",
+                     "api_called": api_called(answer), "model": answer.get("model", ""),
+                     "selected_labels": labels, "confidence": confidence,
+                     "reason": answer["reason"] + "；" + treatment}, sink=self.model_decision_sink)
         trace = {
             "key": key, "platform_id": canonical_platform_name(request.platform_id), "field_id": request.field_id,
             "field_label": request.field_label, "category_leaf_id": request.category_leaf_id,
             "snapshot_version": snapshot.snapshot_version, "excel_value": request.excel_value,
             "selected_value_ids": ids, "selected_labels": labels, "confidence": confidence,
-            "reason": answer["reason"], "evidence_kinds": kinds,
+            "reason": answer["reason"], "treatment_reason": treatment, "evidence_kinds": kinds,
             "learning_review_ids": answer.get("learning_review_ids", []),
             "product_evidence": answer.get("product_evidence", {}),
             "candidate_options": payload["options"], "input_evidence": payload["evidence"],
@@ -477,8 +503,6 @@ class AttributeRuntime:
             ",".join(ids), ",".join(labels), "deepseek", snapshot.snapshot_version,
         )
         if ready:
-            logging.getLogger("kuaimai_erp").info("DeepSeek 自动判断：%s | %s：Excel=%s → %s；置信度=%.1f%%；依据=%s",
-                request.platform_id, request.field_label, request.excel_value, "、".join(labels), confidence * 100, answer["reason"])
             return self._remember_resolved(request, result)
         return result if not allow_auto else None
 
@@ -602,6 +626,8 @@ class AttributeRuntime:
     def _remember_resolved(
         self, request: AttributeRequest, resolved: ResolvedAttribute
     ) -> ResolvedAttribute:
+        if resolved.source != "deepseek" and request.control_type != "ocr_semantic":
+            self._record_model_skip(request, resolved.source, resolved.label)
         self._resolved_attributes[
             (
                 canonical_platform_name(request.platform_id),
@@ -609,6 +635,16 @@ class AttributeRuntime:
             )
         ] = (request, resolved)
         return resolved
+
+    def _record_model_skip(self, request, reason_code, label=""):
+        from model_judgments import reason_text, record_event
+        record_event(self, {
+            "key": "skip:" + canonical_sha256((request.platform_id, request.field_id, request.excel_value, reason_code)),
+            "platform_id": canonical_platform_name(request.platform_id), "field_id": request.field_id,
+            "field_label": request.field_label, "excel_value": request.excel_value,
+            "status": "skipped", "api_called": False, "reason_code": reason_code,
+            "reason": reason_text(reason_code), "selected_labels": [label] if label else [],
+        }, sink=self.model_decision_sink)
 
     def remember_resolved(
         self, request: AttributeRequest, resolved: ResolvedAttribute
@@ -678,8 +714,24 @@ class AttributeRuntime:
                     trace["readback_status"] = "verified" if Counter(actual) == Counter(expected) else "mismatch"
                     trace["readback_values"] = list(values)
             if resolved.source == "deepseek":
-                # Keep model adoption in the run audit; it cannot create human
-                # training votes merely because a browser write succeeded.
+                # Save verified model experience separately from human votes.
+                trace = next((row for row in self.model_decisions
+                              if row["field_id"] == request.field_id and row["snapshot_version"] == resolved.snapshot_version), None)
+                if trace is not None:
+                    logging.getLogger("kuaimai_erp").info(
+                        "大模型判断回读：%s | %s；期望=%s；实际=%s；结果=%s",
+                        platform, request.field_label, "、".join(trace["selected_labels"]),
+                        "、".join(values) or "空", "通过" if trace["readback_status"] == "verified" else "不一致")
+                    if trace["readback_status"] == "verified":
+                        fact = {"product_version": self.product_version, "source": "model_verified",
+                                "payload_json": {"model_verified": {
+                                    "run_id": self.run_id, "platform_id": platform, "field_id": request.field_id,
+                                    "field_label": request.field_label, "control_type": request.control_type,
+                                    "excel_value": request.excel_value, "selected_labels": trace["selected_labels"],
+                                    "confidence": trace["confidence"], "reason": trace["reason"],
+                                    "model": trace.get("model", ""), "readback_verified": True,
+                                }}}
+                        self.store.enqueue("model_verified:" + canonical_sha256(fact), "text_facts.created", fact)
                 continue
             if resolved.is_no_fill:
                 # An intentional omission is not a verified platform value.

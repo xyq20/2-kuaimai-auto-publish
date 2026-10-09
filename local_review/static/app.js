@@ -349,13 +349,33 @@ function renderJob(job) {
   if (!judgment) {
     judgment = document.createElement('details'); judgment.id = 'model-judgment-details';
     judgment.className = 'log-details'; judgment.open = true;
-    $('log-details').before(judgment);
+    $('run-stages').before(judgment);
+    $('log-details').open = false;
   }
   const decisions = job.model_decisions || [];
-  judgment.hidden = !decisions.length;
+  const events = job.model_events || [];
+  const summary = job.model_summary || {};
+  judgment.hidden = false;
   const judgmentStates = {adopted:'自动采用', review_required:'待人工审核', rejected:'校验拒绝', verified:'回读通过',
-    mismatch:'回读不一致', pending:'暂无保存回读', source_validated:'原图数据校验通过'};
-  judgment.innerHTML = `<summary>大模型判断汇总 · ${decisions.length} 项</summary><p class="dialog-subtitle">请核对自动采用的类目和属性。置信度是模型自评，保存回读状态单独列出。</p><div class="model-judgment-list">${decisions.map(row => `<article class="model-judgment-item"><div><strong>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)}</strong><span>${escapeHTML(judgmentStates[row.status] || row.status)} · ${Number(row.confidence || 0).toLocaleString(undefined, {style:'percent', maximumFractionDigits:1})}</span></div><p>原值：${escapeHTML(row.excel_value || '无')} → ${escapeHTML((row.selected_labels || []).join('、') || '未采用')}</p><p>${escapeHTML(row.reason || '')}</p><small>${escapeHTML(judgmentStates[row.readback_status] || row.readback_status || '暂无保存回读')}${row.snapshot_version ? ` · 候选快照 ${escapeHTML(row.snapshot_version.slice(-12))}` : ''}${row.learning_review_ids?.length ? ` · 参考审核 ${escapeHTML(row.learning_review_ids.join('、'))}` : ''}</small></article>`).join('')}</div>`;
+    mismatch:'回读不一致', pending:'暂无保存回读', source_validated:'原图数据校验通过',
+    requesting:'正在请求', unavailable:'判断不可用'};
+  const callCount = summary.api_call_count == null ? '未知' : `${summary.api_call_count} 次`;
+  const metrics = [['接口调用',callCount],['自动采用',`${summary.adopted_count || 0} 项`],
+    ['转人工审核',`${summary.review_count || 0} 次`],['异常',`${(summary.unavailable_count || 0)+(summary.rejected_count || 0)} 次`]];
+  const visibleEvents = events.filter(row => row.status !== 'skipped' &&
+    !decisions.some(decision => decision.key === row.key || decision.request_key === row.key));
+  const cards = [...decisions, ...visibleEvents];
+  const cardHTML = cards.map(row => {
+    const confidence = typeof row.confidence === 'number' ? ` · ${row.confidence.toLocaleString(undefined,{style:'percent',maximumFractionDigits:1})}` : '';
+    const detail = [row.treatment_reason, row.model ? `模型：${row.model}` : '',
+      row.snapshot_version ? `候选快照：${row.snapshot_version}` : '',
+      row.learning_review_ids?.length ? `参考人工审核：${row.learning_review_ids.join('、')}` : '',
+      row.source_image ? `OCR 来源：${row.source_image}` : ''].filter(Boolean);
+    return `<article class="model-judgment-item ${escapeHTML(row.status || '')}"><div><strong>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)}</strong><span class="model-state ${escapeHTML(row.status || '')}">${escapeHTML(judgmentStates[row.status] || row.status)}${confidence}</span></div><p class="model-choice"><span>${escapeHTML(row.excel_value || '无原值')}</span><span aria-hidden="true">→</span><strong>${escapeHTML((row.selected_labels || []).join('、') || '无确定建议')}</strong></p><p>${escapeHTML(row.reason || '')}</p>${row.readback_status ? `<small>${escapeHTML(judgmentStates[row.readback_status] || row.readback_status)}${row.readback_values ? ` · 实际：${escapeHTML(row.readback_values.join('、') || '空')}` : ''}</small>` : ''}${detail.length ? `<details class="model-trace"><summary>查看依据与溯源</summary><p>${detail.map(escapeHTML).join('<br>')}</p></details>` : ''}</article>`;
+  }).join('');
+  const skipReasons = summary.skip_reasons || [];
+  const skipped = events.filter(row => row.status === 'skipped');
+  judgment.innerHTML = `<summary>大模型判断 · ${decisions.length} 项结果</summary><div class="model-metrics">${metrics.map(([label,value]) => `<div class="model-metric"><span>${label}</span><strong>${escapeHTML(value)}</strong></div>`).join('')}</div>${summary.not_called_reason ? `<p class="model-explanation">${escapeHTML(summary.not_called_reason)}</p>` : ''}${summary.stop_reason ? `<p class="model-explanation">运行中断：${escapeHTML(summary.stop_reason)}</p>` : ''}${summary.unknown_call_count ? `<p class="model-explanation">${summary.unknown_call_count} 次判断服务请求未返回完整调用状态。</p>` : ''}<p class="model-help">核对模型建议、采用结果和保存回读。置信度为模型自评。</p><div class="model-judgment-list">${cardHTML || '<p class="model-empty">本次暂无模型建议，调用状态与原因见上方。</p>'}</div>${skipped.length ? `<details class="model-skipped"><summary>无需模型判断的字段 · ${skipped.length} 项</summary>${skipReasons.map(row => `<p>${escapeHTML(row.reason)} · ${row.count} 项</p>`).join('')}<div>${skipped.map(row => `<p>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)}：${escapeHTML(row.reason)}</p>`).join('')}</div></details>` : ''}`;
   if (job.log !== undefined) { const log = $('run-log'); const bottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40; log.textContent = job.log || '任务已创建，等待程序输出…'; if (bottom) log.scrollTop = log.scrollHeight; }
   $('run-confirm').hidden = true;
   $('run-review').hidden = !(job.pending_reviews && isActive(job));

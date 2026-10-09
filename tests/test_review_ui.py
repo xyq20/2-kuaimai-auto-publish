@@ -6,6 +6,51 @@ from local_review.ui import SCRIPT, page as review_page
 
 
 class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_board_displays_results_failures_and_zero_reason(self):
+        from playwright.async_api import async_playwright
+        static = Path(__file__).resolve().parents[1]/'local_review'/'static'
+        html = re.sub(r'<script[^>]+src="[^"]+"[^>]*></script>', '',
+                      (static/'index.html').read_text())
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                tab = await browser.new_page(viewport={'width':1280, 'height':900})
+                await tab.set_content(html)
+                await tab.add_style_tag(content=(static/'styles.css').read_text())
+                await tab.evaluate('''() => {
+                  window.fetch = async path => new Response(JSON.stringify(
+                    path === '/api/launcher/config' ? {user:{username:'admin',role:'admin'},learning_available:true} :
+                    path === '/api/launcher/products' ? {products:[]} :
+                    path === '/api/launcher/jobs' ? {jobs:[]} : {tasks:[]}
+                  ), {status:200,headers:{'content-type':'application/json'}});
+                }''')
+                await tab.add_script_tag(content=(static/'app.js').read_text())
+                await tab.evaluate('''() => {
+                  renderJob({id:'a'.repeat(32), style_code:'2024', mode:'save', status:'failed',stages:[],
+                    model_decisions:[], model_events:[], model_summary:{api_call_count:0, decision_count:0,
+                      adopted_count:0,review_count:0,unavailable_count:0,rejected_count:0,
+                      not_called_reason:'未调用大模型：小红书类目路径校验中断'}});
+                  document.getElementById('run-dialog').showModal();
+                }''')
+                board = tab.locator('#model-judgment-details')
+                self.assertTrue(await board.is_visible())
+                self.assertIn('路径校验中断', await board.inner_text())
+                await tab.evaluate('''() => renderJob({id:'a'.repeat(32),style_code:'2024',mode:'save',status:'failed',stages:[],
+                  model_summary:{api_call_count:2,adopted_count:1,review_count:0,unavailable_count:1,rejected_count:0},
+                  model_events:[{key:'bad',platform_id:'xhs',field_label:'商品类目',status:'unavailable',reason:'DeepSeek 请求超时'}],
+                  model_decisions:[{key:'good',platform_id:'wxsph',field_label:'版型',excel_value:'平直廓形',selected_labels:['直筒'],
+                    confidence:.99,status:'adopted',model:'deepseek-flash',reason:'含义一致',readback_status:'verified'}]})''')
+                text = await board.inner_text()
+                self.assertIn('直筒', text)
+                self.assertIn('自动采用', text)
+                self.assertIn('请求超时', text)
+                self.assertIn('回读通过', text)
+                self.assertEqual(await board.locator('.model-metric').count(), 4)
+                await tab.set_viewport_size({'width':390,'height':844})
+                self.assertTrue(await tab.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
+            finally:
+                await browser.close()
+
     async def test_expired_claim_retries_same_selection_after_reclaim(self):
         from playwright.async_api import async_playwright
 

@@ -948,6 +948,32 @@ class XhsFormListing(TaobaoListing):
                 return match.group(1)
         return ""
 
+    @staticmethod
+    def _category_selection_matches(selected, path):
+        """Use the same route check before clicking and before confirming."""
+        levels = category_path_levels(selected)
+        expression = " > ".join(path)
+        variants = category_input_variants(expression)
+        for variant in variants:
+            cursor = 0
+            for part in variant:
+                wanted = normalize_label(part)
+                while cursor < len(levels) and wanted not in levels[cursor]:
+                    cursor += 1
+                if cursor == len(levels):
+                    break
+                cursor += 1
+            else:
+                return True
+        if not levels:
+            return False
+        expected = category_input_levels(expression)
+        leaves = {normalize_label(option) for option in (expected[-1] if expected else ())}
+        gender = {normalize_label(root) for root in category_gender_roots(category_input_hints(expression))}
+        actual = {option for level in levels for option in level}
+        root_match = bool(expected and any(normalize_label(option) in levels[0] for option in expected[0]))
+        return bool(leaves & set(levels[-1])) and (root_match or not gender or bool(gender & actual))
+
     async def apply_category(self, category_path: Sequence[str]) -> Mapping[str, Any]:
         """Search Excel leaf alternatives in order and verify the route."""
         if self.panel is None:
@@ -959,6 +985,8 @@ class XhsFormListing(TaobaoListing):
         if await modify.count() != 1:
             raise XhsFormListingError("小红书页面找不到唯一的“修改类目”按钮")
         started = asyncio.get_running_loop().time()
+        reviewed_path = ""
+        validation_errors = []
         await modify.click(timeout=30_000)
         dialog = await self._category_dialog()
         search = await self._category_search_input(dialog)
@@ -979,6 +1007,12 @@ class XhsFormListing(TaobaoListing):
                     self.logger.info("小红书类目按 Excel 顺序搜索：%s", search_term)
                 try:
                     target, target_text, strategy = await self._wait_for_category_result(path, capture)
+                    if not self._category_selection_matches(target_text, path):
+                        validation_errors.append({"expected": " > ".join(path), "actual": target_text,
+                                                  "reason": "完整类目路径校验不匹配"})
+                        if self.logger is not None:
+                            self.logger.info("小红书类目候选路径校验不匹配：%s；继续 Excel 备选，全部无法确定时请求模型辅助校验", target_text)
+                        raise XhsFormListingError("小红书类目当前搜索没有匹配候选")
                     break
                 except XhsFormListingError as exc:
                     for candidate_path in capture.paths:
@@ -986,7 +1020,11 @@ class XhsFormListing(TaobaoListing):
                         if normalized_path and normalized_path not in observed_origins:
                             observed_paths.append(candidate_path)
                             observed_origins[normalized_path] = search_term
-                    if str(exc) not in (
+                    ambiguous = "不是唯一" in str(exc)
+                    if ambiguous:
+                        validation_errors.append({"expected": " > ".join(path), "actual": list(capture.paths),
+                                                  "reason": str(exc)})
+                    if not ambiguous and str(exc) not in (
                         "小红书类目搜索接口返回空候选", "小红书类目当前搜索没有匹配候选",
                     ):
                         raise
@@ -994,7 +1032,9 @@ class XhsFormListing(TaobaoListing):
                         self.logger.info("小红书类目搜索“%s”无匹配，尝试下一项", search_term)
             else:
                 reviewed = await self._resolve_category_review(
-                    tuple(observed_paths), source="excel_search_ambiguous"
+                    tuple(observed_paths), source="excel_validation_mismatch" if validation_errors else "excel_search_ambiguous",
+                    excel_value=" > ".join(path),
+                    evidence={"validation_error": validation_errors} if validation_errors else {},
                 )
                 if not reviewed:
                     raise XhsFormListingError(
@@ -1014,6 +1054,7 @@ class XhsFormListing(TaobaoListing):
                     (reviewed,), capture
                 )
                 strategy = "review_learning"
+                reviewed_path = reviewed
                 search_term = origin
             json_paths = tuple(capture.paths)
             result_ready_at = asyncio.get_running_loop().time()
@@ -1028,45 +1069,10 @@ class XhsFormListing(TaobaoListing):
             if selected:
                 break
             await asyncio.sleep(0.1)
-        selected_levels = category_path_levels(selected)
-        expected_expression = " > ".join(path)
-        expected_variants = tuple(
-            tuple(normalize_label(part) for part in variant)
-            for variant in category_input_variants(expected_expression)
+        selected_ok = (
+            self._normalize_category_path(selected) == self._normalize_category_path(reviewed_path)
+            if reviewed_path else self._category_selection_matches(selected, path)
         )
-
-        def contains_ordered(levels, expected):
-            cursor = 0
-            for wanted in expected:
-                while cursor < len(levels) and wanted not in levels[cursor]:
-                    cursor += 1
-                if cursor == len(levels):
-                    return False
-                cursor += 1
-            return True
-
-        selected_ok = any(
-            contains_ordered(selected_levels, expected)
-            for expected in expected_variants
-        )
-        if not selected_ok and selected_levels:
-            expected_levels = category_input_levels(expected_expression)
-            expected_leaf = {
-                normalize_label(option)
-                for option in (expected_levels[-1] if expected_levels else ())
-            }
-            actual_leaf = set(selected_levels[-1])
-            gender_roots = {
-                normalize_label(root)
-                for root in category_gender_roots(category_input_hints(expected_expression))
-            }
-            actual_flat = {option for level in selected_levels for option in level}
-            root_match = bool(expected_levels and any(
-                normalize_label(option) in selected_levels[0]
-                for option in expected_levels[0]
-            ))
-            gender_match = not gender_roots or bool(gender_roots & actual_flat)
-            selected_ok = bool(expected_leaf & actual_leaf) and (root_match or gender_match)
         if not selected_ok:
             raise XhsFormListingError(
                 "小红书类目确认前路径不匹配：目标 {0}，页面为 {1!r}".format(

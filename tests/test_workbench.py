@@ -190,6 +190,36 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(searched['total_matches'], 1)
         self.assertEqual(searched['jobs'][0]['style_code'], 'MY019-1')
 
+    def test_job_detail_exposes_zero_judgment_reason_and_call_failures(self):
+        self.login()
+        job = self.fake_start()
+        directory = self.launcher.root / job['id']
+        stored = json.loads((directory/'job.json').read_text())
+        output = Path(stored['output_dir'])
+        output.mkdir(parents=True, exist_ok=True)
+        atomic_json(output/'model-judgments.json', {
+            'decisions': [], 'events': [{'key':'request', 'status':'unavailable', 'field_label':'商品类目',
+                                        'api_called':False, 'reason':'未配置 DeepSeek key'}],
+            'summary': {'api_call_count':0, 'not_called_reason':'未配置 DeepSeek key'},
+        })
+        response = self.client.get('/api/launcher/jobs/'+job['id'])
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['model_summary']['api_call_count'], 0)
+        self.assertIn('未配置', body['model_events'][0]['reason'])
+        self.assertEqual(body['model_decisions'], [])
+
+    def test_old_zero_judgment_report_does_not_claim_no_api_calls(self):
+        job = self.fake_start()
+        stored = json.loads((self.launcher.root/job['id']/'job.json').read_text())
+        output = Path(stored['output_dir']); output.mkdir(parents=True, exist_ok=True)
+        atomic_json(output/'model-judgments.json', {'decisions': []})
+        (self.launcher.root/job['id']/'run.log').write_text('ERROR | 小红书类目路径不匹配\n')
+        body = self.launcher._public(stored, logs=True)
+        self.assertIsNone(body['model_summary']['api_call_count'])
+        self.assertIn('旧版', body['model_summary']['not_called_reason'])
+        self.assertIn('路径不匹配', body['model_summary']['stop_reason'])
+
     def test_api_requires_login_admin_and_same_origin_for_mutations(self):
         self.assertEqual(self.client.get('/api/launcher/products').status_code,401)
         self.login('reviewer')

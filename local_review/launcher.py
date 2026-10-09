@@ -361,6 +361,8 @@ class Launcher:
         if logs:
             report = read_json(Path(job["output_dir"]) / "model-judgments.json", {})
             result["model_decisions"] = report.get("decisions", [])
+            result["model_events"] = report.get("events", [])
+            result["model_summary"] = report.get("summary")
             try:
                 with (self.root / job["id"] / "run.log").open("rb") as handle:
                     handle.seek(0, 2)
@@ -368,6 +370,18 @@ class Launcher:
                     result["log"] = handle.read().decode("utf-8", errors="replace")
             except OSError:
                 result["log"] = ""
+            if result["model_summary"] is None:
+                errors = [line.split("ERROR |", 1)[-1].strip() for line in result["log"].splitlines() if "ERROR |" in line]
+                result["model_summary"] = {
+                    "api_call_count": None,
+                    "decision_count": len(result["model_decisions"]),
+                    "adopted_count": sum(row.get("status") == "adopted" for row in result["model_decisions"]),
+                    "review_count": sum(row.get("status") == "review_required" for row in result["model_decisions"]),
+                    "stop_reason": errors[-1] if errors else "",
+                    "not_called_reason": "旧版运行记录未记录调用次数，无法确认是否调用模型。" if report else
+                        "尚无模型诊断记录。任务执行到需要判断的字段时会显示结果。" if job["status"] in ACTIVE else
+                        "本次运行未生成模型诊断记录，请结合运行错误排查。",
+                }
             for secret in (self.settings.device_token, self.settings.model_api_key, self.settings.deepseek_api_key):
                 if secret:
                     result["log"] = result["log"].replace(secret, "[已隐藏]")
