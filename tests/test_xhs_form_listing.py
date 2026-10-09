@@ -529,6 +529,9 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
                 return {'status':'suggested','source':'deepseek','api_called':True,'model':'deepseek-flash',
                     'snapshot_version':payload['snapshot_version'],'value_ids':[choice['value_id']],
                     'confidence':.99,'evidence_kinds':['excel','product'],
+                    'assessment':{'relation':'inferred','source_text':payload['excel_value'],
+                                  'assumptions':[],'conflicts':[],'competing_value_ids':[]},
+                    'grounded_support':[{'source':'product','text':'羊毛开衫'}],
                     'reason':'羊毛开衫符合 Excel 毛衣类目，奢侈品分支不符合商品信息'}
             client.semantic_judge.side_effect = judgment
             listing.attribute_runtime = AttributeRuntime(store,client,'run','product')

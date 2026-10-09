@@ -387,7 +387,7 @@ class LocalReviewApiTests(unittest.TestCase):
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
 
-    def test_failed_run_reviews_are_hidden_from_operator_queue(self):
+    def test_failed_run_reviews_are_available_in_focused_run_queue(self):
         self.product_and_snapshot()
         self.event(
             "review-failed-run",
@@ -427,6 +427,18 @@ class LocalReviewApiTests(unittest.TestCase):
         )
         self.login()
         self.assertEqual(self.client.get("/api/reviews").json()["tasks"], [])
+
+        focused = self.client.get('/api/reviews?run_id=run-failed-review').json()['tasks']
+        self.assertEqual([task['id'] for task in focused], ['review-failed-run'])
+        self.assertEqual(focused[0]['run_status'], 'failed')
+        headers = {'Origin':'http://testserver'}
+        claim = self.client.post('/api/reviews/review-failed-run/claim', headers=headers, json={'version':1})
+        self.assertEqual(claim.status_code, 200)
+        confirmed = self.client.post('/api/reviews/review-failed-run/no_fill', headers=headers,
+                                     json={'version':claim.json()['version']})
+        self.assertEqual(confirmed.status_code, 200)
+        with connect(self.settings) as connection:
+            self.assertEqual(connection.execute("SELECT status FROM run_checkpoints WHERE run_id='run-failed-review'").fetchone()[0], 'failed')
 
     def test_tunnel_forwarded_https_origin_gets_secure_session_cookie(self):
         response = self.client.post(

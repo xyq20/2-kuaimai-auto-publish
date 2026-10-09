@@ -101,6 +101,12 @@ def judge_attribute(settings, data):
         "输出 JSON: {\"value_ids\":[\"候选ID\"],\"confidence\":0.99,\"reason\":\"具体判断依据\","
         "\"evidence_kinds\":[\"excel\",\"human_learning\",\"product\"]}。evidence_kinds只列真实支持的依据。"
         "单选和类目只能一个值；multi_select可多个，必须有实际依据。"
+        "另提供 assessment 对象：relation 为 equivalent（纯同义、表达形式差异，未增加或删减含义）、"
+        "inferred（结合商品资料推断）或 uncertain；source_text 必须原样引用 request.excel_value；"
+        "assumptions 列出未经证实的假设，conflicts 列出冲突，competing_value_ids 列出仍可能适用的其他候选。"
+        "三个列表没有对应内容时返回空数组。不得把推断伪装成同义，不得隐去竞争候选来提高通过率。"
+        "推断时额外输出 supporting_quotes:[{source:'product'或'human_learning',text:'支持所选值的资料原文'}]；"
+        "必须逐字引用 product_and_learning 中商品资料或人工历史的原文，不能引用模型历史冒充人工依据。"
     )
     try:
         answer = request_json(settings, system, {"request": data, "product_and_learning": context})
@@ -120,7 +126,30 @@ def judge_attribute(settings, data):
              and ("human_learning" not in kinds or bool(context["human_examples"])))
     if not valid:
         return {**waiting, "reason_code": "deepseek_invalid_judgment"}
+    assessment = answer.get("assessment")
+    if not (isinstance(assessment, dict) and assessment.get("relation") in {"equivalent", "inferred", "uncertain"}
+            and assessment.get("source_text") == data["excel_value"].strip()
+            and all(isinstance(assessment.get(k), list) and all(isinstance(v, str) for v in assessment[k])
+                    for k in ("assumptions", "conflicts", "competing_value_ids"))):
+        assessment = {"relation": "unclassified"}
+    else:
+        assessment = dict(assessment)
+        selected_labels = [o["label"] for o in options if o["value_id"] in ids]
+        conflicts = list(assessment["conflicts"])
+        for example in context["human_examples"]:
+            if (example.get("same_product") and example.get("excel_candidates") == [data["excel_value"].strip()]
+                    and set(example["selected_labels"]) != set(selected_labels)):
+                conflicts.append("本商品已有人工确认与模型建议不一致：" + example["review_id"])
+        assessment["conflicts"] = conflicts
+    sources = {"product": json.dumps({k:v for k,v in context.items() if k in {"title", "category", "product_info"}}, ensure_ascii=False),
+               "human_learning": json.dumps(context["human_examples"], ensure_ascii=False)}
+    quotes = answer.get("supporting_quotes")
+    grounded = [q for q in quotes if isinstance(q, dict) and q.get("source") in kinds
+                and q.get("source") in sources and isinstance(q.get("text"), str)
+                and len(q["text"].strip()) >= 2 and q["text"] in sources[q["source"]]] if isinstance(quotes, list) else []
     return {**waiting, "status": "suggested", "value_ids": ids, "confidence": confidence, "model": settings.deepseek_model,
+            "grounded_support": grounded,
+            "assessment": assessment,
             "reason": reason, "evidence_kinds": kinds,
             "product_evidence": {k: v for k, v in context.items() if k != "human_examples"},
             "learning_review_ids": [example["review_id"] for example in context["human_examples"]]}

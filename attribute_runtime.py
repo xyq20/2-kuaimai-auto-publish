@@ -474,10 +474,10 @@ class AttributeRuntime:
                     self.model_decision_sink()
             return None
         labels = [next(c.label for c in request.candidates if c.value_id == ident) for ident in ids]
-        ready = allow_auto and confidence >= .98 and not request.evidence.get("selection_only")
-        treatment = ("自动采用" if ready else
-                     "模型置信度不足 98%，转人工审核" if confidence < .98 else
-                     "已有审核冲突或页面写入失败，模型仅提供建议，转人工审核")
+        from semantic_policy import adoption_policy
+        policy = adoption_policy(answer, request, allow_auto=allow_auto)
+        ready = policy["auto_adopt"]
+        treatment = policy["reason"]
         record_event(self, {**event, "status": "adopted" if ready else "review_required",
                      "api_called": api_called(answer), "model": answer.get("model", ""),
                      "selected_labels": labels, "confidence": confidence,
@@ -490,6 +490,8 @@ class AttributeRuntime:
             "reason": answer["reason"], "treatment_reason": treatment, "evidence_kinds": kinds,
             "learning_review_ids": answer.get("learning_review_ids", []),
             "product_evidence": answer.get("product_evidence", {}),
+            "assessment": answer.get("assessment", {}), "adoption_policy": policy,
+            "grounded_support": answer.get("grounded_support", []),
             "candidate_options": payload["options"], "input_evidence": payload["evidence"],
             "status": "adopted" if ready else "review_required", "readback_status": "pending",
             "source": "deepseek",
@@ -730,6 +732,9 @@ class AttributeRuntime:
                                     "excel_value": request.excel_value, "selected_labels": trace["selected_labels"],
                                     "confidence": trace["confidence"], "reason": trace["reason"],
                                     "model": trace.get("model", ""), "readback_verified": True,
+                                    "adoption_policy": trace.get("adoption_policy", {}),
+                                    "assessment": trace.get("assessment", {}),
+                                    "grounded_support": trace.get("grounded_support", []),
                                 }}}
                         self.store.enqueue("model_verified:" + canonical_sha256(fact), "text_facts.created", fact)
                 continue

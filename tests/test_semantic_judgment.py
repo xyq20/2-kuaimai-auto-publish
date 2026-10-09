@@ -33,6 +33,8 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
                     'snapshot_version': payload['snapshot_version'],
                     'value_ids': ['straight'], 'confidence': confidence,
                     'reason': 'Excel 平直廓形与候选直筒含义一致',
+                    'assessment': {'relation':'equivalent','source_text':payload['excel_value'],
+                                   'assumptions':[],'conflicts':[],'competing_value_ids':[]},
                     'evidence_kinds': ['excel'], **overrides}
         self.client.semantic_judge.side_effect = judge
 
@@ -128,6 +130,22 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.model_events[0]['api_called'], False)
         self.assertEqual(self.runtime.model_events[0]['status'], 'skipped')
 
+    async def test_equivalence_at_ninety_percent_adopts_without_human_review(self):
+        self.suggestion(.90)
+        result = await self.runtime.resolve(self.request)
+        await self.runtime.drain()
+        self.assertEqual(result.source, 'deepseek')
+        self.assertEqual(self.runtime.model_decisions[0]['adoption_policy']['threshold'], .9)
+        self.assertEqual(self.store.connection.execute("SELECT count(*) FROM sync_outbox WHERE event_type='review.created'").fetchone()[0],0)
+
+    async def test_high_score_with_competing_candidate_goes_to_review(self):
+        self.suggestion(.99, assessment={'relation':'equivalent','source_text':self.request.excel_value,
+                        'assumptions':[],'conflicts':[],'competing_value_ids':['loose']})
+        with self.assertRaises(ReviewRequired):
+            await self.runtime.resolve(self.request)
+        await self.runtime.drain()
+        self.assertIn('其他可能候选', self.runtime.model_decisions[0]['treatment_reason'])
+
     async def test_verified_model_results_are_stored_separately_from_human_votes(self):
         self.suggestion(api_called=True)
         await self.runtime.resolve(self.request)
@@ -142,6 +160,22 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SemanticEndpointTests(unittest.TestCase):
+    def test_inference_quotes_are_checked_and_same_product_human_conflict_is_attached(self):
+        from local_review.semantic import judge_attribute
+        settings=Settings(Path('unused'),'device',deepseek_api_key='private')
+        payload={'product_version':'p','platform_id':'xhs','category_leaf_id':'c','field_id':'style',
+                 'field_label':'风格','control_type':'select','snapshot_version':'s','excel_value':'休闲风',
+                 'options':[{'value_id':'a','label':'美式休闲'}],'evidence':{}}
+        context={'title':'商品提花毛衣','product_info':{},'human_examples':[{'review_id':'r','same_product':True,
+                 'excel_candidates':['休闲风'],'selected_labels':['商务休闲']}]}
+        answer={'value_ids':['a'],'confidence':.99,'reason':'推断','evidence_kinds':['excel','product'],
+                'assessment':{'relation':'inferred','source_text':'休闲风','assumptions':[],'conflicts':[],'competing_value_ids':[]},
+                'supporting_quotes':[{'source':'product','text':'不存在的原文'}]}
+        with patch('local_review.semantic.judgment_context',return_value=context),patch('local_review.semantic.request_json',return_value=answer):
+            result=judge_attribute(settings,payload)
+        self.assertEqual(result['grounded_support'],[])
+        self.assertTrue(result['assessment']['conflicts'])
+
     def test_api_validates_candidate_and_keeps_human_records_as_context(self):
         from local_review.semantic import judge_attribute
         settings = Settings(Path('unused'), 'device', deepseek_api_key='private')

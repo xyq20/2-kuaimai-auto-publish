@@ -147,7 +147,7 @@ function renderPlan() {
   });
 }
 function setMode(id) { state.mode = id; renderPlan(); remember(); }
-function showView(view) {
+function showView(view, reviewRun='', reviewId='') {
   document.body.classList.toggle('review-active', view === 'review');
   ['home','history','review'].forEach(name => {
     $(name+'-view').hidden = name !== view;
@@ -155,7 +155,8 @@ function showView(view) {
   });
   document.querySelector('.breadcrumb strong').textContent = {home:'商品运行',history:'运行记录',review:'商品属性审核'}[view];
   if (view === 'review') {
-    if (!$('review-frame').getAttribute('src')) $('review-frame').src = '/review?embedded=1';
+    const src = '/review?embedded=1' + (reviewRun ? '&run_id='+encodeURIComponent(reviewRun) : '') + (reviewId ? '&review_id='+encodeURIComponent(reviewId) : '');
+    if ($('review-frame').getAttribute('src') !== src) $('review-frame').src = src;
     else $('review-frame').contentWindow.postMessage({type:'refresh-review'}, location.origin);
   }
   if (location.hash !== '#'+view) history.replaceState(null,'','#'+view);
@@ -365,9 +366,12 @@ function renderJob(job) {
   const visibleEvents = events.filter(row => row.status !== 'skipped' &&
     !decisions.some(decision => decision.key === row.key || decision.request_key === row.key));
   const cards = [...decisions, ...visibleEvents];
+  const expandedTraces = new Set([...judgment.querySelectorAll('.model-trace[open]')].map(node => node.closest('article').dataset.judgmentKey));
+  const judgmentScroll = judgment.querySelector('.model-judgment-list')?.scrollTop || 0;
   const cardHTML = cards.map(row => {
     const confidence = typeof row.confidence === 'number' ? ` · ${row.confidence.toLocaleString(undefined,{style:'percent',maximumFractionDigits:1})}` : '';
     const detail = [row.treatment_reason, row.model ? `模型：${row.model}` : '',
+      row.adoption_policy ? `判断类型：${({equivalent:'同义映射',inferred:'事实推断',unclassified:'依据不完整'})[row.adoption_policy.relation] || row.adoption_policy.relation}；门槛：${Math.round(row.adoption_policy.threshold*100)}%；策略：${row.adoption_policy.version}` : '',
       row.snapshot_version ? `候选快照：${row.snapshot_version}` : '',
       row.learning_review_ids?.length ? `参考人工审核：${row.learning_review_ids.join('、')}` : '',
       row.source_image ? `OCR 来源：${row.source_image}` : ''].filter(Boolean);
@@ -377,8 +381,25 @@ function renderJob(job) {
   const skipped = events.filter(row => row.status === 'skipped');
   judgment.innerHTML = `<summary>大模型判断 · ${decisions.length} 项结果</summary><div class="model-metrics">${metrics.map(([label,value]) => `<div class="model-metric"><span>${label}</span><strong>${escapeHTML(value)}</strong></div>`).join('')}</div>${summary.not_called_reason ? `<p class="model-explanation">${escapeHTML(summary.not_called_reason)}</p>` : ''}${summary.stop_reason ? `<p class="model-explanation">运行中断：${escapeHTML(summary.stop_reason)}</p>` : ''}${summary.unknown_call_count ? `<p class="model-explanation">${summary.unknown_call_count} 次判断服务请求未返回完整调用状态。</p>` : ''}<p class="model-help">核对模型建议、采用结果和保存回读。置信度为模型自评。</p><div class="model-judgment-list">${cardHTML || '<p class="model-empty">本次暂无模型建议，调用状态与原因见上方。</p>'}</div>${skipped.length ? `<details class="model-skipped"><summary>无需模型判断的字段 · ${skipped.length} 项</summary>${skipReasons.map(row => `<p>${escapeHTML(row.reason)} · ${row.count} 项</p>`).join('')}<div>${skipped.map(row => `<p>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)}：${escapeHTML(row.reason)}</p>`).join('')}</div></details>` : ''}`;
   if (job.log !== undefined) { const log = $('run-log'); const bottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40; log.textContent = job.log || '任务已创建，等待程序输出…'; if (bottom) log.scrollTop = log.scrollHeight; }
+  judgment.querySelectorAll('.model-judgment-item').forEach((card,index) => {
+    const row = cards[index];
+    card.dataset.judgmentKey = row.key || String(index);
+    const trace = card.querySelector('.model-trace');
+    if (trace) trace.open = expandedTraces.has(card.dataset.judgmentKey);
+    if (row.status !== 'review_required') return;
+    const review = (job.review_tasks || []).find(task => task.platform_id === row.platform_id && task.snapshot_version === row.snapshot_version && task.field_id === row.field_id);
+    if (review && ['pending','claimed'].includes(review.status)) {
+      const button = document.createElement('button'); button.textContent = '审核这一项';
+      button.onclick = () => { $('run-dialog').close(); showView('review',job.id,review.id); };
+      card.append(button);
+    } else {
+      card.querySelector('.model-state').textContent = review ? '审核已处理' : '建议审核 · 尚无可处理任务';
+    }
+  });
+  judgment.querySelector('.model-judgment-list').scrollTop = judgmentScroll;
   $('run-confirm').hidden = true;
-  $('run-review').hidden = !(job.pending_reviews && isActive(job));
+  $('run-review').hidden = !job.pending_reviews;
+  $('run-review').onclick = () => { $('run-dialog').close(); showView('review',job.id); };
   $('run-secondary').textContent = job.status === 'stopping' ? '正在停止…' : isActive(job) && state.admin ? '停止任务' : '关闭';
   $('run-secondary').classList.toggle('stop', !!isActive(job));
   $('run-secondary').disabled = job.status === 'stopping' || actionBusy;

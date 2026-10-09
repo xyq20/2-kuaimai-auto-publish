@@ -116,18 +116,20 @@ def _response(data: object, status: int = 200) -> JSONResponse:
     return JSONResponse(data, status_code=status, headers={"cache-control": "no-store"})
 
 
-def _review_tasks(settings: Settings, user_id: str) -> list[dict[str, Any]]:
+def _review_tasks(settings: Settings, user_id: str, run_id: str = "") -> list[dict[str, Any]]:
     now = utc_now()
     with connect(settings) as connection:
         rows = connection.execute(
-            "SELECT r.*,p.title,s.options_json,s.custom_allowed FROM review_tasks r "
+            "SELECT r.*,p.title,s.options_json,s.custom_allowed,"
+            "(SELECT c.status FROM run_checkpoints c WHERE c.run_id=r.run_id) AS run_status FROM review_tasks r "
             "JOIN products p USING(product_version) JOIN option_snapshots s USING(snapshot_version) "
             "WHERE p.deleting=0 AND r.status IN ('pending','claimed') "
             "AND NOT EXISTS(SELECT 1 FROM run_checkpoints c WHERE c.run_id=r.run_id "
-            "AND c.status IN ('failed','completed')) "
+            "AND (c.status='completed' OR (c.status='failed' AND ?=''))) "
+            "AND (?='' OR r.run_id=?) "
             "AND (r.claimed_by IS NULL OR r.claimed_by=? OR r.lease_until<=?) "
             "ORDER BY r.created_at,r.id LIMIT 50",
-            (user_id, now),
+            (run_id, run_id, run_id, user_id, now),
         ).fetchall()
         tasks: list[dict[str, Any]] = []
         for row in rows:
@@ -635,7 +637,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/api/reviews")
     async def reviews(request: Request):
         user = _require_user(request)
-        return _response({"tasks": _review_tasks(configured, user["id"])})
+        run_id = request.query_params.get("run_id", "")
+        require(len(run_id) <= 128, 400, "invalid_run_id")
+        return _response({"tasks": _review_tasks(configured, user["id"], run_id)})
 
     @app.post("/api/reviews/{review_id}/{action}")
     async def review_action(review_id: str, action: str, request: Request):

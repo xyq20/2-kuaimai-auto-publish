@@ -46,10 +46,51 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('请求超时', text)
                 self.assertIn('回读通过', text)
                 self.assertEqual(await board.locator('.model-metric').count(), 4)
+                await tab.evaluate('''() => {
+                  window.pendingJob={id:'a'.repeat(32),style_code:'2024',mode:'save',status:'failed',stages:[],pending_reviews:1,
+                    review_tasks:[{id:'r1',platform_id:'xhs',field_id:'style',snapshot_version:'s1',status:'pending'}],
+                    model_decisions:[{key:'pending',platform_id:'xhs',field_id:'style',field_label:'细分风格',snapshot_version:'s1',
+                      excel_value:'美式休闲风',selected_labels:['美式休闲'],confidence:.95,status:'review_required',reason:'语义一致',model:'deepseek-flash'}]};
+                  renderJob(window.pendingJob);
+                }''')
+                self.assertTrue(await tab.locator('#run-review').is_visible())
+                await board.locator('.model-trace summary').click()
+                await tab.evaluate('renderJob(window.pendingJob)')
+                self.assertTrue(await board.locator('.model-trace').evaluate('node => node.open'))
+                await board.get_by_role('button',name='审核这一项').click()
+                self.assertEqual(await tab.locator('#review-frame').get_attribute('src'),
+                                 '/review?embedded=1&run_id='+'a'*32+'&review_id=r1')
                 await tab.set_viewport_size({'width':390,'height':844})
                 self.assertTrue(await tab.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
             finally:
                 await browser.close()
+
+    async def test_focused_failed_review_loads_and_explains_rerun(self):
+        from playwright.async_api import async_playwright
+        async with async_playwright() as playwright:
+            browser=await playwright.chromium.launch(channel='chrome',headless=True)
+            try:
+                tab=await browser.new_page()
+                html=re.sub(r'<script[^>]+src="[^"]+"[^>]*></script>','',review_page(True))
+                await tab.route('https://review.test/**',lambda route:route.fulfill(body=html,content_type='text/html'))
+                await tab.goto('https://review.test/review?run_id=failed-run&review_id=target')
+                await tab.evaluate('''() => {
+                  window.requests=[];
+                  const task={id:'target',version:1,run_status:'failed',title:'商品',platform_id:'xhs',field_label:'细分风格',
+                    options:[{value_id:'style',label:'美式休闲'}],evidence:{},asset_ids:[],custom_allowed:false};
+                  window.fetch=async path=>{
+                    window.requests.push(path);
+                    return new Response(JSON.stringify(path.includes('/claim')?{version:2,status:'claimed'}:
+                      {tasks:[{...task,id:'other'},task]}),{status:200,headers:{'content-type':'application/json'}});
+                  };
+                }''')
+                await tab.add_script_tag(content=SCRIPT)
+                await tab.locator('#review').wait_for(state='visible')
+                self.assertIn('/api/reviews?run_id=failed-run',await tab.evaluate('window.requests'))
+                self.assertIn('/api/reviews/target/claim',await tab.evaluate('window.requests'))
+                self.assertIn('审核后需重新运行',await tab.locator('#progress').inner_text())
+                self.assertEqual(await tab.locator('#confirm').inner_text(),'确认并保存审核')
+            finally: await browser.close()
 
     async def test_expired_claim_retries_same_selection_after_reclaim(self):
         from playwright.async_api import async_playwright

@@ -345,6 +345,10 @@ class Launcher:
         with connect(self.settings) as connection:
             checkpoint = connection.execute("SELECT current_index,status FROM run_checkpoints WHERE run_id=?", (job["id"],)).fetchone()
             pending = connection.execute("SELECT COUNT(*) FROM review_tasks WHERE run_id=? AND status IN ('pending','claimed')", (job["id"],)).fetchone()[0]
+            review_tasks = [dict(row) for row in connection.execute(
+                "SELECT id,platform_id,field_id,snapshot_version,status FROM review_tasks WHERE run_id=?",
+                (job["id"],),
+            )] if logs else []
         current = checkpoint["current_index"] if checkpoint else next((i for i, s in enumerate(stages.values()) if s != "success"), len(stages))
         if checkpoint:
             for name in list(stages)[:current]:
@@ -359,6 +363,7 @@ class Launcher:
             stages[list(stages)[current]] = job["status"]
         result.update(stages=[{"platform": name, "status": status} for name, status in stages.items()], pending_reviews=pending)
         if logs:
+            result["review_tasks"] = review_tasks
             report = read_json(Path(job["output_dir"]) / "model-judgments.json", {})
             result["model_decisions"] = report.get("decisions", [])
             result["model_events"] = report.get("events", [])

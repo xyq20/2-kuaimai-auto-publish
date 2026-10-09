@@ -78,7 +78,10 @@ class XhsCategoryTreeTests(unittest.IsolatedAsyncioTestCase):
             choice=choices[0]
             return {'status':'suggested','source':'deepseek','api_called':True,'snapshot_version':payload['snapshot_version'],
                 'model':'deepseek-flash','value_ids':[choice['value_id']], 'confidence':confidence,
-                'reason':'商品为男士开衫，选择男装针织衫下开衫叶子','evidence_kinds':['excel','product']}
+                'reason':'商品为男士开衫，选择男装针织衫下开衫叶子','evidence_kinds':['excel','product'],
+                'assessment':{'relation':'inferred','source_text':payload['excel_value'],
+                              'assumptions':[],'conflicts':[],'competing_value_ids':[]},
+                'grounded_support':[{'source':'product','text':'男士开衫'}]}
         client.semantic_judge.side_effect=judge
         listing.attribute_runtime=AttributeRuntime(store,client,'run','product')
         listing.category_hints=('服装','男装','毛衣')
