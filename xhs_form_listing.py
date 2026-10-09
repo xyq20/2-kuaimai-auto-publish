@@ -34,7 +34,7 @@ from category_search import CategorySearchCapture
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
-from platform_discovery import ApiClient, EndpointSpec
+from platform_discovery import ApiClient, EndpointSpec, PlatformDiscoveryError
 from platform_candidate_source import (
     CandidateSourceError,
     DomCandidate,
@@ -55,7 +55,7 @@ from taobao_listing import (
     selection_value_groups_for_control,
 )
 from xhs_data import XhsFields
-from xhs_listing import normalize_xhs_attribute_options
+from xhs_listing import XhsListing, normalize_xhs_attribute_options
 
 
 class XhsFormListingError(RuntimeError):
@@ -869,7 +869,8 @@ class XhsFormListing(TaobaoListing):
     async def _wait_for_category_result(
         self, category_path: Sequence[str], capture: CategorySearchCapture
     ) -> Tuple[Any, str, str]:
-        deadline = asyncio.get_running_loop().time() + 45
+        timeout_seconds = getattr(self, "category_search_timeout_seconds", 12)
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
         last_results: List[Tuple[Any, str]] = []
         while asyncio.get_running_loop().time() < deadline:
             if capture.error:
@@ -905,7 +906,7 @@ class XhsFormListing(TaobaoListing):
                     )
             await asyncio.sleep(0.15)
         if not capture.received:
-            raise XhsFormListingError("小红书类目搜索 JSON 在 45 秒内未返回候选")
+            raise XhsFormListingError("小红书类目搜索 JSON 在 {0} 秒内未返回候选".format(timeout_seconds))
         rendered = "；".join(text for _node, text in last_results[:12])
         raise XhsFormListingError(
             "小红书类目 JSON 已定位，但对应 DOM 行未出现：{0}".format(
@@ -974,8 +975,152 @@ class XhsFormListing(TaobaoListing):
         root_match = bool(expected and any(normalize_label(option) in levels[0] for option in expected[0]))
         return bool(leaves & set(levels[-1])) and (root_match or not gender or bool(gender & actual))
 
+    @staticmethod
+    def _category_tree_scope(candidates, path):
+        """Require an actual gender root, rather than a word in a luxury branch."""
+        roots = {normalize_label(root) for root in category_gender_roots(category_input_hints(path))}
+        if not roots:
+            return tuple(candidates)
+        # Explicit Excel roots distinguish men's clothing from men's shoes.
+        hints = {normalize_label(hint) for hint in category_input_hints(path)}
+        explicit_roots = roots.intersection(hints)
+        if explicit_roots:
+            roots = explicit_roots
+        return tuple(
+            candidate for candidate in candidates
+            if roots.intersection(category_path_levels(candidate.path[:1])[0])
+        )
+
+    @staticmethod
+    def _category_tree_review_candidates(candidates, path):
+        """Keep all real child leaves of a matching family for semantic review."""
+        levels = category_input_levels(path)
+        terms = {normalize_label(term) for term in (levels[-1] if levels else ())}
+        exact, related = [], []
+        for candidate in candidates:
+            labels = {option for level in category_path_levels(candidate.path[1:]) for option in level}
+            if terms.intersection(labels):
+                exact.append(candidate)
+            elif any(term in label or label in term for term in terms for label in labels):
+                related.append(candidate)
+        # A broad parent such as 针织衫/毛衣 is evidence for the family,
+        # never a substitute for the platform's final leaf.
+        return tuple(exact or related or candidates)
+
+    async def _click_category_tree_path(self, dialog: Any, path: Sequence[str]) -> None:
+        for level, label in enumerate(path):
+            menu = dialog.locator(".el-cascader-panel:visible .el-cascader-menu:visible").nth(level)
+            try:
+                await menu.wait_for(state="visible", timeout=12_000)
+            except PlaywrightTimeoutError as exc:
+                raise XhsFormListingError("小红书类目第 {0} 级菜单未显示：{1}".format(level + 1, label)) from exc
+            deadline = asyncio.get_running_loop().time() + 12
+            while True:
+                matches = []
+                nodes = menu.locator(".el-cascader-node:visible")
+                for index in range(await nodes.count()):
+                    node = nodes.nth(index)
+                    node_label = node.locator(".el-cascader-node__label")
+                    text = await (node_label if await node_label.count() == 1 else node).inner_text()
+                    text = re.sub(r"\s*[(（]灰度[)）]\s*$", "", text.strip())
+                    if normalize_label(text) == normalize_label(label):
+                        if "is-disabled" not in (await node.get_attribute("class") or "") and await node.get_attribute("aria-disabled") != "true":
+                            matches.append(node)
+                if len(matches) > 1:
+                    raise XhsFormListingError("小红书类目第 {0} 级同名节点不唯一：{1}".format(level + 1, label))
+                if len(matches) == 1:
+                    await matches[0].scroll_into_view_if_needed()
+                    await matches[0].click(timeout=10_000)
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise XhsFormListingError("小红书类目树 JSON 对应的菜单节点未出现：" + label)
+                await asyncio.sleep(.15)
+
+    async def _confirm_category_path(self, dialog: Any, expected: str) -> str:
+        deadline = asyncio.get_running_loop().time() + 10
+        selected = ""
+        while asyncio.get_running_loop().time() < deadline:
+            selected = self._selected_category_text(await dialog.inner_text())
+            if self._normalize_category_path(selected) == self._normalize_category_path(expected):
+                break
+            await asyncio.sleep(.1)
+        else:
+            raise XhsFormListingError("小红书类目确认前 JSON+DOM 路径不匹配：目标 {0}，页面为 {1!r}".format(expected, selected))
+        confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
+        if await confirm.count() != 1:
+            raise XhsFormListingError("小红书修改类目弹窗找不到唯一“确定”按钮")
+        await confirm.click(timeout=10_000)
+        await dialog.wait_for(state="hidden", timeout=30_000)
+        self.category_clicked = True
+        await self._wait_for_loading_masks()
+        return selected
+
+    async def _apply_category_from_tree(
+        self, dialog: Any, search: Any, path: Sequence[str]
+    ) -> Optional[Mapping[str, Any]]:
+        # Reuse discovery's API parser, including lazy-tree and budget guards.
+        # Limit total discovery time as well as each individual API request.
+        try:
+            candidates = await asyncio.wait_for(XhsListing(panel=self.page).read_category_tree(), timeout=20)
+        except (asyncio.TimeoutError, PlatformDiscoveryError) as exc:
+            if self.logger is not None:
+                self.logger.info("小红书完整类目树暂不可用，使用关键词搜索兼容：%s", sanitize_message(str(exc)))
+            return None
+        scoped = self._category_tree_scope(candidates, path)
+        candidate_paths = tuple(" > ".join(candidate.path) for candidate in scoped)
+        target_text, strategy = "", ""
+        try:
+            target_text, strategy = self._choose_category_text(candidate_paths, path)
+            if not self._category_selection_matches(target_text, path):
+                target_text = ""
+        except XhsFormListingError:
+            pass
+        if target_text:
+            runtime = self.attribute_runtime
+            if runtime is not None and hasattr(runtime, "model_events"):
+                from model_judgments import record_event, reason_text
+                record_event(runtime, {
+                    "key": "skip:xhs-category-tree:" + canonical_sha256((tuple(path), target_text)),
+                    "platform_id": "xhs", "field_id": "category_path", "field_label": "商品类目",
+                    "excel_value": " > ".join(path), "status": "skipped", "api_called": False,
+                    "reason_code": "explicit_text", "reason": reason_text("explicit_text"),
+                    "selected_labels": [target_text],
+                }, sink=runtime.model_decision_sink, logger=self.logger)
+        else:
+            review_candidates = self._category_tree_review_candidates(scoped or candidates, path)
+            target_text = await self._resolve_category_review(
+                tuple(" > ".join(candidate.path) for candidate in review_candidates),
+                source="xhs_category_tree", excel_value=" > ".join(path),
+                evidence={"api_category_tree": True, "api_path": "/xhs/getCategoryTree.json",
+                          "category_tree_complete": True, "live_dom": False,
+                          "excel_category_hints": list(path),
+                          "category_tree_leaf_count": len(candidates),
+                          "category_tree_candidate_count": len(review_candidates),
+                          "gender_root_not_found": bool(not scoped),
+                          "selection_only": bool(not scoped)},
+            )
+            if not target_text:
+                raise XhsFormListingError("小红书完整类目树无法确定末级类目，需要审核后继续")
+            strategy = "review_learning"
+        matched = [candidate for candidate in candidates if " > ".join(candidate.path) == target_text]
+        if len(matched) != 1:
+            raise XhsFormListingError("小红书类目判断结果不在唯一真实叶子范围内")
+        chosen = matched[0]
+        # No tree-wide DOM scan or Vue mutation: click only the selected route.
+        if await search.input_value():
+            await search.fill("", timeout=10_000)
+        await search.blur()
+        await self._click_category_tree_path(dialog, chosen.path)
+        selected = await self._confirm_category_path(dialog, target_text)
+        if self.logger is not None:
+            self.logger.info("小红书完整类目树 JSON+DOM 校验通过：%s；规则=%s；真实叶子=%s", selected, strategy, chosen.leaf_id)
+        return {"path": tuple(path), "clicked_segments": chosen.path, "selected": selected,
+                "matched_result": target_text, "search_term": "", "strategy": strategy,
+                "json_candidate_count": len(candidate_paths), "category_tree_id": chosen.leaf_id,
+                "category_source": "api_tree"}
+
     async def apply_category(self, category_path: Sequence[str]) -> Mapping[str, Any]:
-        """Search Excel leaf alternatives in order and verify the route."""
+        """Resolve real tree leaves first; retain ordered keyword compatibility."""
         if self.panel is None:
             raise XhsFormListingError("请先调用 open() 打开小红书资料")
         path = tuple(str(item).strip() for item in category_path if str(item).strip())
@@ -990,6 +1135,9 @@ class XhsFormListing(TaobaoListing):
         await modify.click(timeout=30_000)
         dialog = await self._category_dialog()
         search = await self._category_search_input(dialog)
+        tree_report = await self._apply_category_from_tree(dialog, search, path)
+        if tree_report is not None:
+            return tree_report
         async with CategorySearchCapture(self.page, self._category_paths_from_json) as capture:
             # Only the actual search-result portal is scanned.  The page also
             # keeps a large cascader tree in the DOM; enumerating that tree was
@@ -1024,7 +1172,8 @@ class XhsFormListing(TaobaoListing):
                     if ambiguous:
                         validation_errors.append({"expected": " > ".join(path), "actual": list(capture.paths),
                                                   "reason": str(exc)})
-                    if not ambiguous and str(exc) not in (
+                    timed_out = str(exc).startswith("小红书类目搜索 JSON 在")
+                    if not ambiguous and not timed_out and str(exc) not in (
                         "小红书类目搜索接口返回空候选", "小红书类目当前搜索没有匹配候选",
                     ):
                         raise
@@ -1062,31 +1211,7 @@ class XhsFormListing(TaobaoListing):
             await target.click(timeout=10_000)
             clicked = tuple(path)
 
-        selected = ""
-        deadline = asyncio.get_running_loop().time() + 10
-        while asyncio.get_running_loop().time() < deadline:
-            selected = self._selected_category_text(await dialog.inner_text())
-            if selected:
-                break
-            await asyncio.sleep(0.1)
-        selected_ok = (
-            self._normalize_category_path(selected) == self._normalize_category_path(reviewed_path)
-            if reviewed_path else self._category_selection_matches(selected, path)
-        )
-        if not selected_ok:
-            raise XhsFormListingError(
-                "小红书类目确认前路径不匹配：目标 {0}，页面为 {1!r}".format(
-                    " / ".join(path), selected
-                )
-            )
-
-        confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
-        if await confirm.count() != 1:
-            raise XhsFormListingError("小红书修改类目弹窗找不到唯一“确定”按钮")
-        await confirm.click(timeout=10_000)
-        await dialog.wait_for(state="hidden", timeout=30_000)
-        self.category_clicked = True
-        await self._wait_for_loading_masks()
+        selected = await self._confirm_category_path(dialog, reviewed_path or target_text)
         if self.logger is not None:
             self.logger.info(
                 "已按 Excel 层级选择小红书类目：%s；页面路径：%s；规则：%s；"

@@ -397,7 +397,12 @@ class XhsListing:
             },
         )
         observations.append(observation)
+        if observation.status != "ok":
+            self._tree_issue(state, "category_tree_api_" + observation.status)
+            return ()
         values = _items(payload) or _items(_mapping(payload).get("list"))
+        if not values:
+            self._tree_issue(state, "category_tree_missing_children")
         return await self._consume_tree_values(
             api,
             values,
@@ -438,6 +443,8 @@ class XhsListing:
                 self._tree_issue(state, "category_tree_node_budget_exceeded")
                 break
             state["node_count"] += 1
+            if value.get("state") in (0, "0") or value.get("disabled") in (True, "true"):
+                continue
             name = str(value.get("name") or value.get("categoryName") or "").strip()
             child_path = path + ((name,) if name else ())
             child_id = value.get("cid") or value.get("categoryId") or value.get("id")
@@ -455,7 +462,9 @@ class XhsListing:
                 continue
             state["visited"].add(child_key)
             nested_children = _items(value.get("children"))
-            if nested_children:
+            # Full-tree responses can explicitly contain an empty parent.
+            # Only a missing children key denotes a lazy subtree to fetch.
+            if "children" in value:
                 candidates.extend(
                     await self._consume_tree_values(
                         api,
@@ -478,6 +487,22 @@ class XhsListing:
                     )
                 )
         return tuple(candidates)
+
+    async def read_category_tree(
+        self, api: Optional[ApiClient] = None
+    ) -> Tuple[CategoryCandidate, ...]:
+        """Read all active leaves without the discovery report's display cap."""
+        observations = []
+        state = {"visited": set(), "request_count": 0, "node_count": 0, "issues": []}
+        candidates = await self._walk_tree(self._client(api), "0", (), observations, state)
+        self._resolution_fragment = SchemaFragment(
+            endpoints=tuple(observations), issues=tuple(state["issues"])
+        )
+        if state["issues"] or not candidates:
+            raise PlatformDiscoveryError(
+                "小红书完整类目树不可用：" + ";".join(state["issues"] or ["no_active_leaves"])
+            )
+        return candidates
 
     async def resolve_category(
         self,
