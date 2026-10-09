@@ -1,7 +1,8 @@
 import unittest
 import tempfile
+import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from attribute_runtime import ResolvedAttribute
 from kuaimai_erp import AutomationError, sync_image_group, wait_for_image_uploads
@@ -41,6 +42,142 @@ class XhsDataTests(unittest.TestCase):
 
 
 class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
+    async def _empty_saved_attribute_listing(self, payload, *, status=200):
+        await self.page.route(
+            "https://api.test/",
+            lambda route: route.fulfill(content_type="text/html", body="<body></body>"),
+        )
+        await self.page.goto("https://api.test/")
+        listing = await self._listing()
+        listing.base_item_id = "saved-product"
+        items = await listing._attribute_items()
+        for _label, item in reversed(tuple(items.values())):
+            await item.evaluate("node => node.remove()")
+        await listing.panel.evaluate(
+            "node => node.insertAdjacentHTML('beforeend', '<div>暂无属性</div>')"
+        )
+        requests = []
+
+        async def detail(route):
+            requests.append(route.request)
+            await route.fulfill(status=status, json=payload)
+
+        await self.page.route("**/xhs/detail.json*", detail)
+        return listing, requests
+
+    async def test_empty_saved_attributes_use_detail_api_with_single_multi_and_no_fill(self):
+        listing, requests = await self._empty_saved_attribute_listing({
+            "result": 1,
+            "data": {
+                "baseItemId": "saved-product",
+                "attributeList": [
+                    {"name": "细分风格", "value": "时尚都市", "valueList": None},
+                    {"name": "适用季节", "value": None, "valueList": [
+                        {"valueId": "winter", "value": "冬季"},
+                        {"valueId": "autumn", "value": "秋季"},
+                    ]},
+                    {"name": "工艺处理", "value": None, "valueList": None},
+                ],
+            },
+        })
+
+        actual = await listing._verify_persisted_attributes({
+            "细分风格": ("时尚都市",), "适用季节": ("秋季", "冬季"), "工艺处理": (),
+        })
+
+        self.assertEqual(actual["细分风格"], ("时尚都市",))
+        self.assertCountEqual(actual["适用季节"], ("秋季", "冬季"))
+        self.assertEqual(actual["工艺处理"], ())
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].method, "GET")
+        self.assertIn("baseItemId=saved-product", requests[0].url)
+
+    async def test_empty_saved_attributes_reject_api_value_mismatch_and_no_fill_residue(self):
+        listing, _requests = await self._empty_saved_attribute_listing({
+            "result": 1,
+            "data": {"baseItemId": "saved-product", "attributeList": [
+                {"name": "细分风格", "value": "休闲风"},
+                {"name": "工艺处理", "value": "做旧"},
+            ]},
+        })
+
+        with self.assertRaisesRegex(Exception, "细分风格=.*休闲风.*工艺处理=.*做旧"):
+            await listing._verify_persisted_attributes({
+                "细分风格": ("时尚都市",), "工艺处理": (),
+            })
+
+    async def test_empty_saved_attributes_reject_wrong_product_missing_and_duplicate_fields(self):
+        for data, error in (
+            ({"baseItemId": "other-product", "attributeList": []}, "商品身份"),
+            ({"baseItemId": "saved-product", "attributeList": []}, "工艺处理=.*不唯一"),
+            ({"baseItemId": "saved-product", "attributeList": [
+                {"name": "工艺处理", "value": None},
+                {"name": "工艺处理", "value": None},
+            ]}, "工艺处理=.*不唯一"),
+        ):
+            with self.subTest(error=error):
+                listing, _requests = await self._empty_saved_attribute_listing(
+                    {"result": 1, "data": data}
+                )
+                with self.assertRaisesRegex(Exception, error):
+                    await listing._verify_persisted_attributes({"工艺处理": ()})
+
+    async def test_empty_saved_attributes_reject_failed_api_instead_of_accepting_empty(self):
+        listing, _requests = await self._empty_saved_attribute_listing({
+            "result": 500, "message": "请求失败，请和系统管理员联系", "data": None,
+        })
+
+        with self.assertRaisesRegex(Exception, "详情接口.*请求失败"):
+            await listing._verify_persisted_attributes({"工艺处理": ()})
+
+    async def test_empty_saved_attributes_reject_http_failure_and_missing_value_shape(self):
+        for payload, status, error in (
+            ({"result": 1, "data": {}}, 503, "详情接口.*503"),
+            ({"result": 1, "data": {"baseItemId": "saved-product"}}, 200, "缺少 attributeList"),
+            ({"result": 1, "data": {"baseItemId": "saved-product", "attributeList": [
+                {"name": "工艺处理", "valueList": "invalid"},
+            ]}}, 200, "工艺处理=.*格式错误"),
+        ):
+            with self.subTest(error=error):
+                listing, _requests = await self._empty_saved_attribute_listing(payload, status=status)
+                with self.assertRaisesRegex(Exception, error):
+                    await listing._verify_persisted_attributes({"工艺处理": ()})
+
+    async def test_candidate_business_failure_logs_code_without_caching_empty_options(self):
+        listing = await self._listing()
+        listing.logger = logging.getLogger("xhs-api-test")
+        listing._xhs_api_generation = 1
+        response = Mock(status=200)
+        response.request = Mock(url="https://api.test/xhs/getAttributeValues.json?attributeId=sleeve&shopId=")
+        response.json = AsyncMock(return_value={
+            "result": 500, "message": "请求失败，请和系统管理员联系", "data": None,
+        })
+
+        with self.assertLogs("xhs-api-test", level="WARNING") as logs:
+            await listing._consume_xhs_attribute_response(response, ("values", 1, "sleeve"))
+
+        self.assertNotIn((1, "sleeve"), listing._xhs_api_options)
+        self.assertIn("HTTP=200", logs.output[0])
+        self.assertIn("result=500", logs.output[0])
+        self.assertIn("请求失败", logs.output[0])
+        self.assertIn("shopId_present=False", logs.output[0])
+
+    async def test_attribute_request_failure_logs_transport_error_and_parameter_presence(self):
+        listing = await self._listing()
+        listing.logger = logging.getLogger("xhs-api-test")
+        await self.page.route(
+            "**/xhs/getAttributeList.json*", lambda route: route.abort("connectionreset")
+        )
+
+        with self.assertLogs("xhs-api-test", level="WARNING") as logs:
+            await self.page.evaluate("""async () => {
+              try { await fetch('https://api.test/xhs/getAttributeList.json?leafCategoryId=101&shopId=9'); }
+              catch (_) {}
+            }""")
+
+        self.assertIn("ERR_CONNECTION_RESET", logs.output[0])
+        self.assertIn("shopId_present=True", logs.output[0])
+
     async def test_shoe_specification_waits_for_category_rerender(self):
         listing = await self._listing()
 

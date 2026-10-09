@@ -33,12 +33,13 @@ from category_profile import (
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
+from platform_discovery import ApiClient, EndpointSpec
 from platform_candidate_source import (
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
 )
-from platform_schema import FieldOption, field_options
+from platform_schema import FieldOption, field_options, sanitize_message
 from taobao_listing import (
     TaobaoListing,
     TaobaoListingError,
@@ -211,6 +212,8 @@ class XhsFormListing(TaobaoListing):
             attribute_runtime=attribute_runtime,
             category_hints=category_hints,
         )
+        self.base_item_id = ""
+        self._xhs_attribute_readback_source = "dom"
         self._xhs_api_generation = 0
         self._xhs_api_category_id = ""
         self._xhs_api_shop_id = ""
@@ -332,7 +335,15 @@ class XhsFormListing(TaobaoListing):
             task.add_done_callback(self._xhs_response_tasks.discard)
 
         def on_request_failed(request: Any) -> None:
-            self._xhs_request_contexts.pop(id(request), None)
+            context = self._xhs_request_contexts.pop(id(request), None)
+            if context is not None and self.logger is not None:
+                kind, generation, identity = context
+                if generation == self._xhs_api_generation:
+                    self.logger.warning(
+                        "小红书属性接口连接失败：kind=%s，字段/类目=%s，shopId_present=%s，failure=%s",
+                        kind, identity, bool(self._request_parameter(request, "shopId")),
+                        sanitize_message(getattr(request, "failure", "")),
+                    )
 
         self.page.on("request", on_request)
         self.page.on("response", on_response)
@@ -349,8 +360,23 @@ class XhsFormListing(TaobaoListing):
         try:
             payload = await response.json()
         except Exception:
+            if self.logger is not None:
+                self.logger.warning(
+                    "小红书属性接口未返回 JSON：kind=%s，字段/类目=%s，HTTP=%s",
+                    kind, identity, getattr(response, "status", None),
+                )
             return
         if generation != self._xhs_api_generation:
+            return
+        error = self._xhs_api_error(payload, getattr(response, "status", 200))
+        if error:
+            if self.logger is not None:
+                self.logger.warning(
+                    "小红书属性接口失败：kind=%s，字段/类目=%s，shopId_present=%s，%s",
+                    kind, identity,
+                    bool(self._request_parameter(getattr(response, "request", None), "shopId")),
+                    error,
+                )
             return
         data = self._xhs_payload_data(payload)
         if not isinstance(data, Mapping):
@@ -405,6 +431,27 @@ class XhsFormListing(TaobaoListing):
                 identity,
                 sorted(data.keys()),
             )
+
+    @staticmethod
+    def _xhs_api_error(payload: Any, http_status: int = 200) -> str:
+        current = payload
+        for _attempt in range(4):
+            if not isinstance(current, Mapping):
+                break
+            failed = (
+                ("result" in current and str(current["result"]) not in {"1", "True"})
+                or current.get("success") is False
+                or ("code" in current and "data" in current
+                    and str(current["code"]).upper() not in {"0", "1", "200", "OK", "SUCCESS"})
+            )
+            if failed or not 200 <= http_status < 300:
+                return "HTTP={0}，result={1}，code={2}，message={3}".format(
+                    http_status, sanitize_message(current.get("result")),
+                    sanitize_message(current.get("code")),
+                    sanitize_message(current.get("message") or current.get("msg") or current.get("errorMessage")),
+                )
+            current = current.get("data")
+        return "HTTP={0}".format(http_status) if not 200 <= http_status < 300 else ""
 
     @staticmethod
     def _xhs_payload_data(payload: Any) -> Mapping[str, Any]:
@@ -464,6 +511,13 @@ class XhsFormListing(TaobaoListing):
                     "小红书属性候选主动读取失败（字段 %s）：%s",
                     field_id,
                     exc,
+                )
+            return ()
+        error = self._xhs_api_error(payload)
+        if error:
+            if self.logger is not None:
+                self.logger.warning(
+                    "小红书候选主动读取接口失败：字段 %s，%s", field_id, error,
                 )
             return ()
         data = self._xhs_payload_data(payload)
@@ -1031,7 +1085,7 @@ class XhsFormListing(TaobaoListing):
                     end = box["y"] if end is None else min(end, box["y"])
         return start, end
 
-    async def _attribute_items(self) -> Dict[str, Tuple[str, Any]]:
+    async def _attribute_items(self, *, allow_empty: bool = False) -> Dict[str, Tuple[str, Any]]:
         if self.panel is None:
             raise XhsFormListingError("请先调用 open() 打开小红书资料")
         top, end = await self._heading_vertical_bounds()
@@ -1060,7 +1114,7 @@ class XhsFormListing(TaobaoListing):
                 normalized, counts[normalized]
             )
             result[key] = (label, item)
-        if not result:
+        if not result and not allow_empty:
             raise XhsFormListingError("小红书商品属性区域为空或未渲染")
         return result
 
@@ -2029,10 +2083,71 @@ class XhsFormListing(TaobaoListing):
             )
         return actual
 
+    async def _verify_saved_api_attributes(
+        self, expected_attributes: Mapping[str, Sequence[str]]
+    ) -> Mapping[str, Tuple[str, ...]]:
+        if not self.base_item_id:
+            raise XhsFormListingError("小红书商品属性区域为空，且缺少商品 ID，无法通过详情接口回读")
+        endpoint = EndpointSpec(
+            "GET", "/xhs/detail.json", ("baseItemId", "api_name"), read_only=True,
+        )
+        detail, observation = await ApiClient(self.page, (endpoint,)).request(
+            endpoint, {"baseItemId": self.base_item_id, "api_name": "xhs_detail"},
+        )
+        if observation.status != "ok" or not isinstance(detail, Mapping):
+            raise XhsFormListingError(
+                "小红书保存后详情接口回读失败：HTTP={0}，{1}，{2}".format(
+                    observation.http_status, observation.status, observation.sanitized_message,
+                )
+            )
+        if str(detail.get("baseItemId") or "") != self.base_item_id:
+            raise XhsFormListingError("小红书保存后详情接口商品身份不一致")
+        records = detail.get("attributeList")
+        if not isinstance(records, list):
+            raise XhsFormListingError("小红书保存后详情接口缺少 attributeList")
+        persisted: Dict[str, Tuple[str, ...]] = {}
+        errors: List[str] = []
+        for label, expected_values in expected_attributes.items():
+            matches = [
+                record for record in records if isinstance(record, Mapping)
+                and normalize_label(str(record.get("name") or "")) == normalize_label(label)
+            ]
+            if len(matches) != 1:
+                errors.append("{0}=接口字段不唯一({1})".format(label, len(matches)))
+                continue
+            record = matches[0]
+            value_list = record.get("valueList")
+            if value_list is not None and not isinstance(value_list, list):
+                errors.append("{0}=接口多选值格式错误".format(label))
+                continue
+            if isinstance(value_list, list) and value_list:
+                if any(not isinstance(value, Mapping) or value.get("value") in (None, "") for value in value_list):
+                    errors.append("{0}=接口多选值格式错误".format(label))
+                    continue
+                actual = tuple(str(value["value"]) for value in value_list)
+            else:
+                actual = (str(record["value"]),) if record.get("value") not in (None, "") else ()
+            expected_counter = Counter(normalize_option(value) for value in (expected_values or ()) if normalize_option(value))
+            actual_counter = Counter(normalize_option(value) for value in actual if normalize_option(value))
+            if actual_counter != expected_counter:
+                errors.append("{0}=期望 {1}，接口为 {2}".format(label, tuple(expected_values or ()), actual))
+            else:
+                persisted[label] = actual
+        if errors:
+            raise XhsFormListingError("小红书保存后类目属性 API 回读失败：" + "；".join(errors[:12]))
+        self._xhs_attribute_readback_source = "detail_api"
+        if self.logger is not None:
+            self.logger.info("小红书商品属性未渲染，已通过详情 API 逐项复核 %s 个保存值", len(persisted))
+        return persisted
+
     async def _verify_persisted_attributes(
         self, expected_attributes: Mapping[str, Sequence[str]]
     ) -> Mapping[str, Tuple[str, ...]]:
-        page_items = await self._attribute_items()
+        await self._drain_xhs_attribute_tasks()
+        page_items = await self._attribute_items(allow_empty=True)
+        if not page_items:
+            return await self._verify_saved_api_attributes(expected_attributes)
+        self._xhs_attribute_readback_source = "dom"
         persisted: Dict[str, Tuple[str, ...]] = {}
         errors: List[str] = []
         for expected_label, expected_values in expected_attributes.items():
@@ -2146,6 +2261,7 @@ class XhsFormListing(TaobaoListing):
         return {
             "identity": identity,
             "attributes": attributes,
+            "attribute_readback_source": self._xhs_attribute_readback_source,
             "presale": {
                 "发货模式": "全款预售模式",
                 "预售类型": "时段预售",

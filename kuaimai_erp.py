@@ -5467,6 +5467,11 @@ async def run_browser_automation(
                     attribute_runtime=attribute_runtime,
                     category_hints=product.category_hints,
                 )
+                if isinstance(record, dict):
+                    xhs.base_item_id = str(
+                        record.get("baseItemId") or record.get("base_item_id")
+                        or record.get("id") or ""
+                    )
                 await xhs.open()
                 try:
                     xhs_report = await xhs.apply_excel_fields(
@@ -6213,6 +6218,7 @@ async def run_browser_automation(
                     )
                 )
                 persisted_xhs = XhsFormListing(page, persisted_drawer, logger)
+                persisted_xhs.base_item_id = xhs.base_item_id
                 await persisted_xhs.open()
                 persisted_report = await persisted_xhs.verify_persisted_values(
                     product.xhs_fields,
