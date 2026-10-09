@@ -623,7 +623,25 @@ def _matches_alias_composition(text: str, aliases: Sequence[str]) -> bool:
         for alias in aliases:
             if compact.startswith(alias, start):
                 reachable.add(start + len(alias))
-    return len(compact) in reachable
+    if len(compact) in reachable:
+        return True
+    # Vision can drop a letter from a bilingual row while its Chinese label
+    # remains exact (observed: 衣长/ENGTH). Require that exact Chinese label
+    # and only one missing English letter; bare typos and conflicting labels
+    # must not become measurement anchors.
+    bilingual = re.fullmatch(
+        r"\s*([\u4e00-\u9fff]+)\s*[/／]\s*([A-Z\s]+)\s*", text.upper()
+    )
+    if bilingual is None or bilingual.group(1) not in aliases:
+        return False
+    english = re.sub(r"\s+", "", bilingual.group(2))
+    return any(
+        len(alias) >= 5
+        and re.fullmatch(r"[A-Z]+", alias)
+        and len(english) == len(alias) - 1
+        and any(english == alias[:index] + alias[index + 1:] for index in range(len(alias)))
+        for alias in aliases
+    )
 
 
 def parse_size_lengths(

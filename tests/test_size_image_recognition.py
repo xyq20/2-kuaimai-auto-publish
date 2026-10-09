@@ -52,6 +52,28 @@ def _measurement_tokens(*, sizes=("S", "M")):
     return tuple(tokens)
 
 
+def _wool_clothing_tokens():
+    """Table text and positions from the NGBL-2024 Vision OCR output."""
+    tokens = [
+        _token("衣长/ENGTH", 0.224, 0.638, width=0.129, height=0.022),
+        _token("胸围/BUST", 0.235, 0.687, width=0.103, height=0.020),
+        _token("袖长/SLEEVE LENGTH", 0.183, 0.737, width=0.203, height=0.022),
+        _token("袖围/BICEP", 0.231, 0.789, width=0.108, height=0.023),
+    ]
+    for size, x, measurements in (
+        ("M", 0.473, (68, 104, 78, 18)),
+        ("L", 0.570, (70, 108, 79, 19)),
+        ("XL", 0.670, (72, 112, 80, 20)),
+        ("2XL", 0.769, (74, 116, 81, 21)),
+    ):
+        tokens.append(_token(size, x, 0.572, height=0.022))
+        tokens.extend(
+            _token(str(value), x, y, height=0.022)
+            for value, y in zip(measurements, (0.638, 0.690, 0.740, 0.793))
+        )
+    return tuple(tokens)
+
+
 def _completed_process(payload="", *, returncode=0, stderr=""):
     stdout = payload if isinstance(payload, str) else json.dumps(payload)
     return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
@@ -284,6 +306,43 @@ class VisionOCRUnitTests(unittest.TestCase):
             parse_size_names(tokens, "clothing", source="外套尺码表"),
             ("S", "M", "L", "XL"),
         )
+
+    def test_discovers_sizes_when_bilingual_length_label_loses_english_letter(self):
+        self.assertEqual(
+            parse_size_names(_wool_clothing_tokens(), "clothing"),
+            ("M", "L", "XL", "2XL"),
+        )
+
+    def test_reads_lengths_when_bilingual_label_loses_english_letter(self):
+        actual = parse_size_lengths(
+            _wool_clothing_tokens(), ("M", "L", "XL", "2XL"), "clothing"
+        )
+        self.assertEqual(
+            [(item.size, item.length) for item in actual],
+            [("M", 68), ("L", 70), ("XL", 72), ("2XL", 74)],
+        )
+
+    def test_reads_clothing_measurements_when_length_label_loses_english_letter(self):
+        actual = parse_clothing_measurement_table(
+            _wool_clothing_tokens(), ("M", "L", "XL", "2XL")
+        )
+        self.assertEqual(
+            [actual[size]["length"] for size in ("M", "L", "XL", "2XL")],
+            [68, 70, 72, 74],
+        )
+        self.assertEqual(
+            [actual[size]["sleeve"] for size in ("M", "L", "XL", "2XL")],
+            [78, 79, 80, 81],
+        )
+
+    def test_bilingual_length_repair_requires_exact_chinese_and_bounded_english(self):
+        aliases = size_image_recognition._CLOTHING_MEASUREMENT_ALIASES["length"]
+        for text in (
+            "ENGTH", "衣服/ENGTH", "衣长/SLEEVE LENGTH", "衣长/BUST",
+            "衣长/EGTH", "请填写衣长/ENGTH", "衣长/ENGTH 推荐",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(size_image_recognition._matches_alias_composition(text, aliases))
 
     def test_size_discovery_rejects_unknown_product_family(self):
         with self.assertRaisesRegex(RecognitionError, "不支持"):
