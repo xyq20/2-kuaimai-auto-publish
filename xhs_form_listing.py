@@ -707,6 +707,19 @@ class XhsFormListing(TaobaoListing):
             for root in category_gender_roots(category_input_hints(expression))
         }
 
+        # Some workbooks flatten a real category route into one slash-delimited
+        # cell (for example ``休闲裤/男士休闲直筒裤/工装休闲裤``).  Slash still
+        # means an authored alternative in general, but when the first leaf is
+        # contained by the final leaf it is a broad alias for the same family.
+        # Do not stop at that broad alias; wait for the concrete final leaf so
+        # a search result from an unrelated branch cannot win early.
+        preferred_flat_leaf = None
+        if len(expected_levels) == 1 and len(expected_levels[0]) > 1:
+            first_leaf = normalize_label(expected_levels[0][0])
+            final_leaf = normalize_label(expected_levels[0][-1])
+            if first_leaf and final_leaf != first_leaf and first_leaf in final_leaf:
+                preferred_flat_leaf = final_leaf
+
         def has_gender(levels):
             return not gender_roots or any(
                 root in option
@@ -721,6 +734,10 @@ class XhsFormListing(TaobaoListing):
                 if has_gender(candidate_levels(text))
                 and candidate_levels(text)
                 and expected[-1] in candidate_levels(text)[-1]
+                and (
+                    preferred_flat_leaf is None
+                    or expected[-1] == preferred_flat_leaf
+                )
                 and contains_ordered(candidate_levels(text), expected)
             ]
             if len(complete) == 1:
@@ -740,6 +757,10 @@ class XhsFormListing(TaobaoListing):
                     for text in result_texts
                     if candidate_levels(text)
                     and has_gender(candidate_levels(text))
+                    and (
+                        preferred_flat_leaf is None
+                        or normalize_label(leaf) == preferred_flat_leaf
+                    )
                     and any(
                         normalize_label(option) in candidate_level
                         for candidate_level in candidate_levels(text)
@@ -785,6 +806,10 @@ class XhsFormListing(TaobaoListing):
                 for text in result_texts
                 if candidate_levels(text)
                 and has_gender(candidate_levels(text))
+                and (
+                    preferred_flat_leaf is None
+                    or wanted == preferred_flat_leaf
+                )
                 and wanted in candidate_levels(text)[-1]
             ]
             # Excel 类目有时携带“男士/女士”等供应商层级，而平台结果
@@ -944,6 +969,8 @@ class XhsFormListing(TaobaoListing):
             expected_levels = category_input_levels(" > ".join(path))
             leaf_options = expected_levels[-1] if expected_levels else path
             search_terms = category_search_terms(leaf_options)
+            observed_paths: List[str] = []
+            observed_origins: Dict[str, str] = {}
             for search_term in search_terms:
                 capture.start(search_term)
                 await search.fill(search_term, timeout=10_000)
@@ -954,6 +981,11 @@ class XhsFormListing(TaobaoListing):
                     target, target_text, strategy = await self._wait_for_category_result(path, capture)
                     break
                 except XhsFormListingError as exc:
+                    for candidate_path in capture.paths:
+                        normalized_path = self._normalize_category_path(candidate_path)
+                        if normalized_path and normalized_path not in observed_origins:
+                            observed_paths.append(candidate_path)
+                            observed_origins[normalized_path] = search_term
                     if str(exc) not in (
                         "小红书类目搜索接口返回空候选", "小红书类目当前搜索没有匹配候选",
                     ):
@@ -961,7 +993,28 @@ class XhsFormListing(TaobaoListing):
                     if self.logger is not None:
                         self.logger.info("小红书类目搜索“%s”无匹配，尝试下一项", search_term)
             else:
-                raise XhsFormListingError("小红书按 Excel 顺序搜索全部类目后仍无匹配候选：" + " / ".join(search_terms))
+                reviewed = await self._resolve_category_review(
+                    tuple(observed_paths), source="excel_search_ambiguous"
+                )
+                if not reviewed:
+                    raise XhsFormListingError(
+                        "小红书按 Excel 顺序搜索全部类目后仍无匹配候选："
+                        + " / ".join(search_terms)
+                    )
+                origin = observed_origins.get(
+                    self._normalize_category_path(reviewed)
+                )
+                if not origin:
+                    raise XhsFormListingError(
+                        "小红书类目审核结果不在当前搜索候选范围内"
+                    )
+                capture.start(origin)
+                await search.fill(origin, timeout=10_000)
+                target, target_text, _strategy = await self._wait_for_category_result(
+                    (reviewed,), capture
+                )
+                strategy = "review_learning"
+                search_term = origin
             json_paths = tuple(capture.paths)
             result_ready_at = asyncio.get_running_loop().time()
             await target.scroll_into_view_if_needed()

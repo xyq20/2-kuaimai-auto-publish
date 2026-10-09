@@ -701,8 +701,9 @@ class TaobaoListing:
             )
             for label in unique
         )
+        platform_id = self.attribute_platform_id
         schema_version = canonical_sha256({
-            "platform_id": "tb",
+            "platform_id": platform_id,
             "category_leaf_id": "category-path:hints:" + canonical_sha256(tuple(self.category_hints))[:20],
             "field_id": "category_path",
             "options": [
@@ -711,7 +712,7 @@ class TaobaoListing:
             ],
         })
         resolved = await runtime.resolve(AttributeRequest(
-            platform_id="tb",
+            platform_id=platform_id,
             category_leaf_id="category-path:hints:" + canonical_sha256(tuple(self.category_hints))[:20],
             field_id="category_path",
             field_label="商品类目",
@@ -749,7 +750,9 @@ class TaobaoListing:
             == self._normalize_category_path(candidate.label)
         ]
         if len(matches) != 1:
-            raise TaobaoListingError("淘宝类目审核结果不在当前候选范围内")
+            raise TaobaoListingError(
+                f"{self._platform_display_name}类目审核结果不在当前候选范围内"
+            )
         return matches[0]
 
     async def apply_excel_category(self) -> str:

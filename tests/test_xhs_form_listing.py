@@ -501,13 +501,63 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         }""")
         return listing
 
-    async def test_category_search_uses_first_excel_alternative(self):
+    async def test_category_search_prefers_specific_final_leaf(self):
         listing = await self._ordered_category_listing({
-            "休闲裤": [["男装", "休闲裤"]],
+            "休闲裤": [["男装", "休闲裤", "休闲裤"]],
+            "男士休闲直筒裤": [["男装", "休闲裤", "男士休闲直筒裤"]],
+            "工装休闲裤": [["男装", "休闲裤", "工装休闲裤"]],
         })
         report = await listing.apply_category(("休闲裤/男士休闲直筒裤/工装休闲裤",))
-        self.assertEqual(self.searches, ["休闲裤"])
-        self.assertEqual(report["selected"], "男装 > 休闲裤")
+        self.assertEqual(
+            self.searches,
+            ["休闲裤", "男士休闲直筒裤", "工装休闲裤"],
+        )
+        self.assertEqual(report["selected"], "男装 > 休闲裤 > 工装休闲裤")
+
+    async def test_flattened_category_alias_does_not_accept_wrong_branch(self):
+        listing = await self._ordered_category_listing({
+            "休闲裤": [["全新奢侈品", "贸易男装/男士精品", "休闲裤"]],
+            "男士休闲直筒裤": [["男装", "休闲裤", "男士休闲直筒裤"]],
+            "工装休闲裤": [["男装", "休闲裤", "工装休闲裤"]],
+        })
+
+        report = await listing.apply_category(
+            ("休闲裤/男士休闲直筒裤/工装休闲裤",)
+        )
+
+        self.assertEqual(
+            report["selected"], "男装 > 休闲裤 > 工装休闲裤"
+        )
+        self.assertEqual(
+            self.searches,
+            ["休闲裤", "男士休闲直筒裤", "工装休闲裤"],
+        )
+
+    async def test_category_fallback_uses_xhs_learning_review(self):
+        listing = await self._ordered_category_listing({
+            "休闲裤": [["男装", "休闲裤", "休闲裤"], ["女装", "休闲裤", "休闲裤"]],
+        })
+        requests = []
+
+        class Runtime:
+            async def resolve(self, request):
+                requests.append(request)
+                return type("Resolved", (), {
+                    "value_id": "path:learned",
+                    "label": "男装 > 休闲裤 > 休闲裤",
+                    "is_no_fill": False,
+                })()
+
+            def raise_deferred_reviews(self):
+                raise AssertionError("review should have resolved")
+
+        listing.attribute_runtime = Runtime()
+
+        report = await listing.apply_category(("休闲裤/男士休闲直筒裤/工装休闲裤",))
+
+        self.assertEqual(report["strategy"], "review_learning")
+        self.assertEqual(requests[0].platform_id, "xhs")
+        self.assertEqual(requests[0].control_type, "category")
 
     async def test_category_search_advances_after_empty_or_unmatched_results(self):
         listing = await self._ordered_category_listing({
