@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 import logging
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -317,7 +318,7 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 ("夹克", "外套", "男士休闲夹克", "其他夹克"),
             ),
-            ("服饰 > 男装 > 男士休闲夹克", "unique_exact_hint_leaf"),
+            ("服饰 > 男装 > 夹克", "unique_exact_hint_leaf"),
         )
 
     def test_category_leaf_cannot_match_root_hint_from_wrong_branch(self):
@@ -460,6 +461,136 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         listing = XhsFormListing(self.page, self.page.locator("body"), None)
         await listing.open()
         return listing
+
+    async def _ordered_category_listing(self, records_by_term):
+        listing = await self._listing()
+        await self.page.unroute("**/category/base/queryCategoryList.json")
+        self.searches = []
+
+        async def query(route):
+            term = route.request.post_data_json["queryTxt"]
+            self.searches.append(term)
+            await route.fulfill(headers={"access-control-allow-origin": "*"}, json={
+                "result": 1, "data": {"records": [
+                    {"categoryNameList": parts} for parts in records_by_term.get(term, [])
+                ]},
+            })
+
+        await self.page.route("**/category/base/queryCategoryList.json", query)
+        await self.page.evaluate("""() => {
+          window.showRoot = async value => {
+            const results = document.getElementById('portal-results');
+            results.innerHTML = '';
+            const payload = await (await fetch('https://category.test/category/base/queryCategoryList.json', {
+              method: 'POST', body: JSON.stringify({queryTxt: value, platformType: 'xhs'})
+            })).json();
+            results.style.display = 'block';
+            const list = document.createElement('ul');
+            for (const record of payload.data.records) {
+              const row = document.createElement('li');
+              row.textContent = record.categoryNameList.join(' > ');
+              row.onclick = () => {
+                document.getElementById('chosen').textContent = '已选：' + row.textContent;
+                results.style.display = 'none';
+              };
+              list.appendChild(row);
+            }
+            results.appendChild(list);
+          };
+        }""")
+        return listing
+
+    async def test_category_search_uses_first_excel_alternative(self):
+        listing = await self._ordered_category_listing({
+            "休闲裤": [["男装", "休闲裤"]],
+        })
+        report = await listing.apply_category(("休闲裤/男士休闲直筒裤/工装休闲裤",))
+        self.assertEqual(self.searches, ["休闲裤"])
+        self.assertEqual(report["selected"], "男装 > 休闲裤")
+
+    async def test_category_search_advances_after_empty_or_unmatched_results(self):
+        listing = await self._ordered_category_listing({
+            "休闲裤": [["男装", "牛仔裤"]],
+            "工装休闲裤": [["男装", "休闲裤", "工装休闲裤"]],
+        })
+        report = await listing.apply_category(("休闲裤/男士休闲直筒裤/工装休闲裤",))
+        self.assertEqual(self.searches, ["休闲裤", "男士休闲直筒裤", "工装休闲裤"])
+        self.assertEqual(report["selected"], "男装 > 休闲裤 > 工装休闲裤")
+
+    async def test_category_search_advances_when_unmatched_json_has_no_dom_rows(self):
+        listing = await self._ordered_category_listing({
+            "休闲裤": [["男装", "牛仔裤"]],
+            "工装休闲裤": [["男装", "休闲裤", "工装休闲裤"]],
+        })
+        await self.page.evaluate("""() => {
+          const show = window.showRoot;
+          window.showRoot = async value => {
+            await show(value);
+            if (value === '休闲裤') document.getElementById('portal-results').replaceChildren();
+          };
+        }""")
+        report = await asyncio.wait_for(
+            listing.apply_category(("休闲裤/工装休闲裤",)), timeout=10,
+        )
+        self.assertEqual(self.searches, ["休闲裤", "工装休闲裤"])
+        self.assertEqual(report["selected"], "男装 > 休闲裤 > 工装休闲裤")
+
+    def test_category_api_parent_result_is_not_a_selectable_leaf(self):
+        self.assertEqual(XhsFormListing._category_paths_from_json({"data": {"records": [
+            {"categoryNameList": ["男装", "休闲裤"], "leaf": 0},
+            {"categoryNameList": ["男装", "休闲裤", "工装休闲裤"], "leaf": 1},
+        ]}}), ("男装 > 休闲裤 > 工装休闲裤",))
+
+    async def test_category_search_ignores_late_response_from_previous_keyword(self):
+        from category_search import CategorySearchCapture, category_response_paths
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def query(route):
+            term = route.request.post_data_json["queryTxt"]
+            if term == "休闲裤":
+                entered.set()
+                await release.wait()
+            await route.fulfill(headers={"access-control-allow-origin": "*"}, json={
+                "result": 1, "data": {"records": [
+                    {"categoryNameList": ["男装", term], "leaf": 1},
+                ]},
+            })
+
+        await self.page.route("**/category/base/queryCategoryList.json", query)
+        async with CategorySearchCapture(self.page, category_response_paths) as capture:
+            capture.start("休闲裤")
+            old = asyncio.create_task(self.page.evaluate("""async () => {
+              await fetch('https://category.test/category/base/queryCategoryList.json', {
+                method:'POST', body:JSON.stringify({queryTxt:'休闲裤'})
+              });
+            }"""))
+            await asyncio.wait_for(entered.wait(), 5)
+            capture.start("工装休闲裤")
+            await self.page.evaluate("""async () => {
+              await fetch('https://category.test/category/base/queryCategoryList.json', {
+                method:'POST', body:JSON.stringify({queryTxt:'工装休闲裤'})
+              });
+            }""")
+            release.set()
+            await old
+        self.assertEqual(capture.paths, ["男装 > 工装休闲裤"])
+
+    async def test_category_api_failure_is_not_treated_as_no_results(self):
+        listing = await self._ordered_category_listing({})
+        await self.page.route("**/category/base/queryCategoryList.json", lambda route: route.fulfill(
+            headers={"access-control-allow-origin": "*"},
+            json={"result": 500, "message": "接口失败", "data": {"records": []}},
+        ))
+        with self.assertRaisesRegex(Exception, "类目搜索接口失败.*500.*接口失败"):
+            await listing.apply_category(("休闲裤/工装休闲裤",))
+
+    def test_category_path_alternatives_choose_first_exact_leaf(self):
+        self.assertEqual(XhsFormListing._choose_category_text(
+            ("服装 > 男装 > 毛衣", "服装 > 男装 > 针织衫"),
+            ("服装", "男装", "针织衫/毛衣"),
+        ), ("服装 > 男装 > 针织衫", "full_ordered_path"))
 
     async def test_fills_ordered_category_title_attributes_presale_batch_and_34_images(self):
         listing = await self._listing()

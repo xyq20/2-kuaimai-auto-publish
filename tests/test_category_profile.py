@@ -104,13 +104,27 @@ class CategoryProfileTests(unittest.TestCase):
         self.assertEqual(profile.garment_kind, "generic")
         self.assertFalse(profile.supports_letter_size_chart)
 
-    def test_ranks_exact_category_hints_by_specificity(self):
+    def test_search_terms_keep_authored_order(self):
         hints = ("夹克", "外套", "男士休闲夹克", "其他夹克")
         self.assertEqual(
             category_search_terms(hints),
-            ("男士休闲夹克", "其他夹克", "夹克", "外套"),
+            hints,
         )
-        self.assertEqual(preferred_category_leaf(hints), "男士休闲夹克")
+        self.assertEqual(preferred_category_leaf(hints), "夹克")
+
+    def test_search_terms_use_final_path_level_and_deduplicate_in_order(self):
+        self.assertEqual(category_search_terms((
+            "服装 > 男装 > 针织衫/毛衣/羊毛衫", "毛衣/开衫",
+        )), ("针织衫", "毛衣", "羊毛衫", "开衫"))
+        self.assertEqual(category_search_terms((
+            "休闲裤/男士休闲直筒裤/工装休闲裤",
+        )), ("休闲裤", "男士休闲直筒裤", "工装休闲裤"))
+
+    def test_matching_path_alternatives_respects_excel_priority(self):
+        self.assertEqual(choose_category_candidate(
+            ("服装 > 男装 > 毛衣", "服装 > 男装 > 针织衫"),
+            ("服装 > 男装 > 针织衫/毛衣",),
+        ), ("服装 > 男装 > 针织衫", "full_ordered_path"))
 
     def test_category_choice_uses_excel_gender_when_recommendations_share_leaf(self):
         hints = ("夹克", "外套", "男士休闲夹克", "其他夹克")

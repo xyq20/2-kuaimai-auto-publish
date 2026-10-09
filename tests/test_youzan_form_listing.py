@@ -26,7 +26,7 @@ def select_markup(options, *, empty_message=False):
 
 
 class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
-    def test_category_hints_choose_most_specific_unique_outerwear_leaf(self):
+    def test_category_hints_choose_first_authored_unique_outerwear_leaf(self):
         self.assertEqual(
             choose_youzan_category_text(
                 (
@@ -35,7 +35,7 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 ("夹克", "外套", "男士休闲夹克", "其他夹克"),
             ),
-            "服装鞋包 > 男装 > 男士休闲夹克",
+            "服装鞋包 > 男装 > 夹克",
         )
 
     def test_category_candidates_keep_ambiguous_new_leaf_for_review(self):
@@ -268,7 +268,7 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
 
         physical = await listing.select_physical_product()
         category = await listing.apply_category(
-            ("休闲裤", "男士休闲直筒裤", "工装休闲裤")
+            ("休闲裤/男士休闲直筒裤/工装休闲裤",)
         )
 
         self.assertEqual(physical["product_type"], "实物商品")
@@ -280,6 +280,36 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(YouzanFormListingError, "有赞类目接口或 DOM 完整路径不是唯一项"):
             await listing.apply_category(("休闲裤",))
+
+    async def test_category_search_advances_to_next_excel_alternative(self):
+        listing = await self._listing()
+        await self.page.unroute("**/category/base/queryCategoryList.json")
+        searches = []
+
+        async def query(route):
+            term = route.request.post_data_json["queryTxt"]
+            searches.append(term)
+            records = [{"categoryNameList": ["服装鞋包", "男装", "休闲裤"]}] if term == "休闲裤" else []
+            await route.fulfill(headers={"access-control-allow-origin": "*"}, json={
+                "result": 1, "data": {"records": records},
+            })
+
+        await self.page.route("**/category/base/queryCategoryList.json", query)
+        await self.page.evaluate("""() => {
+          const input = document.querySelector('.el-dialog input');
+          input.oninput = async () => {
+            const payload = await (await fetch('https://category.test/category/base/queryCategoryList.json', {
+              method: 'POST', body: JSON.stringify({queryTxt: input.value})
+            })).json();
+            document.getElementById('category-results').style.display = payload.data.records.length ? 'block' : 'none';
+            document.querySelectorAll('.category-result').forEach(row => {
+              row.style.display = payload.data.records.length ? 'block' : 'none';
+            });
+          };
+        }""")
+        category = await listing.apply_category(("男士休闲直筒裤/休闲裤",))
+        self.assertEqual(searches, ["男士休闲直筒裤", "休闲裤"])
+        self.assertEqual(category["selected"], "服装鞋包 > 男装 > 休闲裤")
 
     async def test_fills_attributes_and_clicks_batch_once(self):
         listing = await self._listing()

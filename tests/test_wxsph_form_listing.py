@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import AsyncMock
 
 from attribute_runtime import NO_FILL_VALUE_ID, ResolvedAttribute
 from wxsph_data import parse_wxsph_fields
@@ -21,6 +22,60 @@ def select_markup(options):
 
 
 class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
+    async def _category_search_listing(self, expression, runtime=None):
+        await self.page.set_content('''
+          <section id="panel"><div class="platform-category-input"><span class="current">男装 > 衬衫</span>
+            <button onclick="document.querySelector('[role=dialog]').style.display='block'">修改类目</button>
+          </div></section>
+          <div role="dialog" aria-label="修改类目" style="display:none">
+            <input placeholder="请输入类目关键词，支持模糊查询" oninput="showCategory(this.value)">
+            <div id="chosen">已选：</div>
+            <button onclick="document.querySelector('.current').textContent=window.chosen;this.parentElement.style.display='none'">确定</button>
+          </div>
+          <div class="el-autocomplete-suggestion"><ul id="results"></ul></div>
+          <script>
+            window.searches=[];
+            function showCategory(value) {
+              window.searches.push(value);
+              const row=document.createElement('li');row.textContent='男装 > '+value;
+              row.onclick=()=>{window.chosen=row.textContent;document.getElementById('chosen').textContent='已选：'+row.textContent;};
+              document.getElementById('results').replaceChildren(row);
+            }
+          </script>
+        ''')
+        listing = WxsphFormListing(self.page, self.page.locator('body'), None,
+                                  category_hints=(expression,), attribute_runtime=runtime)
+        listing.panel = self.page.locator('#panel')
+        return listing
+
+    async def test_category_search_splits_excel_or_before_typing(self):
+        listing = await self._category_search_listing("男装 > 牛仔裤/男士直筒牛仔裤")
+        self.assertEqual(await listing.apply_recommended_category(), "男装 > 牛仔裤")
+        self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤'])
+
+    async def test_category_review_waits_for_all_terms_and_restores_earlier_result(self):
+        runtime = type('Runtime', (), {})()
+
+        async def resolve(request):
+            self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤', '男士直筒牛仔裤'])
+            self.assertEqual({c.label for c in request.candidates}, {'男装 > 工装裤', '男装 > 西裤'})
+            candidate = next(c for c in request.candidates if c.label == '男装 > 工装裤')
+            return ResolvedAttribute(candidate.value_id, candidate.label, 'review', 'snapshot')
+
+        runtime.resolve = AsyncMock(side_effect=resolve)
+        listing = await self._category_search_listing("牛仔裤/男士直筒牛仔裤", runtime)
+        await self.page.evaluate("""() => {
+          window.showCategory = value => {
+            window.searches.push(value);
+            const row=document.createElement('li');
+            row.textContent=value==='牛仔裤' ? '男装 > 工装裤' : '男装 > 西裤';
+            row.onclick=()=>{window.chosen=row.textContent;document.getElementById('chosen').textContent='已选：'+row.textContent;};
+            document.getElementById('results').replaceChildren(row);
+          };
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 工装裤')
+        self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤', '男士直筒牛仔裤', '牛仔裤'])
+
     def test_shoe_scene_single_select_uses_first_excel_candidate(self):
         self.assertEqual(
             WxsphFormListing._selection_groups_for_control(

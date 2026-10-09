@@ -24,6 +24,7 @@ from category_profile import (
     category_path_levels,
     category_search_terms,
 )
+from category_search import CategorySearchCapture
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from platform_candidate_source import (
@@ -522,6 +523,8 @@ class YouzanFormListing(TaobaoListing):
 
         def walk(value: Any) -> None:
             if isinstance(value, Mapping):
+                if value.get("leaf") in (0, "0", False):
+                    return
                 for key, child in value.items():
                     normalized_key = normalize_label(key)
                     if (
@@ -603,81 +606,63 @@ class YouzanFormListing(TaobaoListing):
         await buttons.first.click()
         dialog = await self._category_dialog()
         levels = category_input_levels(" > ".join(path))
-        expanded_expression = any("/" in item for item in path)
-        leaf_hints = (
-            levels[-1]
-            if expanded_expression and levels
-            else path
-        )
-        search_term = (
-            str(leaf_hints[0]).strip()
-            if expanded_expression and leaf_hints
-            else path[0]
-        )
+        # Parsed tuples contain path levels; only the final level is a
+        # keyword target. Slash peers retain their authored order.
+        leaf_hints = levels[-1] if levels else path
+        search_terms = category_search_terms(leaf_hints)
         search = await self._category_search_input(dialog)
-        api_paths: List[str] = []
         api_urls: List[str] = []
-        response_tasks: List[asyncio.Task[Any]] = []
-
-        async def capture_category_response(response: Any) -> None:
-            try:
-                headers = await response.all_headers()
-                if "json" not in str(headers.get("content-type") or "").casefold():
-                    return
-                payload = await response.json()
-                rendered = str(payload)
-                if search_term not in rendered:
-                    return
-                for api_path in self._category_paths_from_json(payload):
-                    if api_path not in api_paths:
-                        api_paths.append(api_path)
-                if response.url not in api_urls:
-                    api_urls.append(response.url)
-            except Exception:
-                return
-
-        def on_category_response(response: Any) -> None:
-            response_tasks.append(asyncio.create_task(capture_category_response(response)))
-
-        self.page.on("response", on_category_response)
-        await search.fill(search_term)
-        deadline = asyncio.get_running_loop().time() + 30
         candidates: List[Tuple[str, Any]] = []
         api_matches: List[str] = []
         matched_hint = ""
-        try:
-            while asyncio.get_running_loop().time() < deadline:
-                rows = await self._visible_category_rows()
-                api_hint, api_group = matching_youzan_category_texts(
-                    api_paths, path, leaf_hints=leaf_hints
-                )
-                dom_hint, dom_group = matching_youzan_category_texts(
-                    tuple(text for text, _node in rows),
-                    path,
-                    leaf_hints=leaf_hints,
-                )
-                api_by_path = {_category_parts(text): text for text in api_group}
-                dom_by_path = {
-                    _category_parts(text): (text, node) for text, node in rows
-                    if text in dom_group
-                }
-                common_paths = tuple(
-                    parts for parts in dom_by_path if parts in api_by_path
-                )
-                api_matches = [api_by_path[parts] for parts in common_paths]
-                candidates = [
-                    (text, node)
-                    for text, node in rows
-                    if _category_parts(text) in common_paths
-                ]
-                matched_hint = dom_hint or api_hint
+        async with CategorySearchCapture(self.page, self._category_paths_from_json) as capture:
+            for search_term in search_terms:
+                capture.start(search_term)
+                candidates = []
+                api_matches = []
+                await search.fill(search_term)
+                if self.logger is not None:
+                    self.logger.info("有赞类目按 Excel 顺序搜索：%s", search_term)
+                deadline = asyncio.get_running_loop().time() + 30
+                while asyncio.get_running_loop().time() < deadline:
+                    if capture.error:
+                        raise YouzanFormListingError("有赞类目搜索接口失败：" + capture.error)
+                    rows = await self._visible_category_rows()
+                    api_hint, api_group = matching_youzan_category_texts(
+                        capture.paths, path, leaf_hints=leaf_hints
+                    )
+                    if capture.received and not api_group:
+                        break
+                    dom_hint, dom_group = matching_youzan_category_texts(
+                        tuple(text for text, _node in rows),
+                        path,
+                        leaf_hints=leaf_hints,
+                    )
+                    api_by_path = {_category_parts(text): text for text in api_group}
+                    dom_by_path = {
+                        _category_parts(text): (text, node) for text, node in rows
+                        if text in dom_group
+                    }
+                    common_paths = tuple(
+                        parts for parts in dom_by_path if parts in api_by_path
+                    )
+                    api_matches = [api_by_path[parts] for parts in common_paths]
+                    candidates = [
+                        (text, node)
+                        for text, node in rows
+                        if _category_parts(text) in common_paths
+                    ]
+                    matched_hint = dom_hint or api_hint
+                    if candidates:
+                        break
+                    await asyncio.sleep(0.1)
                 if candidates:
+                    api_urls = [url for url, _payload in capture.payloads]
                     break
-                await asyncio.sleep(0.1)
-        finally:
-            self.page.remove_listener("response", on_category_response)
-            if response_tasks:
-                await asyncio.gather(*response_tasks, return_exceptions=True)
+                if not capture.received:
+                    raise YouzanFormListingError("有赞类目搜索接口在 30 秒内未响应：" + search_term)
+                if api_group:
+                    raise YouzanFormListingError("有赞类目 JSON 已定位，但对应 DOM 行未出现：" + search_term)
         candidate_paths = tuple(_category_parts(text) for text, _node in candidates)
         if len(set(candidate_paths)) != len(candidate_paths):
             raise YouzanFormListingError(

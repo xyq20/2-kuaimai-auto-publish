@@ -124,25 +124,16 @@ def category_profile(hints: Iterable[str], title: str = "") -> CategoryProfile:
 
 
 def category_search_terms(hints: Iterable[str]) -> Tuple[str, ...]:
-    """Return distinct hints from most specific to broadest.
-
-    A longer exact label is normally the marketplace leaf (for example
-    ``男士休闲夹克`` before ``夹克``).  Original order is retained for equal
-    lengths so the result is deterministic.
-    """
-
-    cleaned = tuple(
+    """Search leaf alternatives in Excel order, without promoting long labels."""
+    if isinstance(hints, str):
+        hints = (hints,)
+    return tuple(
         dict.fromkeys(
             option
             for value in hints
-            for option in category_input_hints(value)
+            for level in category_input_levels(value)[-1:]
+            for option in level
             if option
-        )
-    )
-    return tuple(
-        value
-        for _index, value in sorted(
-            enumerate(cleaned), key=lambda item: (-len(item[1]), item[0])
         )
     )
 
@@ -254,17 +245,18 @@ def choose_category_candidate(
         for text in paths
     }
 
-    complete = []
-    for text in paths:
-        levels = candidate_levels[text]
-        if not has_gender_root(levels):
-            continue
-        if any(contains_ordered(levels, expected) for expected in expected_paths):
-            complete.append(text)
-    if len(complete) == 1:
-        return complete[0], "full_ordered_path"
-    if len(complete) > 1:
-        return "", "ambiguous_full_path"
+    for expected in expected_paths:
+        complete = [
+            text for text in paths
+            if has_gender_root(candidate_levels[text])
+            and candidate_levels[text]
+            and expected[-1] in candidate_levels[text][-1]
+            and contains_ordered(candidate_levels[text], expected)
+        ]
+        if len(complete) == 1:
+            return complete[0], "full_ordered_path"
+        if len(complete) > 1:
+            return "", "ambiguous_full_path"
 
     # Slash alternatives are leaves at the same level.  Never treat a root
     # hint such as “服装” as a valid leaf merely because an unrelated result

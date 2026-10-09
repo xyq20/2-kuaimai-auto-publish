@@ -396,6 +396,40 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await listing._category_text(), "男装 > 牛仔裤 > 牛仔裤")
         self.assertEqual(await self.page.evaluate('window.categorySearchInputs'), ['牛仔裤'])
 
+    async def test_category_search_splits_excel_or_before_typing(self):
+        listing = await self._jeans_category_search_fixture()
+        listing.category_hints = ("男装 > 牛仔裤/男士直筒牛仔裤",)
+        await self.page.evaluate("""() => {
+          window.categorySearchInputs=[];
+          document.querySelector('#category-dialog input').addEventListener('input', event => {
+            window.categorySearchInputs.push(event.target.value);
+          });
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), "男装 > 牛仔裤 > 牛仔裤")
+        self.assertEqual(await self.page.evaluate('window.categorySearchInputs'), ['牛仔裤'])
+
+    async def test_category_review_waits_for_all_terms_and_restores_earlier_result(self):
+        listing = await self._jeans_category_search_fixture()
+        listing.category_hints = ("直筒牛仔裤/牛仔长裤",)
+        listing.attribute_runtime = object()
+        await self.page.evaluate("""() => {
+          window.categorySearchInputs=[];
+          document.querySelector('#category-dialog input').addEventListener('input', event => {
+            window.categorySearchInputs.push(event.target.value);
+            document.querySelector('#suggestions li').textContent = event.target.value==='直筒牛仔裤'
+              ? '男装 > 牛仔裤' : '男装 > 西裤';
+          });
+        }""")
+
+        async def review(paths):
+            self.assertEqual(await self.page.evaluate('window.categorySearchInputs'), ['直筒牛仔裤', '牛仔长裤'])
+            self.assertEqual(set(paths), {'男装 > 牛仔裤', '男装 > 西裤'})
+            return listing._normalize_category_path('男装 > 牛仔裤')
+
+        listing._resolve_category_uncertainty = AsyncMock(side_effect=review)
+        self.assertEqual(await listing._apply_excel_category_search(), '男装 > 牛仔裤 > 牛仔裤')
+        self.assertEqual(await self.page.evaluate('window.categorySearchInputs'), ['直筒牛仔裤', '牛仔长裤', '直筒牛仔裤'])
+
     async def test_full_jeans_search_path_does_not_append_an_extra_level(self):
         listing = await self._jeans_category_search_fixture()
         await self.page.evaluate("""() => {

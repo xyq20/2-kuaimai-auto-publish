@@ -21,7 +21,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest
 from canonical_fields import is_learning_managed_field
-from category_profile import category_input_hints, preferred_category_leaf
+from category_profile import category_input_hints, category_search_terms, preferred_category_leaf
+from category_search import CategorySearchCapture, category_response_paths
 from douyin_data import MaterialComponent
 from jd_data import JdFields
 from learning_models import CandidateValue, canonical_sha256
@@ -393,10 +394,10 @@ def _jd_category_hints(fields: Mapping[str, str]) -> Tuple[str, ...]:
 
 
 def jd_category_target(fields: Mapping[str, str]) -> Tuple[Tuple[str, ...], str]:
-    """Choose the most specific Excel hint; the page still proves uniqueness."""
+    """Choose the first authored leaf; the page still proves uniqueness."""
 
     hints = _jd_category_hints(fields)
-    target = preferred_category_leaf(hints)
+    target = preferred_category_leaf((fields["商品分类"],))
     if not target:
         raise JdFormListingError("Excel 京东商品分类无法生成搜索词")
     return hints, target
@@ -404,6 +405,12 @@ def jd_category_target(fields: Mapping[str, str]) -> Tuple[Tuple[str, ...], str]
 
 def _jd_category_matches(current: str, hints: Sequence[str], target: str) -> bool:
     parts = _category_parts(current)
+    hint_text = " ".join(str(hint) for hint in hints)
+    for markers in (("男装", "男士", "男鞋"), ("女装", "女士", "女鞋")):
+        if any(marker in hint_text for marker in markers) and not any(
+            marker in part for part in parts for marker in markers
+        ):
+            return False
     if parts[-1:] == (normalize_label(target),):
         return True
     # 男鞋平台类目可使用 Excel 的其它 OR 备选；保留男鞋分支约束。
@@ -419,15 +426,6 @@ def _jd_category_matches(current: str, hints: Sequence[str], target: str) -> boo
     # Excel “毛针织开衫” while the page has “男士套头毛衣/针织衫”). Keep the
     # existing category when the gender branch matches and one of the final
     # category segments contains an Excel category hint.
-    hint_text = " ".join(str(hint) for hint in hints)
-    if any(marker in hint_text for marker in ("男装", "男士")) and not any(
-        marker in part for part in parts for marker in ("男装", "男士")
-    ):
-        return False
-    if any(marker in hint_text for marker in ("女装", "女士")) and not any(
-        marker in part for part in parts for marker in ("女装", "女士")
-    ):
-        return False
     normalized_hints = tuple(normalize_label(hint) for hint in hints)
     return any(
         hint == part or hint in part or part in hint
@@ -1848,49 +1846,56 @@ class JdFormListing(YouzanFormListing):
 
         api_matches: List[str] = []
         api_candidates: List[Mapping[str, Any]] = []
-        tasks: List[asyncio.Task[Any]] = []
-
-        async def capture(response: Any) -> None:
-            try:
-                headers = await response.all_headers()
-                if "json" not in str(headers.get("content-type") or "").casefold():
-                    return
-                payload = await response.json()
-                nodes = self._json_category_nodes(payload, target)
-                if nodes:
-                    path = urlsplit(response.url).path
-                    if path not in api_matches:
-                        api_matches.append(path)
-                    for node in nodes:
-                        record = {"response_path": path, **dict(node)}
-                        if record not in api_candidates:
-                            api_candidates.append(record)
-            except Exception:
-                return
-
-        def handler(response: Any) -> None:
-            tasks.append(asyncio.create_task(capture(response)))
-
-        self.page.on("response", handler)
-        await search.fill(target)
-        deadline = asyncio.get_running_loop().time() + 30
         candidates: List[Any] = []
-        stable_since: Optional[float] = None
-        try:
-            while asyncio.get_running_loop().time() < deadline:
-                candidates = await self._category_dom_candidates(dialog, target)
-                if api_matches and len(candidates) == 1:
-                    if stable_since is None:
-                        stable_since = asyncio.get_running_loop().time()
-                    elif asyncio.get_running_loop().time() - stable_since >= 1.0:
+        async with CategorySearchCapture(self.page, category_response_paths) as capture:
+            for target in category_search_terms((fields["商品分类"],)):
+                capture.start(target)
+                api_matches.clear()
+                api_candidates.clear()
+                candidates = []
+                await search.fill(target)
+                if self.logger is not None:
+                    self.logger.info("京东类目按 Excel 顺序搜索：%s", target)
+                deadline = asyncio.get_running_loop().time() + 30
+                stable_since: Optional[float] = None
+                while asyncio.get_running_loop().time() < deadline:
+                    if capture.error:
+                        raise JdFormListingError("京东类目搜索接口失败：" + capture.error)
+                    if capture.received and not any(
+                        normalize_label(target) == normalize_label(path.split(" > ")[-1])
+                        for path in capture.paths
+                    ):
                         break
-                else:
-                    stable_since = None
-                await asyncio.sleep(0.1)
-        finally:
-            self.page.remove_listener("response", handler)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                    for response_url, payload in capture.payloads:
+                        nodes = self._json_category_nodes(payload, target)
+                        # Some responses carry only categoryNameList rather
+                        # than scalar name nodes. The exact leaf is evidence.
+                        if nodes or capture.paths:
+                            path = urlsplit(response_url).path
+                            if path not in api_matches:
+                                api_matches.append(path)
+                            for node in nodes:
+                                record = {"response_path": path, **dict(node)}
+                                if record not in api_candidates:
+                                    api_candidates.append(record)
+                    candidates = await self._category_dom_candidates(dialog, target)
+                    if api_matches and len(candidates) == 1:
+                        if stable_since is None:
+                            stable_since = asyncio.get_running_loop().time()
+                        elif asyncio.get_running_loop().time() - stable_since >= 1.0:
+                            break
+                    else:
+                        stable_since = None
+                    await asyncio.sleep(0.1)
+                if api_matches and len(candidates) == 1:
+                    break
+                if not capture.received:
+                    raise JdFormListingError("京东类目搜索接口在 30 秒内未响应：" + target)
+                if capture.paths and any(
+                    normalize_label(target) == normalize_label(path.split(" > ")[-1])
+                    for path in capture.paths
+                ):
+                    raise JdFormListingError("京东类目 JSON 已定位，但 DOM 未唯一匹配：" + target)
         if not api_matches or len(candidates) != 1:
             raise JdFormListingError(
                 "京东类目接口与 DOM 交叉校验失败：接口 {0}，DOM {1}".format(

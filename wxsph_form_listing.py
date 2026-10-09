@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 from playwright.async_api import Error as PlaywrightError
 
 from attribute_runtime import AttributeRequest, ResolvedAttribute
-from category_profile import category_profile, category_path_parts, choose_category_candidate
+from category_profile import category_profile, category_path_parts, category_search_terms, choose_category_candidate
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
@@ -1296,8 +1296,12 @@ class WxsphFormListing(YouzanFormListing):
         dialog = await self._category_dialog()
         search = dialog.get_by_placeholder("请输入类目关键词，支持模糊查询", exact=True)
         selected = None
-        for term in dict.fromkeys(hints):
+        observed_terms: Dict[str, str] = {}
+        search_terms = category_search_terms(hints)
+        for term in search_terms:
             await search.fill(term)
+            if self.logger is not None:
+                self.logger.info("微信小店类目按 Excel 顺序搜索：%s", term)
             deadline = asyncio.get_running_loop().time() + 10
             candidates = []
             while asyncio.get_running_loop().time() < deadline:
@@ -1309,31 +1313,47 @@ class WxsphFormListing(YouzanFormListing):
                 for index in range(await rows.count()):
                     row = rows.nth(index)
                     candidates.append((re.sub(r"\s+", " ", await row.inner_text()).strip(), row))
+                for text, _row in candidates:
+                    observed_terms.setdefault(text, term)
                 chosen, strategy = choose_category_candidate([text for text, _ in candidates], hints)
                 matches = [(text, row) for text, row in candidates if text == chosen]
                 if len(matches) == 1:
                     selected = matches[0]
                     break
                 await asyncio.sleep(0.1)
-            if selected is None and candidates and self.attribute_runtime is not None:
-                paths = sorted(set(text for text, _ in candidates))
-                resolved = await self.attribute_runtime.resolve(AttributeRequest(
-                    platform_id="wxsph", category_leaf_id="category-selection",
-                    field_id="category_path", field_label="商品类目",
-                    candidates=tuple(CandidateValue("path:" + canonical_sha256(path)[:24], path) for path in paths),
-                    excel_value=" / ".join(hints),
-                    evidence={"excel": True, "live_dom": True, "recommendations": self.category_selection["recommendations"],
-                              "candidate_paths": paths, "excel_category_hints": list(hints)},
-                    custom_allowed=False, schema_version=canonical_sha256(paths), control_type="category"))
-                if resolved is None:
-                    self.attribute_runtime.raise_deferred_reviews()
-                    raise WxsphFormListingError("微信小店类目等待审核")
-                matches = [(text, row) for text, row in candidates if text == resolved.label
-                           and resolved.value_id == "path:" + canonical_sha256(text)[:24]]
-                if len(matches) == 1:
-                    selected = matches[0]
             if selected is not None:
                 break
+        if selected is None and observed_terms and self.attribute_runtime is not None:
+            paths = list(observed_terms)
+            resolved = await self.attribute_runtime.resolve(AttributeRequest(
+                platform_id="wxsph", category_leaf_id="category-selection",
+                field_id="category_path", field_label="商品类目",
+                candidates=tuple(CandidateValue("path:" + canonical_sha256(path)[:24], path) for path in paths),
+                excel_value=" / ".join(hints),
+                evidence={"excel": True, "live_dom": True, "recommendations": self.category_selection["recommendations"],
+                          "candidate_paths": paths, "excel_category_hints": list(hints)},
+                custom_allowed=False, schema_version=canonical_sha256(paths), control_type="category"))
+            if resolved is None:
+                self.attribute_runtime.raise_deferred_reviews()
+                raise WxsphFormListingError("微信小店类目等待审核")
+            if resolved.label in observed_terms:
+                await search.fill(observed_terms[resolved.label])
+                deadline = asyncio.get_running_loop().time() + 10
+                while asyncio.get_running_loop().time() < deadline:
+                    rows = self.page.locator(
+                        ".el-popper:visible .categoryList-wrap .item:visible, "
+                        ".el-autocomplete-suggestion:visible li:visible"
+                    )
+                    matches = []
+                    for index in range(await rows.count()):
+                        row = rows.nth(index)
+                        text = re.sub(r"\s+", " ", await row.inner_text()).strip()
+                        if text == resolved.label and resolved.value_id == "path:" + canonical_sha256(text)[:24]:
+                            matches.append((text, row))
+                    if len(matches) == 1:
+                        selected = matches[0]
+                        break
+                    await asyncio.sleep(0.1)
         if selected is None:
             raise WxsphFormListingError("微信小店类目与 Excel 不匹配，未找到唯一可用候选，停止填写")
         expected, row = selected

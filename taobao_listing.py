@@ -840,22 +840,17 @@ class TaobaoListing:
         selected_text = ""
         selected_node: Any = None
         selected_hint = ""
-        observed_rows: Dict[str, Tuple[str, Any]] = {}
+        observed_rows: Dict[str, Tuple[str, str]] = {}
         search_terms = category_search_terms(hints)
-        # 裤类平台通常把“牛仔裤/男士直筒牛仔裤”拆成叶类目和供应商
-        # 描述。先搜 Excel 中的基础叶类目，避免每次先走一个平台不存在
-        # 的长描述，再重复搜索真正可选的“牛仔裤”。
-        if category_profile(hints).garment_kind == "pants":
-            search_terms = tuple(
-                sorted(search_terms, key=lambda value: (len(value), search_terms.index(value)))
-            )
         for hint in search_terms:
             await search.fill(hint, timeout=10_000)
+            if self.logger is not None:
+                self.logger.info("淘宝类目按 Excel 顺序搜索：%s", hint)
             deadline = asyncio.get_running_loop().time() + 20
             while asyncio.get_running_loop().time() < deadline:
                 rows = await self._visible_category_result_nodes()
                 for text, node in rows:
-                    observed_rows.setdefault(self._normalize_category_path(text), (text, node))
+                    observed_rows.setdefault(self._normalize_category_path(text), (text, hint))
                 chosen, strategy = choose_category_candidate(
                     tuple(text for text, _node in rows), hints
                 )
@@ -877,14 +872,27 @@ class TaobaoListing:
             reviewed = await self._resolve_category_review(
                 tuple(dict.fromkeys(
                     [expected for _button, expected in predictions]
-                    + [text for text, _node in observed_rows.values()]
+                    + [text for text, _hint in observed_rows.values()]
                 )),
                 source="excel_search_ambiguous",
             )
             if reviewed:
                 selected = observed_rows.get(self._normalize_category_path(reviewed))
                 if selected is not None:
-                    selected_text, selected_node = selected
+                    selected_text, origin_hint = selected
+                    await search.fill(origin_hint, timeout=10_000)
+                    deadline = asyncio.get_running_loop().time() + 20
+                    while asyncio.get_running_loop().time() < deadline:
+                        matches = [
+                            (text, node)
+                            for text, node in await self._visible_category_result_nodes()
+                            if self._normalize_category_path(text)
+                            == self._normalize_category_path(selected_text)
+                        ]
+                        if len(matches) == 1:
+                            selected_text, selected_node = matches[0]
+                            break
+                        await asyncio.sleep(0.1)
                     selected_hint = "审核确认"
                 else:
                     prediction = next(

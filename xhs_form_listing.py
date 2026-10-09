@@ -30,6 +30,7 @@ from category_profile import (
     category_search_terms,
     is_footwear_category,
 )
+from category_search import CategorySearchCapture
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
@@ -714,52 +715,49 @@ class XhsFormListing(TaobaoListing):
                 for root in gender_roots
             )
 
-        complete = [
-            text
-            for text in result_texts
-            if has_gender(candidate_levels(text))
-            and any(
-                contains_ordered(candidate_levels(text), expected)
-                for expected in expected_variants
-            )
-        ]
-        if len(complete) == 1:
-            return complete[0], "full_ordered_path"
-        if len(complete) > 1:
-            raise XhsFormListingError(
-                "小红书类目完整路径不是唯一精确项：{0}".format(len(complete))
-            )
+        for expected in expected_variants:
+            complete = [
+                text for text in result_texts
+                if has_gender(candidate_levels(text))
+                and candidate_levels(text)
+                and expected[-1] in candidate_levels(text)[-1]
+                and contains_ordered(candidate_levels(text), expected)
+            ]
+            if len(complete) == 1:
+                return complete[0], "full_ordered_path"
+            if len(complete) > 1:
+                raise XhsFormListingError(
+                    "小红书类目完整路径不是唯一精确项：{0}".format(len(complete))
+                )
 
         # Platform taxonomies can omit a supplier-internal middle layer.  This
         # fallback still requires both Excel endpoints to be exact and unique;
         # it never selects merely because a string contains a category word.
         if len(expected_levels) >= 2:
-            root_leaf = [
-                text
-                for text in result_texts
-                if candidate_levels(text)
-                and has_gender(candidate_levels(text))
-                and any(
-                    normalize_label(option) in candidate_level
-                    for candidate_level in candidate_levels(text)
-                    for option in expected_levels[0]
-                )
-                and any(
-                    normalize_label(option) in candidate_levels(text)[-1]
-                    for option in expected_levels[-1]
-                )
-            ]
-            if len(root_leaf) == 1:
-                return root_leaf[0], "first_and_leaf_exact"
-            if len(root_leaf) > 1:
-                raise XhsFormListingError(
-                    "小红书类目首段和末级叶子不是唯一精确项：{0}".format(
-                        len(root_leaf)
+            for leaf in expected_levels[-1]:
+                root_leaf = [
+                    text
+                    for text in result_texts
+                    if candidate_levels(text)
+                    and has_gender(candidate_levels(text))
+                    and any(
+                        normalize_label(option) in candidate_level
+                        for candidate_level in candidate_levels(text)
+                        for option in expected_levels[0]
                     )
-                )
+                    and normalize_label(leaf) in candidate_levels(text)[-1]
+                ]
+                if len(root_leaf) == 1:
+                    return root_leaf[0], "first_and_leaf_exact"
+                if len(root_leaf) > 1:
+                    raise XhsFormListingError(
+                        "小红书类目首段和末级叶子不是唯一精确项：{0}".format(
+                            len(root_leaf)
+                        )
+                    )
 
         # New-category workbooks may list cross-platform category hints rather
-        # than one marketplace path.  Try the most specific exact leaf first;
+        # than one marketplace path.  Try exact leaves in authored order;
         # every accepted leaf must still be unique in the platform JSON.
         # New Excel expressions keep slash alternatives in the final level.
         # A legacy caller may still pass an already-expanded tuple; only that
@@ -776,9 +774,7 @@ class XhsFormListing(TaobaoListing):
             # exact candidate wins deterministically.
             fallback_hints = expected_levels[-1]
         elif expected_levels:
-            # Legacy callers pass a flat hint tuple.  Prefer the most specific
-            # hint first; this preserves the historical outerwear behaviour
-            # without changing the new ``>``/``/`` grammar.
+            # Legacy callers pass a flat hint tuple. Keep its authored order.
             fallback_hints = category_search_terms(category_path)
         else:
             fallback_hints = category_path
@@ -831,6 +827,8 @@ class XhsFormListing(TaobaoListing):
         for record in records:
             if not isinstance(record, Mapping):
                 continue
+            if record.get("leaf") in (0, "0", False):
+                continue
             raw_parts = record.get("categoryNameList")
             if not isinstance(raw_parts, Sequence) or isinstance(
                 raw_parts, (str, bytes)
@@ -844,13 +842,18 @@ class XhsFormListing(TaobaoListing):
         return tuple(paths)
 
     async def _wait_for_category_result(
-        self, category_path: Sequence[str], json_paths: Sequence[str]
+        self, category_path: Sequence[str], capture: CategorySearchCapture
     ) -> Tuple[Any, str, str]:
         deadline = asyncio.get_running_loop().time() + 45
         last_results: List[Tuple[Any, str]] = []
         while asyncio.get_running_loop().time() < deadline:
+            if capture.error:
+                raise XhsFormListingError("小红书类目搜索接口失败：" + capture.error)
+            json_paths = capture.paths
+            if capture.received and not json_paths:
+                raise XhsFormListingError("小红书类目搜索接口返回空候选")
             last_results = await self._category_result_nodes()
-            if json_paths and last_results:
+            if json_paths:
                 try:
                     target_text, strategy = self._choose_category_text(
                         json_paths, category_path
@@ -860,8 +863,7 @@ class XhsFormListing(TaobaoListing):
                     # wait for a DOM race to choose an arbitrary row.
                     if "不是唯一" in str(exc):
                         raise
-                    await asyncio.sleep(0.15)
-                    continue
+                    raise XhsFormListingError("小红书类目当前搜索没有匹配候选") from exc
                 matches = [
                     (node, text)
                     for node, text in last_results
@@ -877,7 +879,7 @@ class XhsFormListing(TaobaoListing):
                         )
                     )
             await asyncio.sleep(0.15)
-        if not json_paths:
+        if not capture.received:
             raise XhsFormListingError("小红书类目搜索 JSON 在 45 秒内未返回候选")
         rendered = "；".join(text for _node, text in last_results[:12])
         raise XhsFormListingError(
@@ -922,7 +924,7 @@ class XhsFormListing(TaobaoListing):
         return ""
 
     async def apply_category(self, category_path: Sequence[str]) -> Mapping[str, Any]:
-        """Search the first Excel segment, then verify the complete route."""
+        """Search Excel leaf alternatives in order and verify the route."""
         if self.panel is None:
             raise XhsFormListingError("请先调用 open() 打开小红书资料")
         path = tuple(str(item).strip() for item in category_path if str(item).strip())
@@ -935,51 +937,36 @@ class XhsFormListing(TaobaoListing):
         await modify.click(timeout=30_000)
         dialog = await self._category_dialog()
         search = await self._category_search_input(dialog)
-        json_paths: List[str] = []
-        response_tasks: List[asyncio.Task[Any]] = []
-
-        async def capture_category_response(response: Any) -> None:
-            try:
-                if XHS_CATEGORY_QUERY_PATH not in response.url:
-                    return
-                headers = await response.all_headers()
-                content_type = str(headers.get("content-type") or "").casefold()
-                if "json" not in content_type:
-                    return
-                for rendered in self._category_paths_from_json(await response.json()):
-                    if rendered not in json_paths:
-                        json_paths.append(rendered)
-            except Exception:
-                # A response can be aborted while the keyword is being typed;
-                # the completed category response remains the only evidence we
-                # use for a DOM click.
-                return
-
-        def on_category_response(response: Any) -> None:
-            response_tasks.append(asyncio.create_task(capture_category_response(response)))
-
-        self.page.on("response", on_category_response)
-        try:
+        async with CategorySearchCapture(self.page, self._category_paths_from_json) as capture:
             # Only the actual search-result portal is scanned.  The page also
             # keeps a large cascader tree in the DOM; enumerating that tree was
             # the source of a 25+ second delay and is not valid click evidence.
             expected_levels = category_input_levels(" > ".join(path))
             leaf_options = expected_levels[-1] if expected_levels else path
             search_terms = category_search_terms(leaf_options)
-            search_term = search_terms[0] if search_terms else path[0]
-            await search.fill(search_term, timeout=10_000)
-            search_filled_at = asyncio.get_running_loop().time()
-            target, target_text, strategy = await self._wait_for_category_result(
-                path, json_paths
-            )
+            for search_term in search_terms:
+                capture.start(search_term)
+                await search.fill(search_term, timeout=10_000)
+                search_filled_at = asyncio.get_running_loop().time()
+                if self.logger is not None:
+                    self.logger.info("小红书类目按 Excel 顺序搜索：%s", search_term)
+                try:
+                    target, target_text, strategy = await self._wait_for_category_result(path, capture)
+                    break
+                except XhsFormListingError as exc:
+                    if str(exc) not in (
+                        "小红书类目搜索接口返回空候选", "小红书类目当前搜索没有匹配候选",
+                    ):
+                        raise
+                    if self.logger is not None:
+                        self.logger.info("小红书类目搜索“%s”无匹配，尝试下一项", search_term)
+            else:
+                raise XhsFormListingError("小红书按 Excel 顺序搜索全部类目后仍无匹配候选：" + " / ".join(search_terms))
+            json_paths = tuple(capture.paths)
             result_ready_at = asyncio.get_running_loop().time()
             await target.scroll_into_view_if_needed()
             await target.click(timeout=10_000)
             clicked = tuple(path)
-        finally:
-            self.page.remove_listener("response", on_category_response)
-            if response_tasks:
-                await asyncio.gather(*response_tasks, return_exceptions=True)
 
         selected = ""
         deadline = asyncio.get_running_loop().time() + 10

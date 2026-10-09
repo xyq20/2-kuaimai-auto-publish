@@ -848,6 +848,58 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual, "服饰 > 动态测试类目")
         self.assertTrue(self.listing.category_clicked)
 
+    async def _excel_category_search_listing(self, expression):
+        await self.page.set_content('''
+          <section id="panel"><div class="platform-category-input">女装 > 裙子
+            <button onclick="document.querySelector('[role=dialog]').style.display='block'">修改类目</button>
+          </div><div class="conf"><div class="complex-wrap"></div></div></section>
+          <div role="dialog" aria-label="修改类目" style="display:none">
+            <input placeholder="请输入类目关键词，支持模糊查询" oninput="showCategory(this.value)">
+            <div id="chosen">已选：</div>
+            <button onclick="document.querySelector('.platform-category-input').textContent='男装 > '+window.chosen;this.parentElement.style.display='none';document.querySelector('.complex-wrap').innerHTML='<div class=complex-item>属性</div>'">确定</button>
+          </div>
+          <div class="el-autocomplete-suggestion"><ul id="results"></ul></div>
+          <script>
+            window.searches=[];
+            function showCategory(value) {
+              window.searches.push(value);
+              const row=document.createElement('li');row.textContent='男装 > '+value;
+              row.onclick=()=>{window.chosen=value;document.getElementById('chosen').textContent='已选：'+row.textContent;};
+              document.getElementById('results').replaceChildren(row);
+            }
+          </script>
+        ''')
+        listing = TaobaoListing(self.page, self.page.locator('#panel'), LOGGER,
+                                category_hints=(expression,))
+        listing.panel = self.page.locator('#panel')
+        return listing
+
+    async def test_excel_category_search_does_not_reorder_pants_by_length(self):
+        listing = await self._excel_category_search_listing("男士休闲直筒裤/休闲裤")
+        self.assertEqual(await listing.apply_excel_category(), "男装 > 男士休闲直筒裤")
+        self.assertEqual(await self.page.evaluate('window.searches'), ['男士休闲直筒裤'])
+
+    async def test_category_review_restores_candidate_from_earlier_search(self):
+        listing = await self._excel_category_search_listing("牛仔裤/男士直筒牛仔裤")
+        await self.page.evaluate("""() => {
+          window.showCategory = value => {
+            window.searches.push(value);
+            const row=document.createElement('li');
+            row.textContent=value==='牛仔裤' ? '男装 > 工装裤' : '男装 > 西裤';
+            row.onclick=()=>{window.chosen=row.textContent.slice(5);document.getElementById('chosen').textContent='已选：'+row.textContent;};
+            document.getElementById('results').replaceChildren(row);
+          };
+        }""")
+
+        async def review(paths, **kwargs):
+            self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤', '男士直筒牛仔裤'])
+            self.assertEqual(set(paths), {'男装 > 工装裤', '男装 > 西裤'})
+            return '男装 > 工装裤'
+
+        listing._resolve_category_review = AsyncMock(side_effect=review)
+        self.assertEqual(await listing.apply_excel_category(), '男装 > 工装裤')
+        self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤', '男士直筒牛仔裤', '牛仔裤'])
+
     async def test_category_search_does_not_join_separate_shoe_paths(self):
         await self.page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
           '<div class="el-autocomplete-suggestion"><ul><li>男鞋 > 男式正装皮鞋</li><li>流行男鞋 > 时尚单鞋 > 正装皮鞋</li></ul></div>')""")

@@ -56,7 +56,7 @@ PDD_CATEGORY_PATH_COMPATIBILITY: Mapping[Tuple[str, ...], Tuple[Tuple[str, ...],
 
 def _pdd_category_search_terms(hints: Sequence[str]) -> Tuple[str, ...]:
     """Respect Excel category order; do not promote longer descriptions."""
-    return tuple(dict.fromkeys(str(hint).strip() for hint in hints if str(hint).strip()))
+    return category_search_terms(hints)
 
 
 def _pdd_recommended_path_matches(expected: str, actual: str) -> bool:
@@ -561,11 +561,17 @@ class PddFormListing(TaobaoListing):
         selected_text = ""
         selected_node: Any = None
         selected_hint = ""
-        for hint in _pdd_category_search_terms(hints):
+        observed_terms: Dict[str, str] = {}
+        search_terms = _pdd_category_search_terms(hints)
+        for hint in search_terms:
             await search.fill(hint)
+            if self.logger is not None:
+                self.logger.info("拼多多类目按 Excel 顺序搜索：%s", hint)
             deadline = asyncio.get_running_loop().time() + 10
             while asyncio.get_running_loop().time() < deadline:
                 nodes = await self._visible_category_result_nodes()
+                for text, _node in nodes:
+                    observed_terms.setdefault(text, hint)
                 chosen, strategy = choose_category_candidate(
                     tuple(text for text, _node in nodes), hints
                 )
@@ -585,15 +591,24 @@ class PddFormListing(TaobaoListing):
                             )
                         break
                 await asyncio.sleep(0.05)
-            if selected_node is None and nodes and self.attribute_runtime is not None:
-                chosen = await self._resolve_category_uncertainty(tuple(text for text, _node in nodes))
-                matches = [(text, node) for text, node in nodes
-                           if self._normalize_category_path(text) == chosen]
-                if len(matches) != 1:
-                    raise PddFormListingError("拼多多审核类目无法唯一定位到当前搜索结果")
-                selected_text, selected_node = matches[0]
             if selected_node is not None:
                 break
+        if selected_node is None and observed_terms and self.attribute_runtime is not None:
+            chosen = await self._resolve_category_uncertainty(tuple(observed_terms))
+            selected_hint = next((term for text, term in observed_terms.items()
+                                  if self._normalize_category_path(text) == chosen), "")
+            if selected_hint:
+                await search.fill(selected_hint)
+                deadline = asyncio.get_running_loop().time() + 10
+                while asyncio.get_running_loop().time() < deadline:
+                    matches = [(text, node) for text, node in await self._visible_category_result_nodes()
+                               if self._normalize_category_path(text) == chosen]
+                    if len(matches) == 1:
+                        selected_text, selected_node = matches[0]
+                        break
+                    await asyncio.sleep(0.05)
+            if selected_node is None:
+                raise PddFormListingError("拼多多审核类目无法唯一定位到当前搜索结果")
         if selected_node is None:
             raise PddFormListingError(
                 "拼多多修改类目搜索中没有与 Excel 商品分类唯一匹配的项"

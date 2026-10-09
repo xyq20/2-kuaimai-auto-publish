@@ -40,6 +40,7 @@ class JdFormListingHelperTests(unittest.TestCase):
         hints, target = jd_category_target({"商品分类": "流行男鞋 > 时尚单鞋 >休闲皮鞋/正装皮鞋/男士德比鞋/皮鞋"})
         self.assertTrue(_jd_category_matches("鞋靴 > 流行男鞋 > 男士商务/正装皮鞋", hints, target))
         self.assertFalse(_jd_category_matches("鞋靴 > 时尚女鞋 > 正装皮鞋", hints, target))
+        self.assertFalse(_jd_category_matches("鞋靴 > 时尚女鞋 > 休闲皮鞋", hints, target))
         self.assertFalse(_jd_category_matches("鞋靴 > 流行男鞋 > 男士凉鞋", hints, target))
         self.assertFalse(_jd_category_matches("鞋靴 > 流行男鞋", hints, target))
 
@@ -47,7 +48,7 @@ class JdFormListingHelperTests(unittest.TestCase):
         hints, target = jd_category_target({
             "商品分类": "服装 > 男装 > 针织衫/毛衣/羊毛衫/毛针织开衫/开衫毛衣"
         })
-        self.assertEqual(target, "毛针织开衫")
+        self.assertEqual(target, "针织衫")
         self.assertTrue(
             _jd_category_matches(
                 "服饰内衣 > 男装 > 男士毛衣/针织衫 > 男士套头毛衣/针织衫",
@@ -137,15 +138,15 @@ class JdFormListingHelperTests(unittest.TestCase):
             jd_category_target(
                 {"商品分类": "夹克/外套/男士休闲夹克/其他夹克"}
             ),
-            (("夹克", "外套", "男士休闲夹克", "其他夹克"), "男士休闲夹克"),
+            (("夹克", "外套", "男士休闲夹克", "其他夹克"), "夹克"),
         )
 
     def test_category_target_preserves_existing_pants_behavior(self):
         self.assertEqual(
             jd_category_target(
-                {"商品分类": "男装/男士休闲裤/男士休闲直筒裤"}
+                {"商品分类": "男装 > 男士休闲裤/男士休闲直筒裤"}
             )[1],
-            "男士休闲直筒裤",
+            "男士休闲裤",
         )
 
     def test_parse_jd_fields(self):
@@ -2262,6 +2263,49 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(candidates), 1)
         self.assertIn("男士休闲直筒裤", await candidates[0].inner_text())
+
+    async def test_category_search_advances_to_next_excel_alternative(self):
+        searches = []
+
+        async def query(route):
+            term = route.request.post_data_json["queryTxt"]
+            searches.append(term)
+            records = [{"categoryNameList": ["男装", "休闲裤"]}] if term == "休闲裤" else []
+            await route.fulfill(headers={"access-control-allow-origin": "*"}, json={
+                "result": 1, "data": {"records": records},
+            })
+
+        await self.page.route("**/category/base/queryCategoryList.json", query)
+        listing = await self._open('''
+          <button role="tab" aria-selected="true">京东资料</button>
+          <div role="tabpanel" aria-label="京东资料">
+            <div class="platform-category-input">商品分类：<span id="current">女装 > 裙子</span>
+              <button onclick="document.querySelector('[role=dialog]').style.display='block'">修改类目</button>
+            </div>
+          </div>
+          <div role="dialog" aria-label="修改类目" style="display:none">
+            <input placeholder="请输入类目关键词，支持模糊查询" oninput="searchCategory(this.value)">
+            <ul id="results"></ul><div id="chosen">已选：</div>
+            <button onclick="document.getElementById('current').textContent=document.getElementById('chosen').textContent.replace('已选：','');this.parentElement.style.display='none'">确定</button>
+          </div>
+          <script>
+            async function searchCategory(value) {
+              document.getElementById('results').innerHTML='';
+              const payload=await (await fetch('https://category.test/category/base/queryCategoryList.json', {
+                method:'POST',body:JSON.stringify({queryTxt:value})
+              })).json();
+              for (const record of payload.data.records) {
+                const row=document.createElement('li'); row.className='el-cascader-node';
+                row.textContent=record.categoryNameList.at(-1);
+                row.onclick=()=>{row.classList.add('is-active');document.getElementById('chosen').textContent='已选：'+record.categoryNameList.join(' > ');};
+                document.getElementById('results').appendChild(row);
+              }
+            }
+          </script>
+        ''')
+        category = await listing.apply_category({"商品分类": "男装 > 男士休闲直筒裤/休闲裤"})
+        self.assertEqual(searches, ["男士休闲直筒裤", "休闲裤"])
+        self.assertEqual(category["selected"], "男装 > 休闲裤")
 
 
 if __name__ == "__main__":
