@@ -7,11 +7,45 @@ from unittest.mock import Mock, patch
 
 import kuaimai_erp as erp
 from learning_assets import PreparedLearningAsset
-from learning_client import RetryableCloudError
+from learning_client import PermanentCloudError, RetryableCloudError
 from learning_store import LearningStore
 
 
 class LearningInitializationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_category_change_registers_without_conflicting_with_prior_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory) / 'learning.sqlite3')
+            store.migrate()
+            old_payload = {'product_version': 'current', 'style_code': '2025',
+                           'title': 'sweater', 'category_json': {'hints': ['男装 > 针织衫', '毛衣']}}
+            cloud_events = {'product.upsert:current': old_payload}
+            old_id = store.enqueue('product.upsert:current', 'product.upsert', old_payload)
+            store.mark_delivered(old_id)
+            client = Mock()
+
+            def post(key, event_type, payload):
+                if key in cloud_events and cloud_events[key] != payload:
+                    raise PermanentCloudError('cloud status 409 (idempotency_payload_conflict)')
+                cloud_events[key] = payload
+                return {'event_id': key}
+
+            client.post_event.side_effect = post
+            client.analyze.return_value = {'status': 'done'}
+            product = SimpleNamespace(style_code='2025', title='sweater',
+                                      category_hints=('男装 > 针织衫/毛衣',),
+                                      main_images=(), main_images_34=(), detail_images=())
+            keys = []
+            for run in ('first', 'rerun'):
+                context = erp.LearningRunContext(store, run, 'current', 'device', 'images', client)
+                await erp.initialize_learning_run(context, product, logging.getLogger(__name__))
+                self.assertTrue(context.initialized)
+                keys.append(client.post_event.call_args.args[0])
+            self.assertEqual(keys[0], keys[1], '同数据复跑必须沿用去重编号')
+            self.assertEqual(cloud_events[keys[0]]['category_json']['hints'], ['男装 > 针织衫/毛衣'])
+            self.assertEqual(len(cloud_events), 2)
+            self.assertEqual(store.pending_outbox(), ())
+            store.connection.close()
+
     async def test_learning_requires_review_service_address(self):
         args = SimpleNamespace(learning_enabled=True, learning_api_url="")
         with self.assertRaisesRegex(erp.AutomationError, "未配置审核服务地址"):
@@ -34,7 +68,10 @@ class LearningInitializationTests(unittest.IsolatedAsyncioTestCase):
                 store.enqueue(f'old:{index}', 'checkpoint.updated', {'index': index})
             payload = {'product_version': 'current', 'style_code': '1228-1',
                        'title': 'shoe', 'category_json': {'hints': ['男鞋']}}
-            event_id = store.enqueue('product.upsert:current', 'product.upsert', payload)
+            product = SimpleNamespace(style_code='1228-1', title='shoe', category_hints=('男鞋',),
+                                      main_images=(Path('image.png'),), main_images_34=(), detail_images=())
+            key, _ = erp.product_registration_event('current', product)
+            event_id = store.enqueue(key, 'product.upsert', payload)
             registered = set()
             client = Mock()
 
@@ -51,13 +88,13 @@ class LearningInitializationTests(unittest.IsolatedAsyncioTestCase):
             client.upload_asset.side_effect = upload
             client.analyze.return_value = {'status': 'done'}
             context = erp.LearningRunContext(store, 'run', 'current', 'device', 'images', client)
-            product = SimpleNamespace(style_code='1228-1', title='shoe', category_hints=('男鞋',),
-                                      main_images=(Path('image.png'),), main_images_34=(), detail_images=())
             asset = PreparedLearningAsset('original', 'hash', 'image/png', b'image', None)
             with patch.object(erp, 'prepare_learning_assets', return_value=(asset, asset)):
                 await erp.initialize_learning_run(context, product, logging.getLogger(__name__))
             self.assertTrue(context.initialized)
-            self.assertEqual(client.post_event.call_args_list[0].args, ('product.upsert:current', 'product.upsert', payload))
+            first_key, first_type, first_payload = client.post_event.call_args_list[0].args
+            self.assertTrue(first_key.startswith('product.upsert:current:'))
+            self.assertEqual((first_type, first_payload), ('product.upsert', payload))
             self.assertIsNotNone(store.connection.execute('SELECT delivered_at FROM sync_outbox WHERE id=?', (event_id,)).fetchone()[0])
             self.assertEqual(len(store.pending_outbox()), 8)
             client.upload_asset.assert_called_once()

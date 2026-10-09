@@ -349,6 +349,20 @@ class LearningRunContext:
     initialized: bool = False
 
 
+def product_registration_event(
+    product_version: str, product: ProductData,
+) -> Tuple[str, Dict[str, Any]]:
+    payload = {
+        "product_version": product_version,
+        "style_code": product.style_code,
+        "title": product.title,
+        "category_json": {"hints": list(getattr(product, "category_hints", ()))},
+    }
+    # 商品版本只含标题和图片；类目变更也必须生成新事件，重试同一数据则去重。
+    key = f"product.upsert:{product_version}:{canonical_sha256(payload)}"
+    return key, payload
+
+
 def create_learning_context(
     args: argparse.Namespace,
     product: ProductData,
@@ -370,16 +384,8 @@ def create_learning_context(
     store = LearningStore(Path(args.learning_db))
     store.migrate()
     store.upsert_product(fingerprint)
-    store.enqueue(
-        f"product.upsert:{fingerprint.product_version}",
-        "product.upsert",
-        {
-            "product_version": fingerprint.product_version,
-            "style_code": fingerprint.style_code,
-            "title": fingerprint.title,
-            "category_json": {"hints": list(getattr(product, "category_hints", ()))},
-        },
-    )
+    product_key, product_payload = product_registration_event(fingerprint.product_version, product)
+    store.enqueue(product_key, "product.upsert", product_payload)
     run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
     client = CloudLearningClient(args.learning_api_url)
     runtime = AttributeRuntime(
@@ -425,13 +431,7 @@ async def initialize_learning_run(
         )
     # 图片接口要求商品先存在。通用 outbox 每次只发送 50 条，不能用
     # 一轮队列同步成功来推断当前商品已经登记；优先确认当前依赖事件。
-    product_key = f"product.upsert:{context.product_version}"
-    product_payload = {
-        "product_version": context.product_version,
-        "style_code": product.style_code,
-        "title": product.title,
-        "category_json": {"hints": list(getattr(product, "category_hints", ()))},
-    }
+    product_key, product_payload = product_registration_event(context.product_version, product)
     product_event_id = context.store.enqueue(product_key, "product.upsert", product_payload)
     await asyncio.to_thread(
         context.client.post_event, product_key, "product.upsert", product_payload
