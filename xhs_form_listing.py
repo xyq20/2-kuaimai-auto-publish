@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from attribute_runtime import AttributeRequest
+from attribute_runtime import AttributeRequest, split_multi_choice
 from category_profile import (
     category_gender_roots,
     category_input_hints,
@@ -1218,6 +1218,7 @@ class XhsFormListing(TaobaoListing):
         if runtime is None:
             raise XhsFormListingError("小红书属性学习运行器未启用")
         multi = await select.locator(".el-select__tags").count() > 0
+        control_type = "multi_select" if multi else "select"
         await self._open_select(select, multi=multi)
         try:
             _dropdown, dom_options = await self._visible_dom_options(select)
@@ -1312,6 +1313,7 @@ class XhsFormListing(TaobaoListing):
                     candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
                     excel_value="/".join(group), evidence={},
                     custom_allowed=bool(field.get("custom_allowed")), schema_version=schema_version,
+                    control_type=control_type,
                 ),
             )
             resolved = await runtime.resolve(
@@ -1325,13 +1327,15 @@ class XhsFormListing(TaobaoListing):
                     evidence={"excel": bool(excel_value.strip())},
                     custom_allowed=bool(field.get("custom_allowed")),
                     schema_version=schema_version,
-                    control_type="select",
+                    control_type=control_type,
                 )
             )
             if resolved is None or getattr(resolved, "is_no_fill", False):
                 return ()
-            resolved_values.append(resolved.label)
-        return tuple(resolved_values)
+            resolved_values.extend(
+                split_multi_choice(resolved.label) if multi else (resolved.label,)
+            )
+        return tuple(dict.fromkeys(resolved_values))
 
     async def _fill_attribute(
         self,
@@ -1361,10 +1365,6 @@ class XhsFormListing(TaobaoListing):
         )
         if not groups:
             raise XhsFormListingError("小红书属性“{0}”期望值为空".format(page_label))
-        # 小红书页面部分控件带有多选外观，但保存接口的
-        # XhsGoodsProperty.value 实际声明为 String；发送数组会直接触发
-        # Jackson START_ARRAY 反序列化错误。提交前保留第一个精确值，
-        # 确保请求与接口协议一致。
         if self.attribute_runtime is not None:
             resolved_values = await self._resolve_learning_select_groups(
                 page_label,

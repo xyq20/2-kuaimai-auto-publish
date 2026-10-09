@@ -5,7 +5,8 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from attribute_runtime import ResolvedAttribute
+from attribute_runtime import AttributeRuntime, ResolvedAttribute
+from learning_store import LearningStore
 from kuaimai_erp import AutomationError, sync_image_group, wait_for_image_uploads
 from xhs_data import XhsFields, parse_xhs_fields
 from xhs_form_listing import XhsFormListing, title_without_neigborl
@@ -917,6 +918,145 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
             tuple((item.value_id, item.label) for item in request.candidates),
             (("regular", "常规"), ("thick", "加厚")),
         )
+
+    async def _reviewed_season_listing(
+        self, runtime, *, multi=True, choices=None
+    ):
+        choices = choices or tuple(
+            ("season-" + label, label) for label in ("春", "夏", "秋", "冬")
+        )
+        listing = await self._listing()
+        listing.attribute_runtime = runtime
+        await self.page.locator("[role=tabpanel]").evaluate(
+            """(root, {multi, choices}) => {
+              const item = document.createElement('div');
+              item.className = 'complex-item';
+              item.id = 'reviewed-season';
+              item.innerHTML = `<div class="el-form-item"><label class="el-form-item__label">适用季节</label>
+                <div class="el-form-item__content"><div class="el-select">
+                  ${multi ? '<div class="el-select__tags"><input class="el-select__input" onclick="openSelect(this)"></div>' : ''}
+                  <input class="el-input__inner" readonly onclick="openSelect(this)">
+                  <div class="el-select-dropdown" style="display:none"><ul></ul></div>
+                </div></div></div>`;
+              root.appendChild(item);
+              for (const [value, label] of choices) {
+                const row = document.createElement('li');
+                row.className = 'el-select-dropdown__item';
+                row.textContent = label;
+                row.__vue__ = {value, created: false};
+                row.onclick = () => {
+                  if (!multi) { choose(row); return; }
+                  const tags = item.querySelector('.el-select__tags');
+                  if ([...tags.querySelectorAll('.el-tag')].some(tag => tag.textContent === label)) return;
+                  const tag = document.createElement('span');
+                  tag.className = 'el-tag';
+                  tag.textContent = label;
+                  const close = document.createElement('i');
+                  close.className = 'el-tag__close';
+                  close.onclick = () => tag.remove();
+                  tag.appendChild(close);
+                  tags.prepend(tag);
+                };
+                item.querySelector('ul').appendChild(row);
+              }
+            }""",
+            {"multi": multi, "choices": choices},
+        )
+        await self.page.route(
+            "**/xhs/getAttributeList.json*",
+            lambda route: route.fulfill(
+                headers={"access-control-allow-origin": "*"},
+                json={"attributeV3s": [{
+                    "id": "season", "name": "适用季节", "isMulti": multi,
+                    "isRequired": True, "customizable": False,
+                }]},
+            ),
+        )
+        await self.page.route(
+            "**/xhs/getAttributeValues.json*",
+            lambda route: route.fulfill(
+                headers={"access-control-allow-origin": "*"},
+                json={"attributeValueV3s": [
+                    {"valueId": value_id, "valueName": label}
+                    for value_id, label in choices
+                ]},
+            ),
+        )
+        await self.page.evaluate("""async () => {
+          await fetch('https://api.test/xhs/getAttributeList.json?leafCategoryId=377119554');
+          await fetch('https://api.test/xhs/getAttributeValues.json?attributeId=season');
+        }""")
+        return listing, self.page.locator("#reviewed-season")
+
+    async def test_reviewed_multiple_seasons_are_refilled_as_separate_choices(self):
+        class Client:
+            def post_event(self, key, event_type, payload):
+                return {"event_id": key}
+
+            def review_learning(self, request):
+                return {
+                    "status": "review_required",
+                    "reason_code": "review_learning_insufficient",
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory) / "learning.sqlite3")
+            store.migrate()
+            runtime = AttributeRuntime(store, Client(), "run", "NGBL-2097")
+            try:
+                runtime.begin_review_collection("xhs")
+                listing, item = await self._reviewed_season_listing(runtime)
+                self.assertIsNone(
+                    await listing._fill_attribute("适用季节", item, "四季通用")
+                )
+                self.assertEqual(len(runtime.deferred_reviews), 1)
+                review = runtime.deferred_reviews[0]
+                store.save_review_resolution(
+                    product_version="NGBL-2097", platform_id="xhs",
+                    snapshot_version=review.snapshot_version, review_id=review.review_id,
+                    final_value_id="season-春,season-夏,season-冬,season-秋",
+                )
+                runtime.begin_review_collection("xhs")
+                actual = await listing._fill_attribute("适用季节", item, "四季通用")
+                self.assertCountEqual(actual, ("春", "夏", "冬", "秋"))
+                self.assertFalse(runtime.has_deferred_reviews)
+                self.assertEqual(review.request.control_type, "multi_select")
+            finally:
+                await runtime.drain()
+                store.close()
+
+    async def test_single_select_keeps_comma_in_reviewed_option_label(self):
+        runtime = Mock()
+        runtime.reusable_choice.return_value = ResolvedAttribute(
+            "combined", "春，夏", "human", "snapshot-season"
+        )
+        runtime.resolve = AsyncMock(return_value=runtime.reusable_choice.return_value)
+        listing, item = await self._reviewed_season_listing(
+            runtime, multi=False, choices=(("combined", "春，夏"), ("winter", "冬"))
+        )
+
+        actual = await listing._fill_attribute("适用季节", item, "四季通用")
+
+        self.assertEqual(actual, ("春，夏",))
+        self.assertEqual(runtime.resolve.call_args.args[0].control_type, "select")
+
+    async def test_multiselect_deduplicates_reviewed_choices_across_excel_groups(self):
+        runtime = Mock()
+        runtime.reusable_choice.return_value = ResolvedAttribute(
+            "season-春,season-夏", "春,夏", "human", "snapshot-season"
+        )
+        runtime.resolve = AsyncMock(return_value=runtime.reusable_choice.return_value)
+        listing, item = await self._reviewed_season_listing(runtime)
+
+        actual = await listing._fill_attribute("适用季节", item, "春,夏")
+
+        self.assertCountEqual(actual, ("春", "夏"))
+        self.assertEqual(await item.locator(".el-tag").count(), 2)
+        self.assertEqual(runtime.reusable_choice.call_count, 2)
+        self.assertTrue(all(
+            call.args[0].control_type == "multi_select"
+            for call in runtime.reusable_choice.call_args_list
+        ))
 
     async def test_xhs_clicks_one_exact_created_remote_option_before_it_disappears(self):
         listing = await self._listing()
