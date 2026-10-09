@@ -94,6 +94,18 @@ class CloudLearningClient:
         )
         return self._successful_json(status, body)
 
+    def _judge(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        status, body = self._request("POST", path, payload, timeout=40)
+        if status == 404:
+            return {"status": "review_required", "reason_code": "semantic_judge_unavailable"}
+        return self._successful_json(status, body)
+
+    def ocr_judge(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self._judge("/api/device/ocr-judge", payload)
+
+    def semantic_judge(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self._judge("/api/device/semantic-judge", payload)
+
     def poll_resume(
         self,
         device_id: str,

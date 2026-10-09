@@ -1,0 +1,167 @@
+"""Use human learning first, then bounded DeepSeek label interpretation."""
+from __future__ import annotations
+
+import asyncio
+from dataclasses import asdict
+import logging
+
+from attribute_runtime import AttributeRequest, ReviewBatchRequired, ReviewRequired
+from learning_client import LearningClientError
+from learning_models import CandidateValue, canonical_sha256
+from ocr_semantics import MEANINGS, OCRJudgmentRequired, OCRSemanticSession, validate_suggestions
+from size_image_recognition import RecognitionError, _matches_alias_composition, _MEASUREMENT_ALIASES, _CLOTHING_MEASUREMENT_ALIASES, _CLOTHING_EXTRA_ROW_ALIASES
+
+
+def unresolved_labels(error):
+    aliases = (_MEASUREMENT_ALIASES if error.garment_kind == "pants" else
+               {**_CLOTHING_MEASUREMENT_ALIASES, **_CLOTHING_EXTRA_ROW_ALIASES})
+    return tuple(i for i in error.label_token_ids
+                 if not any(_matches_alias_composition(error.tokens[i].text, a) for a in aliases.values()))
+
+
+async def resolve_ocr_failure(runtime, client, session: OCRSemanticSession,
+                              error: OCRJudgmentRequired, logger: logging.Logger, *, platform_id="base"):
+    meanings = MEANINGS[error.garment_kind]
+    unknown = unresolved_labels(error)
+    # For a structural failure expose the actual row labels for review rather
+    # than let the model generate numbers to patch a broken grid.
+    label_ids = unknown or error.label_token_ids
+    if not label_ids:
+        raise RecognitionError(f"OCR 无法定位可审核的测量行，请修正尺码图：{error}")
+    requests = {}
+    decisions = dict(session.corrections.get(error.key, {}))
+    pending = []
+    for ident in label_ids:
+        text = error.tokens[ident].text
+        request = AttributeRequest(
+            platform_id=platform_id, category_leaf_id="ocr:" + error.garment_kind,
+            field_id="ocr:" + canonical_sha256((error.garment_kind, text))[:24],
+            field_label="尺码 OCR 含义 · " + text,
+            candidates=tuple(CandidateValue(k, v) for k, v in meanings.items()),
+            excel_value=text,
+            evidence={"ocr_text": text, "ocr_row_index": ident,
+                      "summary": f"尺码表原文“{text}”。请选择它表示的测量项；尺寸数字保持原图数据。原校验：{error}"},
+            custom_allowed=False, schema_version="ocr-v1:" + error.key,
+            control_type="ocr_semantic",
+        )
+        requests[ident] = request
+        if ident in decisions:
+            continue
+        approved = runtime.reusable_choice(request)
+        if approved is not None:
+            if approved.is_no_fill:
+                decisions[ident] = "other"
+            elif approved.value_id in meanings:
+                decisions[ident] = approved.value_id
+            else:
+                raise RecognitionError("OCR 已审核值不属于当前测量项")
+            continue
+        # This uses the normal service gate (same product, or >=3 independent
+        # human examples and >=95% agreement), without proposing model samples.
+        from learning_models import CandidateSnapshot
+        snapshot = CandidateSnapshot(request.platform_id, request.category_leaf_id, request.field_id,
+                                     request.field_label, request.candidates, request.schema_version, False)
+        runtime._queue_candidate_snapshot(snapshot, None, request.control_type)
+        await runtime.drain()
+        try:
+            learned = await asyncio.to_thread(client.review_learning, {
+                "product_version": runtime.product_version, "platform_id": platform_id,
+                "category_leaf_id": request.category_leaf_id, "field_id": request.field_id,
+                "snapshot_version": snapshot.snapshot_version, "excel_value": text,
+                "control_type": request.control_type,
+            })
+        except LearningClientError:
+            learned = {}
+        import math
+        ids = learned.get("value_ids")
+        support, rate = learned.get("support_count"), learned.get("calibrated_acceptance_rate")
+        if (learned.get("status") == "auto_fill_ready" and learned.get("source") == "review_learning"
+                and learned.get("snapshot_version") == snapshot.snapshot_version
+                and type(support) is int and support >= (1 if learned.get("same_product") is True else 3)
+                and type(rate) in (float, int) and math.isfinite(rate) and .95 <= rate <= 1
+                and isinstance(ids, list) and len(ids) == 1 and ids[0] in meanings
+                and learned.get("value_labels") == [meanings[ids[0]]]):
+            decisions[ident] = ids[0]
+        else:
+            pending.append(ident)
+    resolved_structure = False
+    if decisions:
+        try:
+            error.validate(decisions)
+            resolved_structure = True
+        except RecognitionError:
+            pass
+    if not pending or resolved_structure:
+        try:
+            error.validate(decisions)
+        except RecognitionError:
+            raise RecognitionError(f"OCR 已审核含义后，表格行列或数值仍未通过校验，请修正原图：{error}") from None
+        session.corrections[error.key] = decisions
+        logger.info("尺码 OCR 已复用人工审核/学习，结构与数值校验通过")
+        return
+    prediction_key = canonical_sha256({"chart": error.key, "reason": str(error), "decisions": decisions})
+    if prediction_key not in session.predictions:
+        judge = getattr(client, "ocr_judge", None)
+        try:
+            result = await asyncio.to_thread(judge, {
+                "product_version": runtime.product_version, "garment_kind": error.garment_kind,
+                "platform_id": platform_id,
+                "tokens": [asdict(t) for t in error.tokens], "label_token_ids": list(label_ids),
+                "reason": str(error),
+            }) if callable(judge) else {"reason_code": "ocr_judge_unavailable"}
+        except LearningClientError:
+            result = {"reason_code": "ocr_judge_unavailable"}
+        session.predictions[prediction_key] = result if isinstance(result, dict) else {}
+    response = session.predictions[prediction_key]
+    suggestions = validate_suggestions(error, response)
+    proposal = {**decisions, **{i: suggestions[i][0] for i in pending if i in suggestions}}
+    proposed_ids = [i for i in pending if i in suggestions]
+    valid = bool(proposed_ids)
+    if valid:
+        try:
+            error.validate(proposal)
+        except RecognitionError:
+            valid = False
+    if valid and all(suggestions[i][1] >= .98 for i in proposed_ids):
+        session.corrections[error.key] = proposal
+        for ident in proposed_ids:
+            session.record_decision({
+                "platform_id": platform_id, "field_id": requests[ident].field_id,
+                "field_label": requests[ident].field_label, "excel_value": error.tokens[ident].text,
+                "selected_labels": [meanings[proposal[ident]]], "selected_value_ids": [proposal[ident]],
+                "confidence": suggestions[ident][1], "reason": "OCR 原文语义映射；原表行列与正数校验通过",
+                "evidence_kinds": ["ocr"], "status": "adopted", "readback_status": "source_validated",
+                "source_image": str(error.path), "ocr_row_index": ident,
+                "snapshot_version": requests[ident].schema_version, "source": "deepseek",
+                "model": response.get("model", ""), "original_ocr": [asdict(t) for t in error.tokens],
+            })
+        logger.info("DeepSeek 尺码 OCR 含义判断通过原表行列/数值校验：%s", "、".join(
+            f"{error.tokens[i].text} → {meanings[proposal[i]]}" for i in proposed_ids))
+        return
+    reviews = []
+    for ident in pending:
+        request = requests[ident]
+        from learning_models import CandidateSnapshot
+        snapshot = CandidateSnapshot(request.platform_id, request.category_leaf_id, request.field_id,
+                                     request.field_label, request.candidates, request.schema_version, False)
+        if ident in suggestions:
+            session.record_decision({
+                "platform_id": platform_id, "field_id": request.field_id, "field_label": request.field_label,
+                "excel_value": error.tokens[ident].text, "selected_labels": [meanings[suggestions[ident][0]]],
+                "selected_value_ids": [suggestions[ident][0]], "confidence": suggestions[ident][1],
+                "reason": "模型判断未满足置信度或原表结构校验，等待人工确认", "status": "review_required",
+                "readback_status": "pending", "source_image": str(error.path), "ocr_row_index": ident,
+                "snapshot_version": request.schema_version, "source": "deepseek",
+                "model": response.get("model", ""), "original_ocr": [asdict(t) for t in error.tokens],
+            })
+        try:
+            # A model prediction is only a suggestion. The operator's resulting
+            # review action is the only new training evidence.
+            await runtime._raise_review(request, snapshot, None,
+                                        str(response.get("reason_code") or "ocr_semantic_uncertain"),
+                                        suggestions[ident][0] if valid and ident in suggestions else None)
+        except ReviewRequired as review:
+            reviews.append(review)
+    if reviews:
+        raise ReviewBatchRequired(tuple(reviews))
+    runtime.raise_deferred_reviews()

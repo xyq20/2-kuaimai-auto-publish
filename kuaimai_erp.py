@@ -26,7 +26,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -50,6 +50,7 @@ from learning_store import LearningStore
 from learning_assets import PreparedLearningAsset, prepare_learning_assets
 from learning_client import CloudLearningClient, RetryableCloudError, flush_outbox_async
 from attribute_runtime import AttributeRuntime, ReviewBatchRequired, ReviewRequired
+from ocr_semantics import CURRENT_SESSION, OCRJudgmentRequired, OCRSemanticSession
 from historical_readbacks import load_verified_attribute_history
 from review_resume import persist_resume_and_ack, validate_resume
 from pdd_data import PddFields, parse_pdd_fields
@@ -331,6 +332,8 @@ class ProductData:
     garment_kind: str = "generic"
     derived_size_names: Tuple[str, ...] = ()
     colors: Tuple[str, ...] = ()
+    descriptive_fields: Mapping[str, str] = field(default_factory=dict)
+    douyin_expected: bool = False
 
     def __post_init__(self) -> None:
         if (self.douyin_fields is None) != (self.douyin_assets is None):
@@ -347,6 +350,7 @@ class LearningRunContext:
     client: Optional[CloudLearningClient] = None
     attribute_runtime: Optional[AttributeRuntime] = None
     initialized: bool = False
+    platform_order: Tuple[str, ...] = ()
 
 
 def product_registration_event(
@@ -386,6 +390,11 @@ def create_learning_context(
     store.upsert_product(fingerprint)
     product_key, product_payload = product_registration_event(fingerprint.product_version, product)
     store.enqueue(product_key, "product.upsert", product_payload)
+    descriptive = dict(getattr(product, "descriptive_fields", {}))
+    if descriptive:
+        facts = {"product_version": fingerprint.product_version, "source": "product_info",
+                 "payload_json": {"product_info": descriptive}}
+        store.enqueue("text_facts.created:product_info:" + canonical_sha256(facts), "text_facts.created", facts)
     run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
     client = CloudLearningClient(args.learning_api_url)
     runtime = AttributeRuntime(
@@ -691,6 +700,7 @@ def read_product_data(
     excel_path: Path,
     *,
     include_douyin: bool = True,
+    identity_only: bool = False,
 ) -> ProductData:
     try:
         from openpyxl import load_workbook
@@ -724,10 +734,16 @@ def read_product_data(
     category_hints = parse_category_hints(field_value("商品分类"))
     colors = parse_spec_values(field_value("颜色"))
     profile = category_profile(category_hints, title)
+    descriptive_prefixes = ("商品分类", "颜色", "尺码", "面料", "材质", "成分", "风格", "款式", "版型",
+                            "裤型", "袖型", "领型", "适用", "季节", "上市", "厚薄", "长度", "衣长",
+                            "袖长", "裤长", "腰型", "弹力", "功能", "图案", "流行", "织", "工艺", "里料", "闭合")
+    descriptive_fields = {str(k): normalize_cell(v)[:1000] for k, v in fields.items()
+                          if isinstance(k, str) and k.startswith(descriptive_prefixes) and normalize_cell(v)}
     derived_size_names: Tuple[str, ...] = ()
     size_chart_dir = product_dir / "尺码信息表"
     if (
         field_value("尺码") is None
+        and not identity_only
         and profile.supports_letter_size_chart
         and size_chart_dir.is_dir()
     ):
@@ -758,6 +774,16 @@ def read_product_data(
         (product_dir / directory_name).is_dir()
         for directory_name in ("水洗标图片", "尺码信息表", "身高体重推荐表")
     )
+
+    if identity_only:
+        return ProductData(
+            excel_path, product_dir, title, style_code, normalize_price(price_value),
+            list_images(main_dir, "1:1 主图"), list_images(main_34_dir, "3:4 主图"),
+            list_images(detail_dir, "商品详情图"), list_images(sku_dir, "SKU 图"),
+            category_hints=category_hints, garment_kind=profile.garment_kind, colors=colors,
+            descriptive_fields=descriptive_fields,
+            douyin_expected=include_douyin and has_douyin_signals,
+        )
 
     return ProductData(
         excel_path=excel_path,
@@ -790,6 +816,8 @@ def read_product_data(
         garment_kind=profile.garment_kind,
         derived_size_names=derived_size_names,
         colors=colors,
+        descriptive_fields=descriptive_fields,
+        douyin_expected=include_douyin and has_douyin_signals,
     )
 
 
@@ -6847,6 +6875,68 @@ async def drain_learning_events(
         await runtime.drain()
 
 
+async def recover_ocr_with_learning(context, args, session, error, logger):
+    from ocr_review import resolve_ocr_failure
+    if context is None or context.client is None or session is None:
+        raise RecognitionError(f"{error}；启用审核学习后可使用 DeepSeek OCR 判断或人工审核") from error
+    runtime = context.attribute_runtime
+    await runtime.drain()
+    checkpoint = context.store.load_checkpoint(context.run_id)
+    order = checkpoint.platform_order if checkpoint else (context.platform_order or tuple(
+        spec.cli_name for spec in expand_platform_selection(args.platform)))
+    index = checkpoint.current_index if checkpoint else 0
+    platform_id = order[index]
+    if not runtime.has_deferred_reviews:
+        runtime.begin_review_collection(platform_id)
+    try:
+        while True:
+            try:
+                await resolve_ocr_failure(runtime, context.client, session, error, logger, platform_id=platform_id)
+                runtime.raise_deferred_reviews()
+                break
+            except (ReviewRequired, ReviewBatchRequired) as review:
+                logger.info("尺码 OCR 无法确定，提交 %s 的尺码审核；确认后继续读取原图", platform_id)
+                await wait_for_platform_review_batch(context, args, order, index,
+                                                    review_requirements(review), logger)
+                runtime.begin_review_collection(platform_id)
+    finally:
+        await runtime.drain()
+        runtime._collecting_platform_id = ""
+        runtime._deferred_reviews.clear()
+
+
+async def read_product_with_ocr_review(excel_path, args, context, session, error, logger, *, include_douyin):
+    while True:
+        await recover_ocr_with_learning(context, args, session, error, logger)
+        try:
+            return read_product_data(excel_path, include_douyin=include_douyin)
+        except OCRJudgmentRequired as failure:
+            error = failure
+
+
+def write_model_judgment_report(artifact_dir, context, session):
+    """Preserve every prediction, including a failed or interrupted run."""
+    from html import escape
+    runtime = getattr(context, "attribute_runtime", None)
+    rows = list(getattr(runtime, "model_decisions", [])) + list(session.model_decisions)
+    payload = {"run_id": getattr(context, "run_id", ""), "product_version": getattr(context, "product_version", ""),
+               "decisions": rows, "generated_at": datetime.now(timezone.utc).isoformat()}
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    report_path = artifact_dir / "model-judgments.json"
+    report_temporary = report_path.with_suffix(".json.tmp")
+    report_temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    report_temporary.replace(report_path)
+    headers = ("平台", "字段", "原值", "采用/建议值", "置信度", "判断依据", "处理", "回读")
+    def cell(value):
+        return "<td>" + escape(str(value)) + "</td>"
+    body = "".join("<tr>" + "".join(cell(v) for v in (
+        row.get("platform_id", ""), row.get("field_label", ""), row.get("excel_value", ""),
+        "、".join(row.get("selected_labels", [])), f'{row.get("confidence", 0):.1%}', row.get("reason", ""),
+        row.get("status", ""), row.get("readback_status", "pending"))) + "</tr>" for row in rows)
+    document = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>大模型判断汇总</title><style>body{font:15px system-ui;margin:32px;color:#222}table{width:100%;border-collapse:collapse}td,th{padding:14px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}th{background:#f6f7f9}td{white-space:pre-wrap}h1{font-size:24px}</style><h1>大模型判断汇总</h1><p>自动采用与待审核判断独立记录。置信度为模型判断值；pending 表示尚无保存回读结果。</p><table><thead><tr>' + ''.join('<th>' + escape(h) + '</th>' for h in headers) + '</tr></thead><tbody>' + body + '</tbody></table>' + ('<p>本次没有大模型判断。</p>' if not rows else '') + '</html>'
+    (artifact_dir / "model-judgments.html").write_text(document, encoding="utf-8")
+
+
 def review_requirements(
     error: ReviewRequired | ReviewBatchRequired,
 ) -> Tuple[ReviewRequired, ...]:
@@ -7006,6 +7096,10 @@ async def run_single_platform_with_learning(
                 args.platform,
             )
             continue
+        except OCRJudgmentRequired as exc:
+            await recover_ocr_with_learning(learning_context, args, CURRENT_SESSION.get(), exc, logger)
+            save_learning_checkpoint(learning_context, args, platform_order, 0, "running")
+            continue
         except Exception:
             save_learning_checkpoint(
                 learning_context, args, platform_order, 0, "failed"
@@ -7035,7 +7129,7 @@ def platform_execution_stages(
         return tuple(spec.cli_name for spec in selected)
     commerce_stages = (
         tuple(spec.cli_name for spec in selected
-              if spec.cli_name != "douyin" or product.douyin_fields is not None)
+              if spec.cli_name != "douyin" or product.douyin_fields is not None or getattr(product, "douyin_expected", False))
     )
     start_at = getattr(args, "all_platform_start_at", None)
     if start_at is not None:
@@ -7166,6 +7260,12 @@ async def run_all_implemented_platforms(
                     platform_name,
                 )
                 continue
+            except OCRJudgmentRequired as exc:
+                await close_shared_browser_session(shared_session)
+                shared_session = {}
+                await recover_ocr_with_learning(learning_context, args, CURRENT_SESSION.get(), exc, logger)
+                save_learning_checkpoint(learning_context, args, stages, stage_index, "running")
+                continue
             except Exception as exc:
                 stage_results.append(
                     {"platform": platform_name, "status": "failed", "error": str(exc)}
@@ -7237,17 +7337,39 @@ def main() -> int:
             "已启用全平台单店测试：每平台仅使用正式配置的第一家店，默认配置未修改"
         )
     learning_context: Optional[LearningRunContext] = None
+    ocr_session = OCRSemanticSession()
+    if redactor is None:
+        ocr_session.report_sink = lambda: write_model_judgment_report(artifact_dir, learning_context, ocr_session)
+    ocr_scope = ocr_session.activate()
+    ocr_scope.__enter__()
     try:
         if args.create_product:
             product = read_new_product_seed(resolve_excel_path(args.excel_url))
         else:
-            product = read_product_data(
-                resolve_excel_path(args.excel_url),
-                include_douyin=any(
-                    spec.cli_name in {"douyin", "taobao"} for spec in selected_platforms
-                ),
-            )
-        learning_context = create_learning_context(args, product)
+            excel_path = resolve_excel_path(args.excel_url)
+            include_douyin = any(spec.cli_name in {"douyin", "taobao"} for spec in selected_platforms)
+            try:
+                product = read_product_data(excel_path, include_douyin=include_douyin)
+            except OCRJudgmentRequired as error:
+                identity = read_product_data(excel_path, include_douyin=include_douyin, identity_only=True)
+                learning_context = create_learning_context(args, identity)
+                if learning_context is None:
+                    raise RecognitionError(str(error)) from error
+                learning_context.attribute_runtime.model_decision_sink = ocr_session.report_sink
+                learning_context.platform_order = platform_execution_stages(args, identity)
+                key, payload = product_registration_event(learning_context.product_version, identity)
+                learning_context.client.post_event(key, "product.upsert", payload)
+                product = asyncio.run(read_product_with_ocr_review(excel_path, args, learning_context,
+                                      ocr_session, error, logger, include_douyin=include_douyin))
+                # The input phase used its own loop; pending events were drained
+                # before leaving it. Recreate loop-bound synchronization later.
+                learning_context.attribute_runtime._flush_lock = None
+                learning_context.attribute_runtime._background_flush = None
+        if learning_context is None:
+            learning_context = create_learning_context(args, product)
+        if learning_context is not None:
+            learning_context.attribute_runtime.model_decision_sink = ocr_session.report_sink
+            learning_context.platform_order = platform_execution_stages(args, product)
         if redactor is not None:
             redactor.add_sensitive_values(product.style_code, product.title)
             summary = None
@@ -7335,6 +7457,11 @@ def main() -> int:
         logger.exception("程序出现未预期错误")
         return 1
     finally:
+        if redactor is None:
+            write_model_judgment_report(artifact_dir, learning_context, ocr_session)
+            count = len(getattr(getattr(learning_context, "attribute_runtime", None), "model_decisions", [])) + len(ocr_session.model_decisions)
+            logger.info("大模型判断汇总：%s 项，查看 model-judgments.html / model-judgments.json", count)
+        ocr_scope.__exit__(None, None, None)
         if learning_context is not None:
             learning_context.store.close()
 

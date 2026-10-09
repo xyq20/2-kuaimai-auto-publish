@@ -67,3 +67,4 @@ body.review-active{overflow:hidden}
 #review-frame{flex:1 1 auto;width:100%;height:auto;min-height:0;display:block;border:0;border-radius:0;background:transparent}
 @media(max-width:1180px){#review-view{padding-left:27px;padding-right:27px}}
 @media(max-width:650px){#review-view{height:calc(100vh - 64px);padding:0 16px 12px}#review-view .page-heading{padding:18px 0 12px}#review-frame{height:auto;min-height:0}}
+.model-judgment-list{display:grid;gap:10px;max-height:420px;overflow:auto}.model-judgment-item{border:1px solid var(--line);padding:16px;border-radius:10px;font-size:13px}.model-judgment-item>div{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}.model-judgment-item p{margin-top:8px;line-height:1.6;overflow-wrap:anywhere}.model-judgment-item small{display:block;color:var(--muted);margin-top:8px;overflow-wrap:anywhere}

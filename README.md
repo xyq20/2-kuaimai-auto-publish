@@ -254,6 +254,30 @@ FastAPI 服务接到命名 Tunnel，无需迁移 SQLite。未安装用户服务�
 审核。只有人工确认且平台保存后回读通过的结果才累计规则；同条件至少连续确认 3 次且
 历史接受率达到 95% 后才允许规则自动填写。
 
+DeepSeek 官方文字判断使用独立配置，不影响上面的图片分析接口。处理顺序是：
+已确认的同商品审核、Excel 精确候选、成熟学习记录、DeepSeek 语义判断、无法确定时人工审核。
+模型读取商品标题、Excel 描述资料、当前平台真实候选和相关人工审核记录。
+`>` 表示类目路径，`/` 表示按顺序备选。模型只能引用已有候选；尺码 OCR 只能解释文字，
+不能生成尺寸数值。置信度至少 0.98 且候选、证据、尺码结构校验通过才自动采用；
+该置信度是模型自评，不代表实际准确率。已有人工判断或学习冲突不会被模型覆盖。
+
+在本机终端运行以下命令，隐藏输入官方 API Key，配置保存于忽略 Git 的
+`.local-state/review-center/deepseek.json`（仅当前用户可读写），下次判断自动读取，无需重启：
+
+```bash
+.venv/bin/python -m local_review.cli configure-deepseek
+```
+
+也可直接编辑该 JSON 文件中的 `api_key`，预留配置为空字符串；不要提交密钥到 Git。
+
+也可设置 `KUAIMAI_DEEPSEEK_API_KEY`（兼容 `DEEPSEEK_API_KEY`）和
+`KUAIMAI_DEEPSEEK_MODEL`。官方地址固定为 `https://api.deepseek.com/chat/completions`，
+默认 `deepseek-flash`，可使用 `configure-deepseek --model deepseek-v4-pro` 切换。
+无密钥、接口超时、无效结果时走现有人工审核。运行详情会展示“大模型判断汇总”，
+输出目录中的 `model-judgments.html` 和 `model-judgments.json` 包含原值、采用值、
+判断依据、候选快照、参考审核编号、置信度和回读状态；失败或中止的运行也保留记录。
+模型自动判断独立标注，不累计为人工审核学习样本；人工确认仍沿用原有复用门槛。
+
 维护命令：
 
 ```bash

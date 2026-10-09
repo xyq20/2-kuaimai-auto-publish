@@ -1,0 +1,131 @@
+import dataclasses
+import json
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from fastapi.testclient import TestClient
+from local_review.app import create_app
+from local_review.config import Settings
+from local_review.database import migrate, transaction
+from local_review.semantic import judgment_context
+from local_review.cli import main
+from local_review.security import create_user
+from tests.test_ocr_semantics import unfamiliar_tokens
+
+
+class DeepSeekIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = Settings(Path(self.tmp.name), 'device-secret', deepseek_api_key='private-key')
+        migrate(self.settings)
+        self.client = TestClient(create_app(self.settings))
+        self.headers = {'Authorization': 'Device device-secret'}
+        self.event('product', 'product.upsert', {'product_version':'p', 'title':'费尔岛羊毛上衣',
+                   'style_code':'2024', 'category_json':{'hints':['毛衣']}})
+        self.event('fields', 'text_facts.created', {'product_version':'p', 'source':'product_info',
+                   'payload_json':{'product_info':{'面料材质':'羊毛','风格':'复古'}}})
+        self.event('snapshot', 'snapshot.created', {'snapshot_version':'s','platform_id':'xhs',
+                   'category_leaf_id':'c','field_id':'category_path','field_label':'商品类目',
+                   'schema_version':'schema','custom_allowed':False,'control_type':'category',
+                   'options':[{'value_id':'knit','label':'男装 > 针织衫','position':0}]})
+
+    def event(self, key, kind, payload):
+        response = self.client.post('/api/device/events', headers=self.headers,
+                                    json={'idempotency_key':key,'event_type':kind,'payload':payload})
+        self.assertEqual(response.status_code, 201, response.text)
+
+    def test_attribute_endpoint_receives_excel_product_and_real_candidates(self):
+        payload = {'product_version':'p','platform_id':'xhs','category_leaf_id':'c','field_id':'category_path',
+                   'field_label':'商品类目','control_type':'category','snapshot_version':'s',
+                   'excel_value':'男装 > 毛衣/针织衫','evidence':{},
+                   'options':[{'value_id':'knit','label':'男装 > 针织衫'}]}
+        answer = {'value_ids':['knit'],'confidence':.99,'reason':'Excel 毛衣对应针织衫叶子', 'evidence_kinds':['excel','product']}
+        with patch('local_review.semantic.request_json', return_value=answer) as call:
+            unauthorized = self.client.post('/api/device/semantic-judge', json=payload)
+            self.assertEqual(unauthorized.status_code, 401)
+            call.assert_not_called()
+            response = self.client.post('/api/device/semantic-judge', headers=self.headers, json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['value_ids'], ['knit'])
+        context = call.call_args.args[2]['product_and_learning']
+        self.assertEqual(context['title'], '费尔岛羊毛上衣')
+        self.assertEqual(context['product_info']['面料材质'], '羊毛')
+        self.assertNotIn('private-key', response.text)
+        with transaction(self.settings) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM review_actions").fetchone()[0], 0)
+
+    def test_ocr_endpoint_only_accepts_real_non_numeric_row_ids(self):
+        payload = {'product_version':'p','garment_kind':'clothing',
+                   'tokens':[dataclasses.asdict(t) for t in unfamiliar_tokens()],
+                   'label_token_ids':[0], 'reason':'unknown label'}
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {'choices':[{'finish_reason':'stop','message':{'content':json.dumps(
+            {'suggestions':[{'token_id':0,'meaning':'length','confidence':.99}]})}}]}
+        with patch('local_review.deepseek.httpx.post', return_value=response) as call:
+            result = self.client.post('/api/device/ocr-judge', headers=self.headers, json=payload)
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()['status'], 'suggested')
+            self.assertIn('费尔岛羊毛上衣', call.call_args.kwargs['json']['messages'][1]['content'])
+            call.reset_mock()
+            result = self.client.post('/api/device/ocr-judge', headers=self.headers,
+                                      json={**payload,'label_token_ids':[6]})
+            self.assertEqual(result.status_code, 400)
+            call.assert_not_called()
+
+    def test_stale_or_modified_snapshot_does_not_call_model(self):
+        payload = {'product_version':'p','platform_id':'xhs','category_leaf_id':'c','field_id':'category_path',
+                   'field_label':'商品类目','control_type':'category','snapshot_version':'s',
+                   'excel_value':'毛衣','evidence':{}, 'options':[{'value_id':'changed','label':'男装 > 工装裤'}]}
+        with patch('local_review.semantic.request_json') as call:
+            response = self.client.post('/api/device/semantic-judge', headers=self.headers, json=payload)
+            self.assertEqual(response.status_code, 422)
+            call.assert_not_called()
+
+    def test_configure_key_is_private_hidden_and_persists_for_service(self):
+        with patch.dict(os.environ, {'KUAIMAI_REVIEW_DATA_DIR':self.tmp.name}, clear=True), patch('local_review.cli.getpass.getpass', return_value='private-key'), patch('builtins.print') as output:
+            self.assertEqual(main(['configure-deepseek']), 0)
+            settings = Settings.from_env()
+        config = Path(self.tmp.name) / 'deepseek.json'
+        self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+        self.assertEqual(settings.deepseek_api_key, 'private-key')
+        self.assertNotIn('private-key', str(output.call_args_list))
+
+    def test_service_reloads_key_file_and_allows_disabling_without_restart(self):
+        config=Path(self.tmp.name)/'deepseek.json'
+        config.write_text(json.dumps({'api_key':'new-private-key','model':'deepseek-v4-pro'}))
+        with patch.dict(os.environ, {}, clear=True):
+            settings=self.settings.with_deepseek_configuration()
+            self.assertEqual((settings.deepseek_api_key,settings.deepseek_model),('new-private-key','deepseek-v4-pro'))
+            config.write_text(json.dumps({'api_key':'','model':'deepseek-flash'}))
+            self.assertEqual(settings.with_deepseek_configuration().deepseek_api_key,'')
+
+    def test_ocr_review_cannot_confirm_invented_or_multiple_meanings(self):
+        self.event('ocr-snapshot', 'snapshot.created', {'snapshot_version':'ocr-s','platform_id':'base',
+                   'category_leaf_id':'ocr:clothing','field_id':'ocr:length','field_label':'尺码 OCR 含义 · 衣身丈',
+                   'schema_version':'schema','custom_allowed':False,'control_type':'ocr_semantic',
+                   'options':[{'value_id':'length','label':'衣长','position':0},{'value_id':'chest','label':'胸围','position':1}]})
+        self.event('ocr-review','review.created', {'id':'ocr-review','run_id':'run','device_id':'device',
+                   'product_version':'p','platform_id':'base','category_leaf_id':'ocr:clothing','field_id':'ocr:length',
+                   'field_label':'尺码 OCR 含义 · 衣身丈','canonical_field':None,'snapshot_version':'ocr-s',
+                   'reason_code':'uncertain','suggested_value_id':None,'evidence_json':{}})
+        with transaction(self.settings) as connection:
+            create_user(connection,'admin','1234',role='admin')
+        headers={'Origin':'http://testserver'}
+        self.assertEqual(self.client.post('/api/login',headers=headers,json={'username':'admin','password':'1234'}).status_code,200)
+        task=self.client.get('/api/reviews').json()['tasks'][0]
+        self.assertFalse(task['custom_allowed'])
+        claimed=self.client.post('/api/reviews/ocr-review/claim',headers=headers,json={'version':1}).json()
+        for value in ('invented','length,chest'):
+            response=self.client.post('/api/reviews/ocr-review/confirm',headers=headers,
+                                      json={'version':claimed['version'],'final_value_id':value})
+            self.assertEqual(response.status_code,422,response.text)
+
+
+if __name__ == '__main__':
+    unittest.main()

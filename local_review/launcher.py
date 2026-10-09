@@ -359,6 +359,8 @@ class Launcher:
             stages[list(stages)[current]] = job["status"]
         result.update(stages=[{"platform": name, "status": status} for name, status in stages.items()], pending_reviews=pending)
         if logs:
+            report = read_json(Path(job["output_dir"]) / "model-judgments.json", {})
+            result["model_decisions"] = report.get("decisions", [])
             try:
                 with (self.root / job["id"] / "run.log").open("rb") as handle:
                     handle.seek(0, 2)
@@ -366,7 +368,7 @@ class Launcher:
                     result["log"] = handle.read().decode("utf-8", errors="replace")
             except OSError:
                 result["log"] = ""
-            for secret in (self.settings.device_token, self.settings.model_api_key):
+            for secret in (self.settings.device_token, self.settings.model_api_key, self.settings.deepseek_api_key):
                 if secret:
                     result["log"] = result["log"].replace(secret, "[已隐藏]")
         return result

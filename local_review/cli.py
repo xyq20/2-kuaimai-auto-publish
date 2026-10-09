@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
+import os
 import sqlite3
 import sys
+import tempfile
 
 from .config import Settings
 from .database import backup_if_due, connect, migrate, transaction
@@ -44,8 +47,28 @@ def main(argv=None) -> int:
     backup = subparsers.add_parser("backup", help="备份本地审核数据库")
     backup.add_argument("--force", action="store_true")
     subparsers.add_parser("status", help="显示本地数据路径和记录数")
+    deepseek = subparsers.add_parser("configure-deepseek", help="本机配置 DeepSeek 官方文字判断接口（密钥隐藏输入）")
+    deepseek.add_argument("--model", default="deepseek-flash")
     args = parser.parse_args(argv)
     settings = Settings.from_env()
+
+    if args.command == "configure-deepseek":
+        key = getpass.getpass("DeepSeek 官方 API Key（输入隐藏）: ").strip()
+        if not key or any(c.isspace() for c in key):
+            print("密钥为空或含空白，未保存。", file=sys.stderr)
+            return 2
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".deepseek-", dir=settings.data_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"api_key": key, "model": args.model}, handle)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, settings.data_dir / "deepseek.json")
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        print("已保存本机配置。下次文字判断自动读取，无需重启；密钥不会输出到日志。")
+        return 0
 
     if args.command == "has-users":
         return 0 if _user_count(settings) else 1

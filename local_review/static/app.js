@@ -345,6 +345,17 @@ function renderJob(job) {
   $('run-summary').innerHTML = `<span>商品</span><strong>${escapeHTML(job.style_code)}</strong><span>执行模式</span><strong>${modes.find(m=>m.id===job.mode)?.name}</strong><span>任务编号</span><strong>${job.id.slice(0,8)}</strong>`;
   $('run-stages').innerHTML = job.stages.map(s => `<div class="run-stage ${s.status === 'success' ? 'done' : s.status}">${platform(s.platform) ? logo(platform(s.platform)) : icon('box')}<span>${platformName(s.platform)}</span><span class="run-stage-status">${labels[s.status] || s.status}</span></div>`).join('');
   $('log-details').hidden = false;
+  let judgment = $('model-judgment-details');
+  if (!judgment) {
+    judgment = document.createElement('details'); judgment.id = 'model-judgment-details';
+    judgment.className = 'log-details'; judgment.open = true;
+    $('log-details').before(judgment);
+  }
+  const decisions = job.model_decisions || [];
+  judgment.hidden = !decisions.length;
+  const judgmentStates = {adopted:'自动采用', review_required:'待人工审核', rejected:'校验拒绝', verified:'回读通过',
+    mismatch:'回读不一致', pending:'暂无保存回读', source_validated:'原图数据校验通过'};
+  judgment.innerHTML = `<summary>大模型判断汇总 · ${decisions.length} 项</summary><p class="dialog-subtitle">请核对自动采用的类目和属性。置信度是模型自评，保存回读状态单独列出。</p><div class="model-judgment-list">${decisions.map(row => `<article class="model-judgment-item"><div><strong>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)}</strong><span>${escapeHTML(judgmentStates[row.status] || row.status)} · ${Number(row.confidence || 0).toLocaleString(undefined, {style:'percent', maximumFractionDigits:1})}</span></div><p>原值：${escapeHTML(row.excel_value || '无')} → ${escapeHTML((row.selected_labels || []).join('、') || '未采用')}</p><p>${escapeHTML(row.reason || '')}</p><small>${escapeHTML(judgmentStates[row.readback_status] || row.readback_status || '暂无保存回读')}${row.snapshot_version ? ` · 候选快照 ${escapeHTML(row.snapshot_version.slice(-12))}` : ''}${row.learning_review_ids?.length ? ` · 参考审核 ${escapeHTML(row.learning_review_ids.join('、'))}` : ''}</small></article>`).join('')}</div>`;
   if (job.log !== undefined) { const log = $('run-log'); const bottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40; log.textContent = job.log || '任务已创建，等待程序输出…'; if (bottom) log.scrollTop = log.scrollHeight; }
   $('run-confirm').hidden = true;
   $('run-review').hidden = !(job.pending_reviews && isActive(job));
@@ -369,6 +380,7 @@ $('preview-run').onclick = () => {
   $('run-subtitle').textContent = autoBase ? '本次会先保存基础资料，再继续所选平台。' : state.mode === 'publish' ? '本次会真实保存并铺货到已配置的店铺，请核对商品与平台。' : state.mode === 'save' ? '本次会保存快麦商品资料，不提交到店铺。' : '本次只填写并校验，不保存、不铺货。';
   $('run-summary').innerHTML = `<span>商品</span><strong>${escapeHTML(state.product.style_code)}</strong><span>执行模式</span><strong>${mode().name}</strong><span>处理范围</span><strong>${runIds.map(platformName).join(' → ')}</strong>`;
   $('run-stages').replaceChildren(); $('log-details').hidden = true; $('run-error').hidden = true; $('run-review').hidden = true;
+  if ($('model-judgment-details')) $('model-judgment-details').hidden = true;
   $('run-confirm').hidden = false; $('run-confirm').disabled = false;
   $('run-confirm').textContent = state.mode === 'publish' ? '确认保存并铺货' : '确认开始';
   $('run-secondary').textContent = '返回调整'; $('run-secondary').disabled = false; $('run-secondary').classList.remove('stop');

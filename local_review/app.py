@@ -22,7 +22,9 @@ from starlette.concurrency import run_in_threadpool
 from .config import Settings
 from .database import backup_if_due, canonical_json, connect, migrate, remove_expired_originals, transaction, utc_now
 from .security import hash_password, new_session, session_hash, verify_password
-from .service import ApiError, analyze_product, decide_attribute, decide_review_learning, ingest_event, require
+from .service import ApiError, _snapshot, analyze_product, decide_attribute, decide_review_learning, ingest_event, require
+from .ocr import judge_ocr_text
+from .semantic import judge_attribute
 from .ui import SCRIPT, STYLES, page
 from .launcher import Launcher, PLATFORMS
 from attribute_runtime import NO_FILL_VALUE_ID
@@ -139,7 +141,7 @@ def _review_tasks(settings: Settings, user_id: str) -> list[dict[str, Any]]:
             evidence = json.loads(task.pop("evidence_json"))
             options = json.loads(task.pop("options_json"))
             task.update(
-                custom_allowed=not evidence.get("selection_only", False) and (
+                custom_allowed=not task["field_id"].startswith("ocr:") and not evidence.get("selection_only", False) and (
                     bool(task["custom_allowed"]) or task["field_id"] != "__category__"
                 ),
                 options=options,
@@ -244,6 +246,8 @@ def _mutate_review(
         ).fetchone()
         options = json.loads(snapshot["options_json"]) if snapshot else []
         selection_only = bool(json.loads(task["evidence_json"]).get("selection_only"))
+        ocr_semantic = task["field_id"].startswith("ocr:")
+        require(not ocr_semantic or no_fill or len(parts) == 1, 422, "candidate_not_unique")
         unmatched = [] if no_fill else [
             part
             for part in parts
@@ -255,7 +259,7 @@ def _mutate_review(
         ]
         require(
             not unmatched
-            or (not selection_only and (
+            or (not ocr_semantic and not selection_only and (
                 task["field_id"] != "__category__"
                 or bool(snapshot and snapshot["custom_allowed"]))),
             422,
@@ -563,6 +567,24 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def review_learning(request: Request):
         _require_device(request)
         return _response(decide_review_learning(configured, await _json_body(request)))
+
+    @app.post("/api/device/ocr-judge")
+    async def ocr_judge(request: Request):
+        _require_device(request)
+        return _response(await asyncio.to_thread(judge_ocr_text, configured.with_deepseek_configuration(), await _json_body(request)))
+
+    @app.post("/api/device/semantic-judge")
+    async def semantic_judge(request: Request):
+        _require_device(request)
+        data = await _json_body(request)
+        with connect(configured) as connection:
+            snapshot = _snapshot(connection, data)
+            options = [{"value_id": o["value_id"], "label": o["label"]} for o in json.loads(snapshot["options_json"])]
+            field = connection.execute("SELECT control_type FROM platform_fields WHERE platform_id=? AND category_leaf_id=? AND source_field_id=? AND schema_version=?",
+                                       (snapshot["platform_id"], snapshot["category_leaf_id"], snapshot["field_id"], snapshot["schema_version"])).fetchone()
+            require(data.get("options") == options and data.get("field_label") == snapshot["field_label"]
+                    and field is not None and data.get("control_type") == field["control_type"], 422, "semantic_snapshot_mismatch")
+        return _response(await asyncio.to_thread(judge_attribute, configured.with_deepseek_configuration(), data))
 
     @app.get("/api/device/resume")
     async def resume(request: Request, device_id: str, wait_seconds: int = 0):

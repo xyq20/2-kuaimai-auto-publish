@@ -17,7 +17,7 @@ from historical_readbacks import (
     VerifiedAttributeHistory,
     normalize_history_field_label,
 )
-from learning_client import flush_outbox_async
+from learning_client import LearningClientError, flush_outbox_async
 from learning_models import CandidateSnapshot, CandidateValue, canonical_sha256
 from learning_store import LearningStore
 from platform_registry import canonical_platform_name
@@ -203,6 +203,9 @@ class AttributeRuntime:
         self._resolved_attributes: dict[
             tuple[str, str], tuple[AttributeRequest, ResolvedAttribute]
         ] = {}
+        self.model_decisions: list[dict[str, Any]] = []
+        self._model_judgments: dict[str, Mapping[str, Any]] = {}
+        self.model_decision_sink = None
 
     def begin_review_collection(self, platform_id: str) -> None:
         """Start a fresh platform pass that defers reviews until its boundary."""
@@ -342,6 +345,10 @@ class AttributeRuntime:
         existing = self._deferred_reviews.get(snapshot.snapshot_version)
         if existing is not None:
             return
+        if suggested_value_id is None and request.control_type != "ocr_semantic":
+            suggestion = await self._semantic_choice(request, snapshot, allow_auto=False)
+            if suggestion is not None:
+                suggested_value_id = suggestion.value_id
         review_id = uuid.uuid4().hex
         evidence = {
             **dict(request.evidence),
@@ -389,6 +396,91 @@ class AttributeRuntime:
             return
         await self._flush()
         raise review
+
+    async def _semantic_choice(
+        self, request: AttributeRequest, snapshot: CandidateSnapshot, *, allow_auto: bool = True,
+    ) -> Optional[ResolvedAttribute]:
+        """Interpret an unmatched intent; candidate membership is mandatory."""
+        judge = getattr(self.client, "semantic_judge", None)
+        if (not callable(judge) or not request.candidates or len(request.candidates) > 1000
+                or request.control_type not in {"select", "category", *MULTI_SELECT_CONTROL_TYPES}
+                or re.search(r"价格|售价|库存|运费|物流|店铺", request.field_label)):
+            return None
+        payload = {
+            "product_version": self.product_version, "platform_id": request.platform_id,
+            "category_leaf_id": request.category_leaf_id, "field_id": request.field_id,
+            "field_label": request.field_label, "control_type": request.control_type,
+            "snapshot_version": snapshot.snapshot_version, "excel_value": request.excel_value,
+            "options": [{"value_id": c.value_id, "label": c.label} for c in request.candidates],
+            "evidence": dict(request.evidence),
+        }
+        key = canonical_sha256(payload)
+        if key not in self._model_judgments:
+            try:
+                await self._flush()
+                answer = await asyncio.to_thread(judge, payload)
+            except LearningClientError as failure:
+                logging.getLogger("kuaimai_erp").warning("DeepSeek 辅助判断不可用，转人工审核：%s", failure)
+                answer = {}
+            self._model_judgments[key] = answer if isinstance(answer, Mapping) else {}
+        answer = self._model_judgments[key]
+        ids, confidence = answer.get("value_ids"), answer.get("confidence")
+        kinds = answer.get("evidence_kinds")
+        valid = (
+            answer.get("source") == "deepseek" and answer.get("status") == "suggested"
+            and answer.get("snapshot_version") == snapshot.snapshot_version
+            and isinstance(ids, list) and ids and all(isinstance(v, str) for v in ids)
+            and len(ids) == len(set(ids))
+            and (len(ids) == 1 or request.control_type in MULTI_SELECT_CONTROL_TYPES)
+            and all(sum(c.value_id == ident for c in request.candidates) == 1 for ident in ids)
+            and type(confidence) in (int, float) and math.isfinite(confidence) and 0 <= confidence <= 1
+            and isinstance(kinds, list) and kinds and all(k in {"excel", "human_learning", "product"} for k in kinds)
+            and ("excel" not in kinds or bool(request.excel_value.strip()))
+            and (request.control_type != "category" or bool({"excel", "human_learning"}.intersection(kinds)))
+            and isinstance(answer.get("reason"), str) and bool(answer["reason"].strip())
+        )
+        if not valid:
+            if answer.get("source") == "deepseek" and answer.get("status") == "suggested" and not any(row["key"] == key for row in self.model_decisions):
+                self.model_decisions.append({
+                    "key": key, "platform_id": canonical_platform_name(request.platform_id),
+                    "field_id": request.field_id, "field_label": request.field_label,
+                    "excel_value": request.excel_value, "selected_labels": [],
+                    "selected_value_ids": ids if isinstance(ids, list) and all(isinstance(i, str) for i in ids) else [],
+                    "confidence": confidence if type(confidence) in (int, float) and math.isfinite(confidence) else 0,
+                    "reason": "模型响应未通过候选、证据或快照校验；" + str(answer.get("reason") or "")[:1000],
+                    "snapshot_version": snapshot.snapshot_version, "status": "rejected", "readback_status": "pending",
+                    "candidate_options": payload["options"], "source": "deepseek", "model": answer.get("model", ""),
+                })
+                if self.model_decision_sink is not None:
+                    self.model_decision_sink()
+            return None
+        labels = [next(c.label for c in request.candidates if c.value_id == ident) for ident in ids]
+        ready = allow_auto and confidence >= .98 and not request.evidence.get("selection_only")
+        trace = {
+            "key": key, "platform_id": canonical_platform_name(request.platform_id), "field_id": request.field_id,
+            "field_label": request.field_label, "category_leaf_id": request.category_leaf_id,
+            "snapshot_version": snapshot.snapshot_version, "excel_value": request.excel_value,
+            "selected_value_ids": ids, "selected_labels": labels, "confidence": confidence,
+            "reason": answer["reason"], "evidence_kinds": kinds,
+            "learning_review_ids": answer.get("learning_review_ids", []),
+            "product_evidence": answer.get("product_evidence", {}),
+            "candidate_options": payload["options"], "input_evidence": payload["evidence"],
+            "status": "adopted" if ready else "review_required", "readback_status": "pending",
+            "source": "deepseek",
+            "model": answer.get("model", ""),
+        }
+        if not any(row["key"] == key for row in self.model_decisions):
+            self.model_decisions.append(trace)
+            if self.model_decision_sink is not None:
+                self.model_decision_sink()
+        result = ResolvedAttribute(
+            ",".join(ids), ",".join(labels), "deepseek", snapshot.snapshot_version,
+        )
+        if ready:
+            logging.getLogger("kuaimai_erp").info("DeepSeek 自动判断：%s | %s：Excel=%s → %s；置信度=%.1f%%；依据=%s",
+                request.platform_id, request.field_label, request.excel_value, "、".join(labels), confidence * 100, answer["reason"])
+            return self._remember_resolved(request, result)
+        return result if not allow_auto else None
 
     def confirmed_choice(self, request: AttributeRequest) -> Optional[ResolvedAttribute]:
         """Read a product/field/snapshot scoped approval without attempting a write."""
@@ -578,6 +670,17 @@ class AttributeRuntime:
             if remembered is None:
                 continue
             request, resolved = remembered
+            for trace in self.model_decisions:
+                if (canonical_platform_name(trace["platform_id"]) == platform and trace["field_id"] == request.field_id
+                        and trace["snapshot_version"] == resolved.snapshot_version):
+                    expected = trace["selected_labels"]
+                    actual = tuple(part for value in values for part in split_multi_choice(value))
+                    trace["readback_status"] = "verified" if Counter(actual) == Counter(expected) else "mismatch"
+                    trace["readback_values"] = list(values)
+            if resolved.source == "deepseek":
+                # Keep model adoption in the run audit; it cannot create human
+                # training votes merely because a browser write succeeded.
+                continue
             if resolved.is_no_fill:
                 # An intentional omission is not a verified platform value.
                 continue
@@ -632,6 +735,8 @@ class AttributeRuntime:
                 payload,
             )
             recorded += 1
+        if self.model_decisions and self.model_decision_sink is not None:
+            self.model_decision_sink()
         return recorded
 
     async def resolve(
@@ -970,6 +1075,10 @@ class AttributeRuntime:
                 await self._raise_review(request, snapshot, canonical_field, learning_reason)
                 return None
         if canonical_field is None:
+            if request.control_type != "ocr_semantic":
+                semantic = await self._semantic_choice(request, snapshot)
+                if semantic is not None:
+                    return semantic
             # A platform pass owns an ordered local outbox.  While collecting a
             # batch, enqueue every unmapped field first and drain once at the
             # platform boundary; otherwise a size table with many empty cells
@@ -994,6 +1103,10 @@ class AttributeRuntime:
             },
         )
         if response.get("status") != "auto_fill_ready":
+            if response.get("reason_code") not in {"evidence_conflict", "review_learning_conflict"}:
+                semantic = await self._semantic_choice(request, snapshot)
+                if semantic is not None:
+                    return semantic
             await self._raise_review(
                 request,
                 snapshot,

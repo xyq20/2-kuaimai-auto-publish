@@ -559,9 +559,9 @@ def recognize_size_names(
     garment_kind: str,
 ) -> Tuple[str, ...]:
     size_chart_path = Path(size_chart_path)
-    return parse_size_names(
-        vision_ocr(size_chart_path), garment_kind, source=str(size_chart_path)
-    )
+    from ocr_semantics import parse_chart
+    return parse_chart(size_chart_path, garment_kind, lambda tokens:
+                       parse_size_names(tokens, garment_kind, source=str(size_chart_path)))
 
 
 def _require_size_set(actual: Sequence[str], expected: Sequence[str], source: str) -> None:
@@ -743,12 +743,9 @@ def recognize_size_lengths(
     garment_kind: str,
 ) -> Tuple[SizeLength, ...]:
     size_chart_path = Path(size_chart_path)
-    return parse_size_lengths(
-        vision_ocr(size_chart_path),
-        expected_sizes,
-        garment_kind,
-        source=str(size_chart_path),
-    )
+    from ocr_semantics import parse_chart
+    return parse_chart(size_chart_path, garment_kind, lambda tokens:
+                       parse_size_lengths(tokens, expected_sizes, garment_kind, source=str(size_chart_path)))
 
 
 def _cell_bounds(centers: Sequence[float]) -> Tuple[Tuple[float, float], ...]:
@@ -1301,12 +1298,9 @@ def recognize_recommendations(
     expected = tuple(expected_map)
     size_chart_path = Path(size_chart_path)
     height_weight_path = Path(height_weight_path)
-    size_tokens = vision_ocr(size_chart_path)
-    measurements = parse_measurement_table(
-        size_tokens,
-        expected,
-        source=str(size_chart_path),
-    )
+    from ocr_semantics import parse_chart
+    measurements = parse_chart(size_chart_path, "pants", lambda tokens:
+                               parse_measurement_table(tokens, expected, source=str(size_chart_path)))
     _require_size_set(tuple(measurements), expected, str(size_chart_path))
     height_weight_tokens = vision_ocr(height_weight_path)
     ranges = parse_height_weight_chart(height_weight_path, height_weight_tokens, expected)
@@ -1383,11 +1377,9 @@ def recognize_clothing_recommendations(
     expected = tuple(expected_map)
     size_chart_path = Path(size_chart_path)
     height_weight_path = Path(height_weight_path)
-    measurements = parse_clothing_measurement_table(
-        vision_ocr(size_chart_path),
-        expected,
-        source=str(size_chart_path),
-    )
+    from ocr_semantics import parse_chart
+    measurements = parse_chart(size_chart_path, "clothing", lambda tokens:
+                               parse_clothing_measurement_table(tokens, expected, source=str(size_chart_path)))
     ranges = parse_height_weight_chart(
         height_weight_path,
         vision_ocr(height_weight_path),
