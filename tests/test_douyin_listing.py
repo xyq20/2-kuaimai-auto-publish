@@ -474,6 +474,50 @@ function openDouyin() {
 
 
 class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_dropdown_readback_uses_model_before_retry(self):
+        from learning_models import CandidateValue
+        from tests.test_attribute_runtime import FakeClient
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        select = (await self.listing._attribute_item('厚度')).locator('.el-select').first
+        await self.page.evaluate("""() => {
+          const original = pickOption;
+          window.writeCount = 0;
+          pickOption = (...args) => {
+            window.writeCount++;
+            if (window.writeCount > 1) original(...args);
+            else args[0].closest('.el-select-dropdown').style.display = 'none';
+          };
+        }""")
+        store = LearningStore(Path(self.tempdir.name) / 'learning.sqlite3')
+        store.migrate()
+        client = FakeClient()
+        calls = []
+        def judge(payload):
+            calls.append(payload)
+            return {'status': 'suggested', 'source': 'deepseek', 'api_called': True,
+                'snapshot_version': payload['snapshot_version'], 'value_ids': ['normal'],
+                'confidence': .99, 'reason': '常规款与 Excel 原文一致',
+                'evidence_kinds': ['excel'],
+                'assessment': {'relation': 'equivalent', 'source_text': payload['excel_value'],
+                    'assumptions': [], 'conflicts': [], 'competing_value_ids': []}}
+        client.semantic_judge = judge
+        runtime = AttributeRuntime(store, client, 'run', 'product')
+        runtime.begin_review_collection('douyin')
+        self.listing.attribute_runtime = runtime
+        try:
+            await runtime.resolve(AttributeRequest('douyin', 'pants', 'thickness', '厚度',
+                (CandidateValue('normal', '常规款'), CandidateValue('thick', '加厚款')),
+                '常规款', {'excel': True}, False, 'schema'))
+            actual = await self.listing._select_values(select, ('常规款',), label='厚度', multi=False)
+            self.assertEqual(actual, ('常规款',))
+            self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(runtime.deferred_reviews)
+        finally:
+            await runtime.drain()
+            store.close()
+
     async def test_unmapped_dropdown_uses_visible_candidates_for_review(self):
         await self.listing.open()
         await self.listing.apply_first_recommended_category()

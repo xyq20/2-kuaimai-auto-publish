@@ -12,8 +12,12 @@ def adoption_policy(answer, request, *, allow_auto=True):
     grounded_kinds = {quote.get("source") for quote in support if isinstance(quote, dict)} if isinstance(support, list) else set()
     evidence_kinds = set(answer.get("evidence_kinds", []))
     reason = ""
-    if not allow_auto or request.evidence.get("selection_only"):
+    if not allow_auto or (request.evidence.get("selection_only") and not request.evidence.get("bounded_write_retry")):
         reason = "已有审核冲突或页面操作失败，需要人工确认"
+    elif (request.evidence.get('bounded_write_retry')
+          and request.evidence.get('failed_selection_source') in {'human_override', 'cross_product_human', 'review_learning'}
+          and set(answer.get('value_ids', [])) != set(request.evidence.get('failed_selection_value_ids', []))):
+        reason = "模型建议与已有人工选择不同，需要人工确认"
     elif relation not in {"equivalent", "inferred"}:
         reason = "模型未提供完整的语义判定依据"
     elif assessment.get("conflicts") != [] or assessment.get("competing_value_ids") != []:

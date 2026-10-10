@@ -19,8 +19,9 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
+from playwright.async_api import Error as PlaywrightError
 
-from attribute_runtime import AttributeRequest
+from attribute_runtime import AttributeRequest, split_multi_choice
 from category_profile import category_profile, category_search_terms, choose_category_candidate
 from douyin_data import DouyinDataError, MaterialComponent, parse_materials
 from learning_models import CandidateValue, canonical_sha256
@@ -1510,6 +1511,14 @@ class TaobaoListing:
                     if (typeof component.handleQueryChange === 'function') {
                       component.handleQueryChange(value);
                     }
+                    // Closing a searchable select can clear query while
+                    // leaving every option's last filter result hidden.
+                    // Re-run Element's own option filtering when clearing.
+                    if (value === '' && !component.remote
+                        && typeof component.broadcast === 'function') {
+                      component.filteredOptionsCount = component.optionsCount;
+                      component.broadcast('ElOption', 'queryChange', '');
+                    }
                     if (typeof component.$nextTick === 'function') {
                       await new Promise(resolve => component.$nextTick(resolve));
                     }
@@ -2086,6 +2095,66 @@ class TaobaoListing:
         multi: bool,
         allow_review: bool = True,
     ) -> Optional[Tuple[str, ...]]:
+        failure = None
+        try:
+            actual = await self._write_select_values_once(
+                select, expected_groups, label=label, multi=multi, allow_review=allow_review)
+            if actual is not None or not allow_review:
+                return actual
+        except (TaobaoListingError, PlaywrightError) as exc:
+            if not allow_review:
+                raise
+            failure = exc
+        runtime = self.attribute_runtime
+        recover = getattr(runtime, 'recover_failed_write', None)
+        if not callable(recover):
+            if failure is not None:
+                raise failure
+            return None
+        try:
+            resolved = await recover(platform_id=self.attribute_platform_id,
+                field_label=label, error=str(failure or '选择后未取得已填写的值'))
+        except ValueError:
+            options = await self._registered_vue_options(select)
+            if not options:
+                await self._search_select(select, '')
+                await self._open_select(select, multi=multi)
+                _dropdown, options = await self._visible_dom_options(select)
+            await self._dismiss_select_dropdown(select)
+            resolved = await runtime.resolve_unmatched_page_options(
+                platform_id=self.attribute_platform_id,
+                category_leaf_id=str(getattr(self.api_index, 'active_category_id', '') or ''),
+                field_label=label, excel_value=(','.join('/'.join(group) for group in expected_groups)
+                                               if multi else '/'.join(expected_groups[0])),
+                options=tuple(options), multi=multi,
+                write_error=str(failure or '选择后未取得已填写的值'))
+        if resolved is None or resolved.is_no_fill:
+            return None
+        values = split_multi_choice(resolved.label) if multi else (resolved.label,)
+        try:
+            await self._search_select(select, '')
+            await self._dismiss_select_dropdown(select)
+            actual = await self._write_select_values_once(
+                select, tuple((value,) for value in values),
+                label=label, multi=multi, allow_review=False)
+            if actual is not None:
+                return actual
+            failure = TaobaoListingError('模型选择重试后未取得已填写的值')
+        except (TaobaoListingError, PlaywrightError) as exc:
+            failure = exc
+        await recover(platform_id=self.attribute_platform_id, field_label=label,
+                      error=str(failure), force_review=True)
+        return None
+
+    async def _write_select_values_once(
+        self,
+        select: Any,
+        expected_groups: Sequence[Sequence[str]],
+        *,
+        label: str,
+        multi: bool,
+        allow_review: bool = True,
+    ) -> Optional[Tuple[str, ...]]:
         current = await self._read_select_values(select, multi=multi)
         if multi:
             remaining = [
@@ -2187,6 +2256,7 @@ class TaobaoListing:
             style_matches = match_style_option_candidates(label, alias, labels)
             if len(style_matches) == 1:
                 return values, labels[style_matches[0]]
+        actual = None
         try:
             multi = await select.locator('.el-select__tags').count() > 0
             actual = await TaobaoListing._select_values(
@@ -2195,6 +2265,14 @@ class TaobaoListing:
             )
         except TaobaoListingError:
             actual = None
+        finally:
+            if actual is None:
+                await self._search_select(select, '')
+                try:
+                    await self._dismiss_select_dropdown(select)
+                except TaobaoListingError:
+                    if self.logger:
+                        self.logger.warning('属性“%s”试填后下拉层尚未关闭，候选筛选已清空', label)
         material_matches = (
             match_option_candidates(group, labels)
             if is_material_field_label(label) else ()

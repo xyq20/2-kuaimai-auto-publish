@@ -222,6 +222,7 @@ class AttributeRuntime:
         self._resolved_attributes: dict[
             tuple[str, str], tuple[AttributeRequest, ResolvedAttribute]
         ] = {}
+        self._write_recovery_requests: dict[tuple[str, str], AttributeRequest] = {}
         self.model_decisions: list[dict[str, Any]] = []
         self.model_events: list[dict[str, Any]] = []
         self._model_judgments: dict[str, Mapping[str, Any]] = {}
@@ -265,6 +266,76 @@ class AttributeRuntime:
             for review in self._deferred_reviews.values()
         )
 
+    async def recover_failed_write(
+        self, *, platform_id: str, field_label: str, error: str,
+        force_review: bool = False,
+        fallback_request: Optional[AttributeRequest] = None,
+    ) -> Optional[ResolvedAttribute]:
+        """Judge a failed attribute write once, then defer a failed retry.
+
+        Keep the original Excel intent and validated dictionary. A previously
+        approved label is failure evidence, not a replacement Excel value.
+        """
+        key = (canonical_platform_name(platform_id),
+               normalize_history_field_label(field_label.split('#', 1)[0]))
+        if self.review_pending_or_omitted(platform_id, field_label):
+            return None
+        remembered = self._resolved_attributes.get(key)
+        if remembered is None and fallback_request is None:
+            raise ValueError(f'属性“{field_label}”没有已校验的候选快照，无法判断填写失败')
+        if remembered is not None:
+            original, previous = remembered
+        else:
+            original = fallback_request
+            previous = ResolvedAttribute('', original.excel_value, 'page_attempt', '')
+        request = self._write_recovery_requests.get(key) if force_review else None
+        if request is None:
+            request = replace(original, evidence={
+                **dict(original.evidence), 'selection_only': True, 'bounded_write_retry': True,
+                'validation_error': str(error), 'failed_selection': previous.label,
+                'failed_selection_value_ids': list(split_multi_choice(previous.value_id)),
+                'failed_selection_source': previous.source,
+            })
+            self._write_recovery_requests[key] = request
+        snapshot = CandidateSnapshot(
+            request.platform_id, request.category_leaf_id, request.field_id,
+            request.field_label, request.candidates, request.schema_version,
+            request.custom_allowed,
+        )
+        try:
+            canonical_field = map_platform_field(request.platform_id, request.field_label)
+        except FieldMappingError:
+            canonical_field = None
+        self._queue_candidate_snapshot(snapshot, canonical_field, request.control_type)
+        logging.getLogger('kuaimai_erp').warning(
+            '属性“%s”填写失败：%s；%s', field_label, error,
+            '模型重试仍失败，转人工审核' if force_review else '进入大模型判断流程')
+        resolved = await self._semantic_choice(request, snapshot, allow_auto=not force_review)
+        if resolved is not None and not force_review:
+            return resolved
+        traces = [row for row in self.model_decisions
+                  if canonical_platform_name(row['platform_id']) == key[0]
+                  and row['field_id'] == request.field_id
+                  and row['snapshot_version'] == snapshot.snapshot_version
+                  and row.get('input_evidence') == dict(request.evidence)]
+        trace = traces[-1] if traces else None
+        suggested = resolved.value_id if resolved is not None else (
+            ','.join(trace['selected_value_ids'])
+            if trace and trace['status'] != 'rejected' else None)
+        if force_review and trace is not None:
+            trace.update(status='review_required', readback_status='write_failed',
+                         write_error=str(error), treatment_reason='模型选择重试仍未写入，转人工审核')
+            if self.model_decision_sink is not None:
+                self.model_decision_sink()
+        review_request = replace(request, evidence={
+            **dict(request.evidence), 'force_review': True,
+            'first_validation_error': request.evidence['validation_error'],
+            'validation_error': str(error),
+        })
+        await self._raise_review(review_request, snapshot, canonical_field,
+                                 'platform_write_failed', suggested, model_checked=True)
+        return None
+
     async def resolve_unmatched_page_options(
         self,
         *,
@@ -276,6 +347,7 @@ class AttributeRuntime:
         multi: bool = False,
         force_review: bool = False,
         confirmed_only: bool = False,
+        write_error: str = "",
     ) -> Optional[ResolvedAttribute]:
         """Submit an unmatched visible dropdown to the normal review pipeline.
 
@@ -321,6 +393,10 @@ class AttributeRuntime:
             schema_version=schema_version,
             control_type="multi_select" if multi else "select",
         )
+        if write_error:
+            return await self.recover_failed_write(
+                platform_id=platform_id, field_label=field_label, error=write_error,
+                force_review=force_review, fallback_request=request)
         if confirmed_only:
             snapshot = CandidateSnapshot(request.platform_id, request.category_leaf_id,
                 request.field_id, request.field_label, request.candidates,
@@ -373,11 +449,13 @@ class AttributeRuntime:
         canonical_field: Optional[str],
         reason_code: str,
         suggested_value_id: Optional[str] = None,
+        *,
+        model_checked: bool = False,
     ) -> None:
         existing = self._deferred_reviews.get(snapshot.snapshot_version)
         if existing is not None:
             return
-        if suggested_value_id is None and request.control_type != "ocr_semantic":
+        if suggested_value_id is None and not model_checked and request.control_type != "ocr_semantic":
             suggestion = await self._semantic_choice(request, snapshot, allow_auto=False)
             if suggestion is not None:
                 suggested_value_id = suggestion.value_id
@@ -459,7 +537,9 @@ class AttributeRuntime:
                  "excel_value": request.excel_value, "snapshot_version": snapshot.snapshot_version}
         if key not in self._model_judgments:
             record_event(self, {**event, "status": "requesting", "api_called": None,
-                         "reason": "Excel 和学习库尚未确定候选，请求模型辅助判断"}, sink=self.model_decision_sink)
+                         "reason": ("属性填写/回读失败，请求模型结合原始商品资料和学习库重新判断"
+                                    if request.evidence.get('validation_error') else
+                                    "Excel 和学习库尚未确定候选，请求模型辅助判断")}, sink=self.model_decision_sink)
             try:
                 await self._flush()
                 answer = await asyncio.to_thread(judge, payload)

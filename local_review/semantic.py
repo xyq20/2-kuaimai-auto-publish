@@ -115,7 +115,9 @@ def judge_attribute(settings, data):
     waiting["history_summary"] = context.get("history_summary", {})
     waiting["learning_review_ids"] = [e["review_id"] for e in context["human_examples"]]
     from .model_rules import reuse, save_proposal, learned_guidance
-    cached = reuse(settings, data, context) if context.get("history_summary") else None
+    cached = reuse(settings, data, context) if (
+        context.get("history_summary") and not data['evidence'].get('validation_error')
+    ) else None
     if cached:
         rule_id, proposal, check = cached
         return {**waiting, "status": "suggested", "api_called": False,

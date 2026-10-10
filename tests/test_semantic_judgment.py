@@ -82,6 +82,83 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         self.client.semantic_judge.assert_not_called()
         await self.runtime.drain()
 
+    async def test_failed_confirmed_write_uses_original_intent_for_model_recovery(self):
+        from learning_models import CandidateSnapshot
+        snapshot = CandidateSnapshot(self.request.platform_id, self.request.category_leaf_id,
+            self.request.field_id, self.request.field_label, self.request.candidates,
+            self.request.schema_version, False)
+        self.store.save_candidate_snapshot(snapshot)
+        self.store.save_review_resolution(product_version='product', platform_id='wxsph',
+            snapshot_version=snapshot.snapshot_version, review_id='old', final_value_id='straight')
+        approved = await self.runtime.resolve(self.request)
+        self.assertEqual(approved.label, '直筒')
+        self.suggestion()
+
+        recovered = await self.runtime.recover_failed_write(
+            platform_id='wxsph', field_label='版型', error='选择后页面仍为空')
+        await self.runtime.drain()
+
+        self.assertEqual((recovered.label, recovered.source), ('直筒', 'deepseek'))
+        trace = self.runtime.model_decisions[0]
+        self.assertEqual(trace['excel_value'], '平直廓形')
+        self.assertEqual(trace['input_evidence']['failed_selection'], '直筒')
+        self.assertEqual(trace['input_evidence']['validation_error'], '选择后页面仍为空')
+        self.assertEqual(trace['selected_labels'], ['直筒'])
+
+    async def test_write_recovery_does_not_silently_replace_human_choice(self):
+        from attribute_runtime import ResolvedAttribute
+        self.runtime.remember_resolved(self.request,
+            ResolvedAttribute('loose', '宽松', 'human_override', 'old'))
+        self.runtime.begin_review_collection('wxsph')
+        self.suggestion()
+        result = await self.runtime.recover_failed_write(
+            platform_id='wxsph', field_label='版型', error='候选点击失败')
+        await self.runtime.drain()
+        self.assertIsNone(result)
+        self.assertEqual(len(self.runtime.deferred_reviews), 1)
+        self.assertEqual(self.runtime.model_decisions[0]['status'], 'review_required')
+
+    async def test_uncertain_write_recovery_queues_review_with_failure_evidence(self):
+        await self.runtime.resolve(dataclasses.replace(self.request, excel_value='直筒'))
+        self.runtime.begin_review_collection('wxsph')
+        self.suggestion(.7)
+
+        result = await self.runtime.recover_failed_write(
+            platform_id='wxsph', field_label='版型', error='回读为空')
+        await self.runtime.drain()
+
+        self.assertIsNone(result)
+        self.assertEqual(len(self.runtime.deferred_reviews), 1)
+        review = self.runtime.deferred_reviews[0]
+        self.assertEqual(review.reason_code, 'platform_write_failed')
+        self.assertEqual(review.request.evidence['validation_error'], '回读为空')
+        self.assertEqual(tuple(v.label for v in review.request.candidates), ('直筒', '宽松'))
+        self.assertEqual(self.runtime.model_events[-1]['status'], 'review_required')
+
+    async def test_failed_model_retry_queues_review_without_another_model_request(self):
+        await self.runtime.resolve(dataclasses.replace(self.request, excel_value='直筒'))
+        self.runtime.begin_review_collection('wxsph')
+        self.suggestion()
+        await self.runtime.recover_failed_write(
+            platform_id='wxsph', field_label='版型', error='候选点击失败')
+        # A second API request would now fail: retry failure must reuse the
+        # judgment already made and queue review, rather than loop.
+        self.client.semantic_judge.side_effect = AssertionError('unexpected second model request')
+
+        result = await self.runtime.recover_failed_write(
+            platform_id='wxsph', field_label='版型', error='重试回读仍为空', force_review=True)
+        await self.runtime.drain()
+
+        self.assertIsNone(result)
+        self.assertEqual(len(self.runtime.deferred_reviews), 1)
+        row = self.store.connection.execute(
+            "SELECT payload_json FROM sync_outbox WHERE event_type='review.created'").fetchone()
+        payload = json.loads(row[0])
+        self.assertEqual(payload['suggested_value_id'], 'straight')
+        self.assertEqual(payload['evidence_json']['validation_error'], '重试回读仍为空')
+        self.assertEqual(self.runtime.model_decisions[0]['status'], 'review_required')
+        self.assertEqual(self.runtime.model_decisions[0]['readback_status'], 'write_failed')
+
     async def test_category_requires_excel_or_confirmed_library_evidence(self):
         self.request = dataclasses.replace(self.request, field_id='__category__', field_label='商品类目',
                                           excel_value='男装 > 毛衣/针织衫', control_type='category')
@@ -160,6 +237,30 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SemanticEndpointTests(unittest.TestCase):
+    def test_write_failure_requests_fresh_model_instead_of_reusing_old_rule(self):
+        from local_review.semantic import judge_attribute
+        settings = Settings(Path('unused'), 'device', deepseek_api_key='private')
+        payload = {'product_version': 'p', 'platform_id': 'tm', 'category_leaf_id': 'c',
+            'field_id': 'detail', 'field_label': '款式细节', 'control_type': 'select',
+            'snapshot_version': 's', 'excel_value': '针织',
+            'options': [{'value_id': 'a', 'label': '提花'}],
+            'evidence': {'validation_error': '打开下拉框后没有可见选项'}}
+        context = {'title': '提花毛衣', 'product_info': {}, 'human_examples': [],
+                   'history_summary': {'human_records_matched': 1}}
+        cached = ('old-rule', {'selected_labels': ['提花']}, {'review_ids': ['r']})
+        answer = {'value_ids': ['a'], 'confidence': .95, 'reason': '商品资料支持提花，需重试点击',
+            'evidence_kinds': ['excel', 'product'],
+            'assessment': {'relation': 'inferred', 'source_text': '针织',
+                'assumptions': [], 'conflicts': [], 'competing_value_ids': []}}
+        with patch('local_review.semantic.judgment_context', return_value=context), \
+             patch('local_review.model_rules.reuse', return_value=cached), \
+             patch('local_review.model_rules.learned_guidance', return_value=[]), \
+             patch('local_review.model_rules.save_proposal'), \
+             patch('local_review.semantic.request_json', return_value=answer):
+            result = judge_attribute(settings, payload)
+        self.assertTrue(result['api_called'])
+        self.assertEqual(result['reason'], '商品资料支持提花，需重试点击')
+
     def test_inference_quotes_are_checked_and_same_product_human_conflict_is_attached(self):
         from local_review.semantic import judge_attribute
         settings=Settings(Path('unused'),'device',deepseek_api_key='private')

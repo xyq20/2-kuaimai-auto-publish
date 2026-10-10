@@ -1,10 +1,13 @@
 import asyncio
 import logging
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
 
-from attribute_runtime import ResolvedAttribute
+from attribute_runtime import AttributeRequest, AttributeRuntime, ResolvedAttribute
+from learning_store import LearningStore
 from kuaimai_erp import resolve_taobao_category_mode
 from learning_models import CandidateValue
 from taobao_data import parse_taobao_fields
@@ -591,6 +594,131 @@ class TaobaoPureFunctionTests(unittest.TestCase):
 
 
 class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def _failed_write_fixture(self, *, confidence=.99, always_fail=False):
+        from tests.test_attribute_runtime import FakeClient
+        await self.listing.apply_recommended_category()
+        await self.page.evaluate("""alwaysFail => {
+          const original = choose;
+          window.writeCount = 0;
+          choose = option => {
+            window.writeCount++;
+            if (alwaysFail || window.writeCount === 1) {
+              option.closest('.el-select-dropdown').style.display = 'none';
+            } else original(option);
+          };
+        }""", always_fail)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        store = LearningStore(Path(temp.name) / 'learning.sqlite3')
+        store.migrate()
+        self.addCleanup(store.close)
+        client = FakeClient()
+        calls = []
+        def judge(payload):
+            calls.append(payload)
+            return {'status': 'suggested', 'source': 'deepseek', 'api_called': True,
+                'snapshot_version': payload['snapshot_version'],
+                'value_ids': [v['value_id'] for v in payload['options'] if v['label'] == '直筒'],
+                'confidence': confidence, 'reason': '直筒与原文一致，可重试真实候选',
+                'assessment': {'relation': 'equivalent', 'source_text': payload['excel_value'],
+                    'assumptions': [], 'conflicts': [], 'competing_value_ids': []},
+                'evidence_kinds': ['excel']}
+        client.semantic_judge = judge
+        runtime = AttributeRuntime(store, client, 'run', 'product')
+        runtime.begin_review_collection('tb')
+        self.listing.attribute_runtime = runtime
+        await runtime.resolve(AttributeRequest('tb', 'pants', 'cut', '裤型',
+            (CandidateValue('straight', '直筒'), CandidateValue('loose', '宽松')),
+            '直筒', {'excel': True, 'live_dom': True}, False, 'schema'))
+        select = self.page.locator(".complex-item:has(.el-form-item__label:text-is('裤型')) .el-select").first
+        return select, runtime, calls
+
+    async def test_select_readback_failure_retries_valid_model_choice(self):
+        select, runtime, calls = await self._failed_write_fixture()
+        try:
+            actual = await self.listing._select_values(
+                select, (('直筒',),), label='裤型', multi=False)
+            self.assertEqual(actual, ('直筒',))
+            self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(runtime.deferred_reviews)
+            self.assertEqual(runtime.model_decisions[0]['status'], 'adopted')
+        finally:
+            await runtime.drain()
+
+    async def test_select_readback_failure_with_uncertain_model_enters_review(self):
+        select, runtime, calls = await self._failed_write_fixture(confidence=.7)
+        try:
+            actual = await self.listing._select_values(
+                select, (('直筒',),), label='裤型', multi=False)
+            self.assertIsNone(actual)
+            self.assertEqual(await self.page.evaluate('window.writeCount'), 1)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(runtime.deferred_reviews), 1)
+        finally:
+            await runtime.drain()
+
+    async def test_select_failed_model_retry_enters_review_without_loop(self):
+        select, runtime, calls = await self._failed_write_fixture(always_fail=True)
+        try:
+            actual = await self.listing._select_values(
+                select, (('直筒',),), label='裤型', multi=False)
+            self.assertIsNone(actual)
+            self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(runtime.deferred_reviews), 1)
+            self.assertEqual(runtime.model_decisions[0]['readback_status'], 'write_failed')
+        finally:
+            await runtime.drain()
+
+    async def test_failed_write_without_api_snapshot_judges_real_dom_candidates(self):
+        select, runtime, calls = await self._failed_write_fixture(confidence=.7)
+        # Some selectors have no API field entry; only live DOM candidates are
+        # available. The failure must still reach judgment and human review.
+        runtime._resolved_attributes.clear()
+        try:
+            actual = await self.listing._select_values(
+                select, (('直筒',),), label='裤型', multi=False)
+            self.assertIsNone(actual)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual([v['label'] for v in calls[0]['options']], ['直筒', '宽松'])
+            self.assertEqual(len(runtime.deferred_reviews), 1)
+            self.assertTrue(runtime.deferred_reviews[0].request.evidence['live_dom'])
+        finally:
+            await runtime.drain()
+
+    async def test_failed_write_without_api_snapshot_retries_valid_dom_choice(self):
+        select, runtime, calls = await self._failed_write_fixture()
+        runtime._resolved_attributes.clear()
+        try:
+            actual = await self.listing._select_values(
+                select, (('直筒',),), label='裤型', multi=False)
+            self.assertEqual(actual, ('直筒',))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
+            self.assertFalse(runtime.deferred_reviews)
+        finally:
+            await runtime.drain()
+
+    async def test_component_operation_error_also_reaches_model_recovery(self):
+        select, runtime, calls = await self._failed_write_fixture()
+        await select.evaluate("""select => {
+          choose = option => setSelectValue(option.closest('.el-select'), option.textContent.trim());
+          const option = select.querySelector('.el-select-dropdown__item');
+          let failed = false;
+          option.click = function() {
+            if (!failed) { failed = true; throw new Error('component option click failed'); }
+            HTMLElement.prototype.click.call(this);
+          };
+        }""")
+        try:
+            actual = await self.listing._select_values(
+                select, (('直筒',),), label='裤型', multi=False)
+            self.assertEqual(actual, ('直筒',))
+            self.assertEqual(len(calls), 1)
+        finally:
+            await runtime.drain()
+
     async def test_material_pending_review_stops_fallback_attempts(self):
         self.listing.attribute_runtime = SimpleNamespace(review_pending_or_omitted=lambda *args: True)
         writer = AsyncMock(return_value=None)
@@ -721,6 +849,36 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             (('直筒',),),label='裤脚款式',multi=False)
         self.assertEqual(result,('直筒',))
         self.assertEqual(await self.page.evaluate('window.opens'),2)
+
+    async def test_unmatched_excel_search_does_not_hide_learned_candidate(self):
+        await self.page.set_content('''
+          <div class="el-select"><input class="el-input__inner"></div>
+          <div class="el-select-dropdown" style="display:none">
+            <li class="el-select-dropdown__item">提花</li>
+            <li class="el-select-dropdown__item">印花</li>
+          </div><script>
+            const select=document.querySelector('.el-select');
+            const popper=document.querySelector('.el-select-dropdown');
+            const input=select.querySelector('input');
+            select.__vue__={query:'',value:'',visible:false,popperElm:popper,
+              handleQueryChange(value){
+                popper.querySelectorAll('li').forEach(li=>li.style.display=
+                  li.textContent.includes(value)?'block':'none');
+              },$nextTick(callback){callback();}};
+            input.onclick=()=>{select.__vue__.visible=true;popper.style.display='block';};
+            input.onkeydown=e=>{if(e.key==='Escape'){
+              select.__vue__.visible=false;popper.style.display='none';input.value=select.__vue__.value;}};
+            popper.querySelectorAll('li').forEach(li=>li.onclick=()=>{
+              input.value=li.textContent;select.__vue__.value=li.textContent;
+              popper.style.display='none';select.__vue__.visible=false;});
+          </script>''')
+        listing=TaobaoListing(self.page,self.page.locator('body'),LOGGER)
+        select=self.page.locator('.el-select')
+        await listing._excel_before_review(select,
+            (CandidateValue('jacquard','提花'),CandidateValue('print','印花')),
+            ('针织',),label='款式细节')
+        actual=await listing._select_values(select,(('提花',),),label='款式细节',multi=False)
+        self.assertEqual(actual,('提花',))
 
     async def test_select_keeps_existing_equivalent_alias_without_reselection(self):
         await self.page.set_content(

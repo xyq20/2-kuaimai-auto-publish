@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest, split_multi_choice
+from playwright.async_api import Error as PlaywrightError
 from field_policies import listing_date_text_value, positional_listing_date_value
 from category_profile import choose_category_candidate, is_leather_shoe_category
 from canonical_fields import is_learning_managed_field
@@ -1920,6 +1921,67 @@ class DouyinListing:
         return None
 
     async def _select_values(
+        self,
+        select: Any,
+        expected_values: Sequence[str],
+        *,
+        label: str,
+        multi: bool,
+        api_options: Optional[Sequence[Mapping[str, str]]] = None,
+        review_alternatives: Optional[Sequence[str]] = None,
+        allow_operational_review: bool = True,
+        allow_empty_options: bool = False,
+        require_committed_direct_value: bool = False,
+    ) -> Optional[Tuple[str, ...]]:
+        failure = None
+        try:
+            actual = await self._write_select_values_once(
+                select, expected_values, label=label, multi=multi, api_options=api_options,
+                review_alternatives=review_alternatives,
+                allow_operational_review=allow_operational_review,
+                allow_empty_options=allow_empty_options,
+                require_committed_direct_value=require_committed_direct_value)
+            if actual is not None or not allow_operational_review:
+                return actual
+        except (DouyinListingError, PlaywrightError) as exc:
+            if not allow_operational_review:
+                raise
+            failure = exc
+        recover = getattr(self.attribute_runtime, 'recover_failed_write', None)
+        if not callable(recover):
+            if failure is not None:
+                raise failure
+            return None
+        try:
+            resolved = await recover(platform_id='douyin', field_label=label,
+                error=str(failure or '选择后未取得已填写的值'))
+        except ValueError:
+            await self._open_select(select, multi=multi)
+            _dropdown, options = await self._visible_dom_options(select)
+            await self._dismiss_select_dropdown(select)
+            resolved = await self.attribute_runtime.resolve_unmatched_page_options(
+                platform_id='douyin', category_leaf_id=str(self._category_properties_leaf_id or ''),
+                field_label=label, excel_value='/'.join(review_alternatives or expected_values),
+                options=tuple(options), multi=multi,
+                write_error=str(failure or '选择后未取得已填写的值'))
+        if resolved is None or resolved.is_no_fill:
+            return None
+        values = split_multi_choice(resolved.label) if multi else (resolved.label,)
+        try:
+            await self._dismiss_select_dropdown(select)
+            actual = await self._write_select_values_once(
+                select, values, label=label, multi=multi, allow_operational_review=False,
+                allow_empty_options=allow_empty_options,
+                require_committed_direct_value=require_committed_direct_value)
+            if actual is not None:
+                return actual
+            failure = DouyinListingError('模型选择重试后未取得已填写的值')
+        except (DouyinListingError, PlaywrightError) as exc:
+            failure = exc
+        await recover(platform_id='douyin', field_label=label, error=str(failure), force_review=True)
+        return None
+
+    async def _write_select_values_once(
         self,
         select: Any,
         expected_values: Sequence[str],
