@@ -370,7 +370,7 @@ function renderJob(job) {
     ['待处理审核',`${job.pending_reviews || 0} 项`],['异常',`${(summary.unavailable_count || 0)+(summary.rejected_count || 0)} 次`]];
   const visibleEvents = events.filter(row => row.status !== 'skipped' &&
     !decisions.some(decision => decision.key === row.key || decision.request_key === row.key));
-  const cards = [...decisions, ...visibleEvents].filter(row => row.selected_labels?.length && row.status !== 'review_required');
+  const cards = [...decisions, ...visibleEvents].filter(row => row.selected_labels?.length);
   const activityHTML = visibleEvents.filter(row => ['requesting','unavailable','rejected'].includes(row.status))
     .map(row => `<p class="model-explanation"><strong>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)} · ${escapeHTML(judgmentStates[row.status])}</strong><br>${escapeHTML(row.reason || '')}</p>`).join('');
   const expandedTraces = new Set([...judgment.querySelectorAll('.model-trace[open]')].map(node => node.closest('article').dataset.judgmentKey));
