@@ -68,7 +68,8 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                   document.getElementById('run-dialog').showModal();
                 }''')
                 board = tab.locator('#model-judgment-details')
-                self.assertFalse(await board.is_visible())
+                self.assertTrue(await board.is_visible())
+                self.assertIn('未调用大模型：小红书类目路径校验中断', await board.inner_text())
                 self.assertTrue(await tab.locator('#run-error').is_visible())
                 await tab.evaluate('''() => renderJob({id:'a'.repeat(32),style_code:'2024',mode:'save',status:'failed',stages:[],
                   model_summary:{api_call_count:2,adopted_count:1,review_count:0,unavailable_count:1,rejected_count:0},
@@ -78,7 +79,7 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                 text = await board.inner_text()
                 self.assertIn('直筒', text)
                 self.assertIn('自动采用', text)
-                self.assertNotIn('请求超时', text)
+                self.assertIn('请求超时', text)
                 self.assertEqual(await board.locator('.model-judgment-item').count(), 1)
                 self.assertTrue(await tab.locator('#run-error').is_visible())
                 self.assertIn('回读通过', text)
@@ -91,7 +92,10 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                   renderJob(window.pendingJob);
                 }''')
                 self.assertTrue(await tab.locator('#run-review').is_visible())
+                self.assertTrue(await board.is_visible())
                 self.assertEqual(await board.locator('.model-judgment-item').count(), 0)
+                self.assertNotIn('请求超时', await board.inner_text())
+                self.assertNotIn('直筒', await board.inner_text())
                 await tab.locator('#run-review').click()
                 self.assertEqual(await tab.locator('#review-frame').get_attribute('src'),
                                  '/review?embedded=1&run_id='+'a'*32)

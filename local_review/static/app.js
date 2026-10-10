@@ -371,7 +371,8 @@ function renderJob(job) {
   const visibleEvents = events.filter(row => row.status !== 'skipped' &&
     !decisions.some(decision => decision.key === row.key || decision.request_key === row.key));
   const cards = [...decisions, ...visibleEvents].filter(row => row.selected_labels?.length && row.status !== 'review_required');
-  judgment.hidden = cards.length === 0;
+  const activityHTML = visibleEvents.filter(row => ['requesting','unavailable','rejected'].includes(row.status))
+    .map(row => `<p class="model-explanation"><strong>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)} · ${escapeHTML(judgmentStates[row.status])}</strong><br>${escapeHTML(row.reason || '')}</p>`).join('');
   const expandedTraces = new Set([...judgment.querySelectorAll('.model-trace[open]')].map(node => node.closest('article').dataset.judgmentKey));
   const judgmentScroll = judgment.querySelector('.model-judgment-list')?.scrollTop || 0;
   const cardHTML = cards.map(row => {
@@ -387,7 +388,7 @@ function renderJob(job) {
   }).join('');
   const skipReasons = summary.skip_reasons || [];
   const skipped = events.filter(row => row.status === 'skipped');
-  judgment.innerHTML = `<summary>大模型判断 · ${cards.length} 项选择结果</summary><div class="model-metrics">${metrics.map(([label,value]) => `<div class="model-metric"><span>${label}</span><strong>${escapeHTML(value)}</strong></div>`).join('')}</div>${summary.not_called_reason ? `<p class="model-explanation">${escapeHTML(summary.not_called_reason)}</p>` : ''}${summary.stop_reason ? `<p class="model-explanation">运行中断：${escapeHTML(summary.stop_reason)}</p>` : ''}${summary.unknown_call_count ? `<p class="model-explanation">${summary.unknown_call_count} 次判断服务请求未返回完整调用状态。</p>` : ''}<p class="model-help">核对模型建议、采用结果和保存回读。置信度为模型自评。</p><div class="model-judgment-list">${cardHTML || '<p class="model-empty">本次暂无模型建议，调用状态与原因见上方。</p>'}</div>${skipped.length ? `<details class="model-skipped"><summary>无需模型判断的字段 · ${skipped.length} 项</summary>${skipReasons.map(row => `<p>${escapeHTML(row.reason)} · ${row.count} 项</p>`).join('')}<div>${skipped.map(row => `<p>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)}：${escapeHTML(row.reason)}</p>`).join('')}</div></details>` : ''}`;
+  judgment.innerHTML = `<summary>大模型判断 · ${cards.length} 项选择结果</summary><div class="model-metrics">${metrics.map(([label,value]) => `<div class="model-metric"><span>${label}</span><strong>${escapeHTML(value)}</strong></div>`).join('')}</div>${summary.not_called_reason ? `<p class="model-explanation">${escapeHTML(summary.not_called_reason)}</p>` : ''}${summary.stop_reason ? `<p class="model-explanation">运行中断：${escapeHTML(summary.stop_reason)}</p>` : ''}${summary.unknown_call_count ? `<p class="model-explanation">${summary.unknown_call_count} 次判断服务请求未返回完整调用状态。</p>` : ''}${activityHTML}<p class="model-help">核对模型建议、采用结果和保存回读。置信度为模型自评。</p><div class="model-judgment-list">${cardHTML || '<p class="model-empty">本次暂无模型选择结果；调用状态、异常或未调用原因见本看板。</p>'}</div>${skipped.length ? `<details class="model-skipped"><summary>无需模型判断的字段 · ${skipped.length} 项</summary>${skipReasons.map(row => `<p>${escapeHTML(row.reason)} · ${row.count} 项</p>`).join('')}<div>${skipped.map(row => `<p>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)}：${escapeHTML(row.reason)}</p>`).join('')}</div></details>` : ''}`;
   if (job.log !== undefined) { const log = $('run-log'); const bottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40; log.textContent = job.log || '任务已创建，等待程序输出…'; if (bottom) log.scrollTop = log.scrollHeight; }
   judgment.querySelectorAll('.model-judgment-item').forEach((card,index) => {
     const row = cards[index];
