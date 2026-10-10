@@ -23,6 +23,7 @@ from learning_models import CandidateSnapshot, CandidateValue, canonical_sha256
 from learning_store import LearningStore
 from platform_registry import canonical_platform_name
 from platform_candidate_source import first_per_label
+from semantic_policy import is_style_judgment_field
 
 
 UNSUPPORTED_CONTROL_TYPES = frozenset({"shop", "logistics", "freight"})
@@ -612,6 +613,8 @@ class AttributeRuntime:
             "rule_validation": answer.get("rule_validation"),
             "product_evidence": answer.get("product_evidence", {}),
             "assessment": answer.get("assessment", {}), "adoption_policy": policy,
+            "acceptable_labels": [c.label for c in request.candidates
+                                  if c.value_id in policy['acceptable_value_ids']],
             "grounded_support": answer.get("grounded_support", []),
             "candidate_options": payload["options"], "input_evidence": payload["evidence"],
             "status": "adopted" if ready else "review_required", "readback_status": "pending",
@@ -851,6 +854,7 @@ class AttributeRuntime:
                                     "run_id": self.run_id, "platform_id": platform, "field_id": request.field_id,
                                     "field_label": request.field_label, "control_type": request.control_type,
                                     "excel_value": request.excel_value, "selected_labels": trace["selected_labels"],
+                                    "acceptable_labels": trace.get('acceptable_labels', []),
                                     "confidence": trace["confidence"], "reason": trace["reason"],
                                     "model": trace.get("model", ""), "readback_verified": True,
                                     "adoption_policy": trace.get("adoption_policy", {}),
@@ -1258,6 +1262,10 @@ class AttributeRuntime:
                 learned.get("calibrated_acceptance_rate", 0),
             )
             if learning_reason in {"review_learning_conflict", "review_learning_invalid_response"}:
+                if learning_reason == 'review_learning_conflict' and is_style_judgment_field(request.field_label):
+                    semantic = await self._semantic_choice(request, snapshot)
+                    if semantic is not None:
+                        return semantic
                 await self._raise_review(request, snapshot, canonical_field, learning_reason)
                 return None
         if canonical_field is None:

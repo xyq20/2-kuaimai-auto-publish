@@ -13,6 +13,27 @@ from tests.test_attribute_runtime import make_length_request
 
 
 class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mixed_style_learning_can_use_model_operator_preference(self):
+        request = dataclasses.replace(self.request, field_id='style', field_label='风格',
+            excel_value='美式休闲风', candidates=(CandidateValue('casual', '休闲风'), CandidateValue('american', '美式')))
+        self.client.review_learning.return_value = {'status': 'review_required', 'reason_code': 'review_learning_conflict'}
+        self.suggestion(.72, value_ids=['casual'], reason='两种风格都合理，本商品优先休闲风',
+            assessment={'relation': 'preference', 'source_text': '美式休闲风',
+                'acceptable_value_ids': ['casual', 'american'], 'assumptions': [],
+                'conflicts': [], 'competing_value_ids': []})
+        self.runtime.begin_review_collection('wxsph')
+        result = await self.runtime.resolve(request)
+        self.runtime.record_verified_readbacks('wxsph', {'风格': ['休闲风']})
+        await self.runtime.drain()
+        self.assertIsNotNone(result)
+        self.assertEqual(result.label, '休闲风')
+        self.assertFalse(self.runtime.deferred_reviews)
+        self.assertEqual(self.runtime.model_decisions[0]['acceptable_labels'], ['休闲风', '美式'])
+        facts = [json.loads(row[0]) for row in self.store.connection.execute(
+            "SELECT payload_json FROM sync_outbox WHERE event_type='text_facts.created'")]
+        model_fact = next(f for f in facts if f.get('source') == 'model_verified')
+        self.assertEqual(model_fact['payload_json']['model_verified']['acceptable_labels'], ['休闲风', '美式'])
+
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -237,6 +258,33 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SemanticEndpointTests(unittest.TestCase):
+    def test_style_operator_assessment_keeps_multiple_acceptable_candidates(self):
+        from local_review.semantic import judge_attribute
+        from semantic_policy import adoption_policy
+        from types import SimpleNamespace
+        settings = Settings(Path('unused'), 'device', deepseek_api_key='private')
+        payload = {'product_version': 'p', 'platform_id': 'tm', 'category_leaf_id': 'c',
+            'field_id': 'style', 'field_label': '风格', 'control_type': 'select',
+            'snapshot_version': 's', 'excel_value': '美式休闲风',
+            'options': [{'value_id': 'casual', 'label': '休闲风'}, {'value_id': 'american', 'label': '美式'}],
+            'evidence': {}}
+        context = {'title': '宽松圆领针织衫', 'product_info': {}, 'human_examples': []}
+        answer = {'value_ids': ['casual'], 'confidence': .72, 'reason': '两个都合理，结合日常穿着优先休闲风',
+            'evidence_kinds': ['excel', 'product'],
+            'supporting_quotes': [{'source': 'product', 'text': '宽松圆领针织衫'}],
+            'assessment': {'relation': 'preference', 'source_text': '美式休闲风',
+                'acceptable_value_ids': ['casual', 'american'], 'assumptions': [],
+                'conflicts': [], 'competing_value_ids': []}}
+        with patch('local_review.semantic.judgment_context', return_value=context), \
+             patch('local_review.semantic.request_json', return_value=answer):
+            result = judge_attribute(settings, payload)
+        request = SimpleNamespace(field_label='风格', control_type='select',
+            excel_value='美式休闲风', evidence={},
+            candidates=(CandidateValue('casual', '休闲风'), CandidateValue('american', '美式')))
+        self.assertTrue(adoption_policy(result, request)['auto_adopt'])
+        self.assertEqual(result['assessment']['acceptable_value_ids'], ['casual', 'american'])
+        self.assertEqual(result['grounded_support'][0]['text'], '宽松圆领针织衫')
+
     def test_write_failure_requests_fresh_model_instead_of_reusing_old_rule(self):
         from local_review.semantic import judge_attribute
         settings = Settings(Path('unused'), 'device', deepseek_api_key='private')
