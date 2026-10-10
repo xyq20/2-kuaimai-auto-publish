@@ -474,13 +474,6 @@ class AttributeRuntime:
                 "control_type": request.control_type,
             },
         }
-        model_event = next((row for row in reversed(self.model_events)
-                            if canonical_platform_name(row.get("platform_id", "")) == canonical_platform_name(request.platform_id)
-                            and row.get("field_id") == request.field_id
-                            and row.get("snapshot_version") == snapshot.snapshot_version
-                            and row.get("status") not in {"skipped", "requesting"}), None)
-        if model_event is not None:
-            evidence["model_judgment"] = dict(model_event)
         payload = {
             "id": review_id,
             "run_id": self.run_id,

@@ -107,7 +107,7 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         runtime.begin_review_collection('wxsph')
         async def judge(req, snapshot, **kwargs):
             self.assertEqual(req.excel_value, "短裤,长裤")
-            runtime.model_events.append({"platform_id": "wxsph", "field_id": req.field_id,
+            runtime.model_events.append({"key": "internal-trace", "platform_id": "wxsph", "field_id": req.field_id,
                 "snapshot_version": snapshot.snapshot_version, "status": "review_required",
                 "api_called": True, "confidence": .72, "selected_labels": ["短裤", "长裤"]})
         with patch.object(runtime, '_semantic_choice', side_effect=judge):
@@ -115,7 +115,8 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 error='dropdown closed', fallback_request=request)
         await runtime.drain()
         reviews = [p for _, kind, p in client.events if kind == 'review.created']
-        self.assertEqual(reviews[-1]['evidence_json']['model_judgment']['selected_labels'], ['短裤', '长裤'])
+        self.assertNotIn('model_judgment', reviews[-1]['evidence_json'])
+        self.assertEqual(reviews[-1]['evidence_json']['full_excel_value'], '短裤,长裤')
 
     async def test_failed_confirmed_write_forces_review_instead_of_reusing_choice(self):
         from learning_models import CandidateSnapshot
