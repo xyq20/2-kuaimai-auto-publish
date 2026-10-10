@@ -65,6 +65,29 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_embedded_submit_error_stays_in_view(self):
+        from playwright.async_api import async_playwright
+        from local_review.ui import STYLES
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                tab = await browser.new_page(viewport={'width':1400, 'height':700})
+                html = re.sub(r'<script[^>]+src="[^"]+"[^>]*></script>', '', review_page(False, embedded=True))
+                await tab.set_content(html)
+                await tab.add_style_tag(content=STYLES)
+                await tab.add_script_tag(content=SCRIPT)
+                await tab.evaluate("""() => {
+                    document.getElementById('login').hidden=true;
+                    document.getElementById('review').hidden=false;
+                    message('候选校验失败，请刷新审核后重新选择。');
+                }""")
+                self.assertTrue(await tab.locator('#status').is_visible())
+                box = await tab.locator('#status').bounding_box()
+                self.assertGreaterEqual(box['y'], 0)
+                self.assertLessEqual(box['y'] + box['height'], 700)
+            finally:
+                await browser.close()
+
     async def test_focused_failed_review_loads_and_explains_rerun(self):
         from playwright.async_api import async_playwright
         async with async_playwright() as playwright:

@@ -216,6 +216,39 @@ class LocalReviewApiTests(unittest.TestCase):
         self.assertIn("$('option-search').oninput=filterOptions", script)
         self.assertIn("$('custom-value').oninput=", script)
 
+    def test_json_candidate_ids_confirm_and_resume_intact(self):
+        from attribute_runtime import split_multi_choice
+        self.product_and_snapshot()
+        ids = [json.dumps({'value': label, 'vid': n, 'extendInfo': None}, ensure_ascii=False)
+               for n, label in enumerate(['美式', '休闲'])]
+        with transaction(self.settings) as connection:
+            connection.execute("UPDATE option_snapshots SET options_json=? WHERE snapshot_version='sv-1'",
+                               (json.dumps([{'value_id': value, 'label': label}
+                                            for value, label in zip(ids, ['美式', '休闲'])]),))
+        self.login()
+        headers = {'Origin': 'http://testserver'}
+        for index, selected in enumerate([ids[:1], ids]):
+            review_id = 'json-review-' + str(index)
+            self.event(review_id, 'review.created', {
+                'id': review_id, 'run_id': 'json-run', 'device_id': 'mac-1',
+                'product_version': 'pv-1', 'platform_id': 'jd',
+                'category_leaf_id': 'straight-pants', 'field_id': 'length',
+                'field_label': '裤长', 'canonical_field': 'pant_length',
+                'snapshot_version': 'sv-1', 'reason_code': 'manual_input_rejected',
+                'evidence_json': {'selection_only': True},
+            })
+            task = next(t for t in self.client.get('/api/reviews').json()['tasks'] if t['id'] == review_id)
+            claim = self.client.post('/api/reviews/' + review_id + '/claim', headers=headers,
+                                     json={'version': task['version']}).json()
+            final = ','.join(selected)
+            response = self.client.post('/api/reviews/' + review_id + '/confirm', headers=headers,
+                                        json={'version': claim['version'], 'final_value_id': final})
+            self.assertEqual(response.status_code, 200, response.text)
+            with connect(self.settings) as connection:
+                stored = connection.execute('SELECT final_value_id FROM review_actions WHERE review_id=?',
+                                            (review_id,)).fetchone()[0]
+            self.assertEqual(split_multi_choice(stored), tuple(selected))
+
     def test_failed_manual_input_review_requires_existing_option(self):
         self.product_and_snapshot()
         self.event('restricted-review', 'review.created', {

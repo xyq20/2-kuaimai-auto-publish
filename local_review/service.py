@@ -16,7 +16,7 @@ from platform_registry import platforms_equivalent
 
 from .config import Settings
 from .database import canonical_json, connect, transaction, utc_now
-from attribute_runtime import NO_FILL_VALUE_ID
+from attribute_runtime import NO_FILL_VALUE_ID, split_multi_choice
 
 
 class ApiError(RuntimeError):
@@ -35,11 +35,7 @@ def _candidate_selection_is_unique(options: list[dict[str, Any]], value: str) ->
     """Validate one candidate ID or a comma-separated multi-selection."""
     if sum(1 for option in options if option.get("value_id") == value) == 1:
         return True
-    parts = tuple(
-        part.strip()
-        for part in re.split(r"[,，、;；]", value)
-        if part.strip()
-    )
+    parts = split_multi_choice(value)
     return (
         len(parts) > 1
         and len(parts) == len(set(parts))
@@ -1033,7 +1029,7 @@ def decide_review_learning(settings: Settings, data: Any) -> dict[str, Any]:
                 # never training evidence for another product.
                 continue
             whole = [v for v in old_options if final in (v['value_id'], v['label'])]
-            parts = [final] if len(whole) == 1 else re.split(r'[,，、;；]', final)
+            parts = [final] if len(whole) == 1 else split_multi_choice(final)
             labels = []
             for part in parts:
                 matches = [v['label'] for v in old_options if part.strip() in (v['value_id'], v['label'])]

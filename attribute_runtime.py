@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import math
 import re
 from collections import Counter
@@ -48,11 +49,29 @@ def split_multi_choice(value: object) -> Tuple[str, ...]:
     “分组全选”语法一致，消费端 selection_value_groups 会按同样规则
     拆组后全选。
     """
-    return tuple(
-        part.strip()
-        for part in re.split(MULTI_CHOICE_SEPARATORS, str(value or ""))
-        if part.strip()
-    )
+    text = str(value or "").strip()
+    parts = []
+    decoder = json.JSONDecoder()
+    while text:
+        # Platform IDs may be serialized objects containing commas. Preserve
+        # their exact bytes so snapshot matching and resume use the same ID.
+        end = None
+        if text.startswith("{"):
+            try:
+                parsed, length = decoder.raw_decode(text)
+                if isinstance(parsed, dict) and (length == len(text) or
+                        re.match(MULTI_CHOICE_SEPARATORS, text[length:length + 1])):
+                    end = length
+            except ValueError:
+                pass
+        if end is None:
+            separator = re.search(MULTI_CHOICE_SEPARATORS, text)
+            end = separator.start() if separator else len(text)
+        part = text[:end].strip()
+        if part:
+            parts.append(part)
+        text = text[end + 1:].strip()
+    return tuple(parts)
 
 
 def excel_alternative_set(excel_value: object) -> frozenset:

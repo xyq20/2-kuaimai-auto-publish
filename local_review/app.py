@@ -27,7 +27,7 @@ from .ocr import judge_ocr_text
 from .semantic import judge_attribute
 from .ui import SCRIPT, STYLES, page
 from .launcher import Launcher, PLATFORMS
-from attribute_runtime import NO_FILL_VALUE_ID
+from attribute_runtime import NO_FILL_VALUE_ID, split_multi_choice
 
 
 SESSION_COOKIE = "km_session"
@@ -214,7 +214,7 @@ def _mutate_review(
         no_fill = action == "no_fill"
         final = NO_FILL_VALUE_ID if no_fill else data.get("final_value_id")
         require(
-            no_fill or (isinstance(final, str) and 0 < len(final.strip()) <= 256),
+            no_fill or (isinstance(final, str) and 0 < len(final.strip()) <= 16384),
             400,
             "invalid_final_value_id",
         )
@@ -222,11 +222,7 @@ def _mutate_review(
         # 审核确认兼容多选：final_value_id 支持逗号分隔多个候选
         # valueId（或 custom_allowed 时的自定义值），与 Excel 的
         # “逗号分组全选”语法一致；每个部分不得重复。
-        parts = [] if no_fill else [
-            part.strip()
-            for part in re.split(r"[,，、;；]", final.strip())
-            if part.strip()
-        ]
+        parts = [] if no_fill else list(split_multi_choice(final))
         require(
             no_fill or (parts and len(parts) == len(set(parts))),
             400,
@@ -272,7 +268,7 @@ def _mutate_review(
         require(
             no_fill
             or task["suggested_value_id"] is None
-            or set(parts) == set(re.split(r"[,，、;；]", task["suggested_value_id"]))
+            or set(parts) == set(split_multi_choice(task["suggested_value_id"]))
             or bool(reason),
             422,
             "correction_reason_required",
