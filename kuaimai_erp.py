@@ -7478,6 +7478,7 @@ def main() -> int:
         TmallFormListingError,
         TmallSizeSourceError,
         PlatformDiscoveryError,
+        PddFormListingError,
         WxsphFormListingError,
         XhsDataError,
         XhsFormListingError,

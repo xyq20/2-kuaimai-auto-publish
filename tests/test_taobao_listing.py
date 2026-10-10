@@ -404,6 +404,10 @@ function openTaobao() {
 
 
 class TaobaoPureFunctionTests(unittest.TestCase):
+    def test_other_variant_matches_only_complete_option(self):
+        self.assertEqual(preferred_exact_candidate_label(('其它', '羊毛'), ('其他',)), '其它')
+        self.assertIsNone(preferred_exact_candidate_label(('其它材质',), ('其他',)))
+
     def test_reviewed_material_combination_uses_real_control_cardinality(self):
         from taobao_listing import reviewed_selection_labels
         options = (CandidateValue('wool','羊毛'),CandidateValue('nylon','锦纶'))
@@ -587,6 +591,13 @@ class TaobaoPureFunctionTests(unittest.TestCase):
 
 
 class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_material_pending_review_stops_fallback_attempts(self):
+        self.listing.attribute_runtime = SimpleNamespace(review_pending_or_omitted=lambda *args: True)
+        writer = AsyncMock(return_value=None)
+        result = await self.listing._fill_fabric_attribute('材质', ('羊毛','腈纶'), item=None, writer=writer)
+        self.assertIsNone(result)
+        writer.assert_awaited_once()
+
     async def test_shoe_craft_alias_selects_and_reads_page_choice(self):
         await self.listing.apply_recommended_category()
         await self.page.evaluate("""() => {

@@ -48,7 +48,8 @@ SIZE_NAME_PATTERN = re.compile(
 
 def normalize_option(value: object) -> str:
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
-    return re.sub(r"[\s，,;；、・·\-_（）()]", "", text).casefold()
+    normalized = re.sub(r"[\s，,;；、・·\-_（）()]", "", text).casefold()
+    return "其他" if normalized == "其它" else normalized
 
 
 def normalize_label(value: object) -> str:
@@ -2571,14 +2572,22 @@ class TaobaoListing:
                     exact_values=tuple(values),
                     item=item,
                 )
+        def pending_review():
+            checker = getattr(getattr(self, "attribute_runtime", None), "review_pending_or_omitted", None)
+            return callable(checker) and checker(self.attribute_platform_id, page_label)
+
         try:
             result = await writer("/".join(expected), expected)
             if result is not None:
                 return result
+            if pending_review():
+                return None
             raise TaobaoListingError(
                 f"淘宝属性“{page_label}”没有同时匹配到全部面料候选"
             )
         except Exception as exc:
+            if pending_review():
+                return None
             if self.logger is not None:
                 self.logger.warning(
                     "淘宝属性“%s”无法同时选择面料 %s，回退选择“其他”：%s",
@@ -2608,6 +2617,8 @@ class TaobaoListing:
                     continue
                 if fallback is not None:
                     return fallback
+                if pending_review():
+                    return None
             if last_error is not None:
                 raise last_error
             raise TaobaoListingError(
