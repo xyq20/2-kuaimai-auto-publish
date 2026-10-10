@@ -377,7 +377,7 @@ class AttributeRuntime:
             "evidence_json": evidence,
         }
         self.store.enqueue(
-            f"review.created:{self.run_id}:{snapshot.snapshot_version}",
+            f"review.created:{self.run_id}:{snapshot.snapshot_version}:{review_id}",
             "review.created",
             payload,
         )

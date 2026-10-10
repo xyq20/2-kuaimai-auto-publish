@@ -1668,6 +1668,7 @@ class WxsphFormListing(YouzanFormListing):
                 is_select=is_select,
                 required=required,
             )
+            learning_resolved = False
             rules[page_label] = rule
             if value is None:
                 if required:
@@ -1739,10 +1740,11 @@ class WxsphFormListing(YouzanFormListing):
                     continue
                 if resolved_values is not None:
                     exact_values = resolved_values
+                    learning_resolved = True
             if is_select:
                 fabric_label = normalize_label(page_label)
                 fabric_values = exact_values
-                if not fabric_values or len(fabric_values) < 2:
+                if not learning_resolved and (not fabric_values or len(fabric_values) < 2):
                     # 微信小店实际标签是“面料材质”，而 Excel 常用
                     # “材质成分/材质”承载原始多成分文本；从原值拆出
                     # 面料名称后统一走公共“多值失败回退其他”协议。

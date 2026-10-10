@@ -60,6 +60,18 @@ def make_length_request(**overrides):
 
 
 class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_review_after_resume_has_new_durable_identity(self):
+        runtime = AttributeRuntime(self.store, FakeClient(), 'run', 'p')
+        request = make_length_request(evidence={'force_review':True,'selection_only':True})
+        for _ in range(2):
+            runtime.begin_review_collection('wxsph')
+            await runtime.resolve(request)
+            await runtime.drain()
+        events = [e for e in runtime.client.events if e[1] == 'review.created']
+        self.assertEqual(len(events), 2)
+        self.assertNotEqual(events[0][0], events[1][0])
+        self.assertNotEqual(events[0][2]['id'], events[1][2]['id'])
+
     async def test_failed_confirmed_write_forces_review_instead_of_reusing_choice(self):
         from learning_models import CandidateSnapshot
         request = make_length_request(excel_value='长裤')

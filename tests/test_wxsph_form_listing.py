@@ -983,6 +983,21 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(waist_request.excel_value, "中腰")
 
+    async def test_reviewed_single_fabric_is_not_replaced_by_excel_components(self):
+        class Runtime:
+            async def resolve(self, request):
+                candidate = request.candidates[0]
+                return ResolvedAttribute(candidate.value_id, candidate.label, 'human_override', 'approved')
+        listing = await self._listing(Runtime())
+        from unittest.mock import AsyncMock
+        listing._fill_fabric_attribute = AsyncMock(side_effect=AssertionError('must preserve reviewed value'))
+        fields = parse_wxsph_fields({'面料材质':'棉50%，聚酯纤维50%', '适用场景':'日常',
+                                    '材质成分/材质':'棉50%，聚酯纤维50%',
+                                    '里料材质成分含量/材质成分含量/面料材质成分含量':'95%及以上/95',
+                                    '吊牌价':'586','价格':'586','数量':'100'})
+        await listing.apply_excel_fields(fields)
+        listing._fill_fabric_attribute.assert_not_awaited()
+
     async def test_material_slash_is_ordered_or_and_percentage_is_separate(self):
         class Runtime:
             def __init__(self):
