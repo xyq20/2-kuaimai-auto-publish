@@ -275,6 +275,7 @@ class AttributeRuntime:
         options: Tuple[Mapping[str, Any], ...],
         multi: bool = False,
         force_review: bool = False,
+        confirmed_only: bool = False,
     ) -> Optional[ResolvedAttribute]:
         """Submit an unmatched visible dropdown to the normal review pipeline.
 
@@ -308,7 +309,7 @@ class AttributeRuntime:
                 for value in candidates
             ],
         })
-        return await self.resolve(AttributeRequest(
+        request = AttributeRequest(
             platform_id=platform_id,
             category_leaf_id=category_id,
             field_id=field_id,
@@ -319,7 +320,17 @@ class AttributeRuntime:
             custom_allowed=False,
             schema_version=schema_version,
             control_type="multi_select" if multi else "select",
-        ))
+        )
+        if confirmed_only:
+            snapshot = CandidateSnapshot(request.platform_id, request.category_leaf_id,
+                request.field_id, request.field_label, request.candidates,
+                request.schema_version, request.custom_allowed)
+            if self.store.load_review_resolution(product_version=self.product_version,
+                    platform_id=canonical_platform_name(platform_id),
+                    snapshot_version=snapshot.snapshot_version) is None:
+                return None
+            request = replace(request, evidence={"excel": True, "live_dom": True})
+        return await self.resolve(request)
 
     async def _flush(self) -> int:
         # All event delivery uses one ordered worker.  Snapshot/review/checkpoint

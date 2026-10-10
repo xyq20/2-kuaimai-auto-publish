@@ -354,6 +354,25 @@ class PddFormListing(TaobaoListing):
                     await self._dismiss_select_dropdown(select)
                 except Exception:
                     pass
+            # A failed API-based choice is reviewed against a DOM snapshot.
+            # Consume that exact product approval before considering old API
+            # history; otherwise every retry repeats the failed history.
+            if callable(getattr(runtime, "resolve_unmatched_page_options", None)):
+                approved = await runtime.resolve_unmatched_page_options(
+                    platform_id="pdd", category_leaf_id=category_id,
+                    field_label=page_label, excel_value="/".join(
+                        value for group in normalized_groups for value in group),
+                    options=tuple(options), multi=multi, confirmed_only=True,
+                )
+                if approved is not None:
+                    if getattr(approved, "is_no_fill", False):
+                        return ()
+                    if self.logger:
+                        self.logger.info("拼多多属性“%s”：优先复用本商品页面审核值 %s", page_label, approved.label)
+                    return tuple((value,) for value in reviewed_selection_labels(
+                        approved.label,
+                        tuple(CandidateValue(str(o.get("value") or ""), str(o.get("name") or "")) for o in options),
+                        multi=multi))
             try:
                 candidates = reconcile_candidates(
                     field.option_values,

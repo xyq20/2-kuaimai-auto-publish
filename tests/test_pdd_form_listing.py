@@ -269,6 +269,16 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
             await select.locator(".el-select-dropdown").is_visible()
         )
 
+    async def test_dom_approval_precedes_old_api_history(self):
+        runtime = SimpleNamespace(
+            resolve_unmatched_page_options=AsyncMock(return_value=ResolvedAttribute('loose', '宽松', 'human_override', 'dom-snapshot')),
+            resolve=AsyncMock())
+        listing = await self._listing(runtime)
+        result = await listing.fill_attribute('版型', '旧风格')
+        self.assertEqual(result, ('宽松',))
+        runtime.resolve.assert_not_awaited()
+        self.assertTrue(runtime.resolve_unmatched_page_options.await_args.kwargs['confirmed_only'])
+
     async def test_failed_historical_selection_creates_forced_review(self):
         runtime = SimpleNamespace(resolve_unmatched_page_options=AsyncMock(return_value=None),
                                   review_pending_or_omitted=lambda *args: False)

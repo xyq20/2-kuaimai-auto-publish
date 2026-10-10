@@ -85,6 +85,14 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                 box = await tab.locator('#status').bounding_box()
                 self.assertGreaterEqual(box['y'], 0)
                 self.assertLessEqual(box['y'] + box['height'], 700)
+                for width, height in [(1400,700),(900,600),(390,650)]:
+                    await tab.set_viewport_size({'width':width,'height':height})
+                    for selector in ['#skip','#no-fill','#confirm']:
+                        button = await tab.locator(selector).bounding_box()
+                        self.assertGreaterEqual(button['x'], 0)
+                        self.assertLessEqual(button['x'] + button['width'], width)
+                        self.assertLessEqual(button['y'] + button['height'], height)
+
             finally:
                 await browser.close()
 

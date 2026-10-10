@@ -60,6 +60,32 @@ def make_length_request(**overrides):
 
 
 class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_dom_selection_reused_without_new_review(self):
+        runtime = AttributeRuntime(self.store, FakeClient(), 'run', 'p')
+        runtime.begin_review_collection('pdd')
+        options = ({'value':'{"value":"美式","vid":13054}', 'name':'美式'},
+                   {'value':'{"value":"休闲","vid":2}', 'name':'休闲'})
+        kwargs = dict(platform_id='pdd', category_leaf_id='sweater', field_label='风格',
+                      excel_value='美式休闲风', options=options)
+        self.assertIsNone(await runtime.resolve_unmatched_page_options(**kwargs, confirmed_only=True))
+        self.assertFalse(runtime.deferred_reviews)
+        await runtime.resolve_unmatched_page_options(**kwargs, force_review=True)
+        await runtime.drain()
+        event = next(e[2] for e in runtime.client.events if e[1] == 'review.created')
+        self.store.save_review_resolution(product_version='p', platform_id='pdd',
+            snapshot_version=event['snapshot_version'], review_id=event['id'],
+            final_value_id=options[0]['value'])
+        resumed = AttributeRuntime(self.store, FakeClient(), 'next-run', 'p')
+        resumed.begin_review_collection('pdd')
+        result = await resumed.resolve_unmatched_page_options(**kwargs, confirmed_only=True)
+        self.assertEqual(result.label, '美式')
+        self.assertFalse(resumed.deferred_reviews)
+        # Different product or changed dictionary cannot inherit this approval.
+        other = AttributeRuntime(self.store, FakeClient(), 'next-run', 'other-product')
+        self.assertIsNone(await other.resolve_unmatched_page_options(**kwargs, confirmed_only=True))
+        self.assertIsNone(await resumed.resolve_unmatched_page_options(
+            **{**kwargs, 'options': options[1:]}, confirmed_only=True))
+
     async def test_repeated_review_after_resume_has_new_durable_identity(self):
         runtime = AttributeRuntime(self.store, FakeClient(), 'run', 'p')
         request = make_length_request(evidence={'force_review':True,'selection_only':True})
