@@ -2512,6 +2512,19 @@ class XhsFormListing(TaobaoListing):
             errors = await self._visible_validation_errors()
         except TaobaoListingError as exc:
             raise XhsFormListingError(str(exc).replace("淘宝", "小红书")) from exc
+        # Removing old images can leave this message visible after the upload
+        # callback completes. Let the real save validate the uploaded images.
+        deferred_image_errors = tuple(
+            error for error in errors
+            if images.get("count", 0) > 0
+            and re.fullmatch(r"主图\s*[：:]+\s*至少选择\s*1\s*张图片", error.strip())
+        )
+        errors = tuple(error for error in errors if error not in deferred_image_errors)
+        if deferred_image_errors and self.logger is not None:
+            self.logger.info(
+                "小红书主图已完成上传，保存前残留提示暂不拦截：%s；以保存接口结果和保存后回读为准",
+                "；".join(deferred_image_errors),
+            )
         if (
             errors
             and not (
@@ -2529,6 +2542,7 @@ class XhsFormListing(TaobaoListing):
             "presale": presale,
             "sku_batch": batch,
             "main_images": images,
+            "save_validation_pending": deferred_image_errors,
             "freight": freight,
             "deferred_validation_errors": (
                 errors

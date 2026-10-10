@@ -310,6 +310,33 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["deferred_validation_errors"], ())
         self.assertEqual(result["main_images"]["count"], 1)
 
+    async def test_uploaded_main_image_warning_defers_to_save_but_other_errors_block(self):
+        from xhs_form_listing import XhsFormListingError
+        listing=await self._listing()
+        for name, result in (
+            ('apply_category',{}),('fill_identity',{}),('fill_category_attributes',{}),
+            ('apply_full_payment_presale',{}),('fill_price_inventory_batch',{}),
+            ('sync_main_images',{'source':'3:4主图','count':5}),
+            ('_wait_for_main_image_validation',None),
+        ):
+            setattr(listing,name,AsyncMock(return_value=result))
+        warning='主图：：至少选择1张图片'
+        listing._visible_validation_errors=AsyncMock(return_value=(warning,))
+        async def apply():
+            return await listing.apply_excel_fields(XhsFields(fields={},category_path=()),
+                title='商品',style_code='SKU',portrait_paths=(Path('one.png'),),
+                timeout_seconds=5,uploader=AsyncMock())
+        with patch('xhs_form_listing.sync_store_freight',new_callable=AsyncMock,return_value={}):
+            result=await apply()
+            self.assertEqual(result['save_validation_pending'],(warning,))
+            listing._visible_validation_errors.return_value=(warning,'售价：必填')
+            with self.assertRaisesRegex(XhsFormListingError,'售价：必填'):
+                await apply()
+            listing.sync_main_images.return_value={'count':0}
+            listing._visible_validation_errors.return_value=(warning,)
+            with self.assertRaisesRegex(XhsFormListingError,'至少选择1张图片'):
+                await apply()
+
     def test_category_hints_accept_one_exact_outerwear_leaf(self):
         self.assertEqual(
             XhsFormListing._choose_category_text(
