@@ -1648,12 +1648,21 @@ class TmallFormListing(TaobaoListing):
         if not materials:
             return {"filled": False, "materials": ()}
 
-        items = await self._attribute_items()
-        records = tuple(
-            (page_label, item)
-            for key, (page_label, item) in items.items()
-            if key.split("#", 1)[0] == normalize_label("材质成分")
-        )
+        await self._wait_for_loading_masks()
+        scope = await self._product_identity_scope()
+        labels = scope.locator(".el-form-item > .el-form-item__label")
+        records = []
+        for index in range(await labels.count()):
+            label = labels.nth(index)
+            if not await label.is_visible():
+                continue
+            page_label = re.sub(r"^\s*\*\s*", "", await label.inner_text()).strip()
+            if normalize_label(page_label) == normalize_label("材质成分"):
+                records.append((page_label, label.locator("xpath=..")))
+        if not records:
+            if self.logger is not None:
+                self.logger.info("天猫首次产品信息未展示材质成分；继续生成完整表单，后续按实际字段填写")
+            return {"filled": False, "materials": (), "reason": "not_present_in_product_information"}
         compatible = []
         for page_label, item in records:
             components = item.locator(".multi-complex-items")

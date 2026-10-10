@@ -16,6 +16,30 @@ from tmall_form_listing import (
 
 
 class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_materials_absent_on_pants_does_not_require_full_form(self):
+        listing = await self._listing('''<div class="tm-product-info">
+          <div class="el-form-item"><label class="el-form-item__label">上市年份季节</label><input value="2026年秋季"></div>
+          <button>发布</button></div>''')
+        result = await listing.fill_initial_product_materials({'材质成分/材质': '棉/100%'})
+        self.assertFalse(result['filled'])
+        self.assertEqual(result['reason'], 'not_present_in_product_information')
+
+    async def test_initial_materials_uses_product_scope_not_full_form(self):
+        listing = await self._listing('''<div class="tm-product-info">
+          <div class="el-form-item"><label class="el-form-item__label">材质成分</label>
+          <div class="multi-complex-items"></div><button>添加</button></div></div>''')
+        listing.fill_materials = AsyncMock(return_value=(('棉', 100),))
+        result = await listing.fill_initial_product_materials({'材质成分/材质': '棉/100%'})
+        self.assertTrue(result['filled'])
+        listing.fill_materials.assert_awaited_once()
+
+    async def test_initial_materials_present_but_broken_is_not_skipped(self):
+        listing = await self._listing('''<div class="tm-product-info">
+          <div class="el-form-item"><label class="el-form-item__label">材质成分</label>
+          <input></div></div>''')
+        with self.assertRaisesRegex(TmallFormListingError, '材质成分.*不唯一或未渲染'):
+            await listing.fill_initial_product_materials({'材质成分/材质': '棉/100%'})
+
     async def test_restore_product_season_after_image_reset_preserves_confirmed_choice(self):
         listing = await self._listing('''
           <div class="el-form-item" id="season"><label class="el-form-item__label">上市年份季节</label>
