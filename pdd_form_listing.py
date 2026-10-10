@@ -1188,6 +1188,16 @@ class PddFormListing(TaobaoListing):
             assignment = assignments.get(normalized_page)
             if assignment is None:
                 continue
+            # Parent selections may remove dependent fields (e.g. material
+            # "其它" removes composition percentage). Never wait on a stale
+            # locator or redirect its value to the following field.
+            if not await item.count() or not await item.is_visible():
+                ignored.append(report_label)
+                if self.logger:
+                    self.logger.info("拼多多属性“%s”已因上游选项联动隐藏，跳过填写", page_label)
+                continue
+            if self.logger:
+                self.logger.info("正在填写拼多多属性：%s", page_label)
             _source_label, expected = assignment
             exact_values = _special_category_values(
                 fields.fields, page_label, expected

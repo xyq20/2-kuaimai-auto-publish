@@ -269,6 +269,27 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
             await select.locator(".el-select-dropdown").is_visible()
         )
 
+    async def test_removed_dependent_field_is_skipped_without_blocking_later_fields(self):
+        import asyncio
+        listing = await self._listing()
+        await self.page.locator('.complex-wrap').evaluate("""root => {
+          const node=document.createElement('div');node.className='el-form-item';node.id='dependent';
+          node.innerHTML='<label class="el-form-item__label">成分含量</label><div class="el-form-item__content"><input></div>';
+          root.firstElementChild.after(node);
+        }""")
+        original = listing.fill_attribute
+        async def fill(label, *args, **kwargs):
+            value = await original(label, *args, **kwargs)
+            if label == '版型':
+                await self.page.locator('#dependent').evaluate('node => node.remove()')
+            return value
+        listing.fill_attribute = fill
+        report = await asyncio.wait_for(listing.fill_category_attributes(PddFields(fields={
+            '版型':'宽松','成分含量':'50','货号/商家外部编码':'NGBL-2024'})), timeout=10)
+        self.assertIn('成分含量', report['ignored_fields'])
+        self.assertEqual(report['attributes']['商品货号'], ('NGBL-2024',))
+        self.assertNotIn('成分含量', report['skipped_values'])
+
     async def test_cached_field_locator_survives_conditional_field_insertion(self):
         listing = await self._listing()
         items = await listing._attribute_items()
