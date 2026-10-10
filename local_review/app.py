@@ -121,6 +121,7 @@ def _review_tasks(settings: Settings, user_id: str, run_id: str = "") -> list[di
     with connect(settings) as connection:
         rows = connection.execute(
             "SELECT r.*,p.title,s.options_json,s.custom_allowed,"
+            "(SELECT f.control_type FROM platform_fields f WHERE f.platform_id=s.platform_id AND f.category_leaf_id=s.category_leaf_id AND f.source_field_id=s.field_id AND f.schema_version=s.schema_version) AS control_type,"
             "(SELECT c.status FROM run_checkpoints c WHERE c.run_id=r.run_id) AS run_status FROM review_tasks r "
             "JOIN products p USING(product_version) JOIN option_snapshots s USING(snapshot_version) "
             "WHERE p.deleting=0 AND r.status IN ('pending','claimed') "
@@ -151,7 +152,7 @@ def _review_tasks(settings: Settings, user_id: str, run_id: str = "") -> list[di
             options = json.loads(task.pop("options_json"))
             task.update(
                 custom_allowed=not task["field_id"].startswith("ocr:") and not evidence.get("selection_only", False) and (
-                    bool(task["custom_allowed"]) or task["field_id"] != "__category__"
+                    bool(task["custom_allowed"])
                 ),
                 options=options,
                 evidence=evidence,
@@ -246,13 +247,14 @@ def _mutate_review(
             "task_locked_or_updated",
         )
         snapshot = connection.execute(
-            "SELECT options_json,custom_allowed FROM option_snapshots WHERE snapshot_version=?",
+            "SELECT s.options_json,s.custom_allowed,(SELECT f.control_type FROM platform_fields f WHERE f.platform_id=s.platform_id AND f.category_leaf_id=s.category_leaf_id AND f.source_field_id=s.field_id AND f.schema_version=s.schema_version) AS control_type FROM option_snapshots s WHERE snapshot_version=?",
             (task["snapshot_version"],),
         ).fetchone()
         options = json.loads(snapshot["options_json"]) if snapshot else []
         selection_only = bool(json.loads(task["evidence_json"]).get("selection_only"))
         ocr_semantic = task["field_id"].startswith("ocr:")
-        require(not ocr_semantic or no_fill or len(parts) == 1, 422, "candidate_not_unique")
+        multi_allowed = bool(snapshot and snapshot["control_type"] in {"multi_select", "multi-select", "multiselect"}) and not ocr_semantic
+        require(no_fill or multi_allowed or len(parts) == 1, 422, "candidate_not_unique")
         unmatched = [] if no_fill else [
             part
             for part in parts
@@ -265,8 +267,7 @@ def _mutate_review(
         require(
             not unmatched
             or (not ocr_semantic and not selection_only and (
-                task["field_id"] != "__category__"
-                or bool(snapshot and snapshot["custom_allowed"]))),
+                bool(snapshot and snapshot["custom_allowed"]))),
             422,
             "candidate_not_unique",
         )

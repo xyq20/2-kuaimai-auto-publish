@@ -248,6 +248,8 @@ class LocalReviewApiTests(unittest.TestCase):
     def test_json_candidate_ids_confirm_and_resume_intact(self):
         from attribute_runtime import split_multi_choice
         self.product_and_snapshot()
+        with transaction(self.settings) as connection:
+            connection.execute("UPDATE platform_fields SET control_type='multi_select' WHERE source_field_id='length'")
         ids = [json.dumps({'value': label, 'vid': n, 'extendInfo': None}, ensure_ascii=False)
                for n, label in enumerate(['美式', '休闲'])]
         with transaction(self.settings) as connection:
@@ -301,6 +303,12 @@ class LocalReviewApiTests(unittest.TestCase):
         # 混入不存在候选的值时拒绝（selection_only 字段禁止自定义）。
         multi = self.client.post('/api/reviews/restricted-review/confirm', headers=headers,
                                  json={'version': claim['version'], 'final_value_id': 'short,长裤'})
+        self.assertEqual(multi.status_code, 422, multi.text)
+        self.assertEqual(task['control_type'], 'select')
+        with transaction(self.settings) as connection:
+            connection.execute("UPDATE platform_fields SET control_type='multi_select' WHERE source_field_id='length'")
+        multi = self.client.post('/api/reviews/restricted-review/confirm', headers=headers,
+                                 json={'version': claim['version'], 'final_value_id': 'short,长裤'})
         self.assertEqual(multi.status_code, 200, multi.text)
         self.event('restricted-review-2', 'review.created', {
             'id': 'restricted-review-2', 'run_id': 'restricted-run', 'device_id': 'mac-1',
@@ -325,8 +333,8 @@ class LocalReviewApiTests(unittest.TestCase):
 
     def test_custom_review_value_is_saved_and_returned_to_device(self):
         self.product_and_snapshot()
-        # Legacy snapshots deny custom platform options; operators must still
-        # be able to submit a value for the writer to try and verify.
+        with transaction(self.settings) as connection:
+            connection.execute("UPDATE option_snapshots SET custom_allowed=1 WHERE snapshot_version='sv-1'")
         self.event(
             "review-custom-value",
             "review.created",
@@ -451,6 +459,8 @@ class LocalReviewApiTests(unittest.TestCase):
 
     def test_multi_candidate_suggestion_can_be_reviewed_without_correction(self):
         self.product_and_snapshot()
+        with transaction(self.settings) as connection:
+            connection.execute("UPDATE platform_fields SET control_type='multi_select' WHERE source_field_id='length'")
         payload = dict(id="multi", run_id="run", device_id="mac-1", product_version="pv-1",
                        platform_id="jd", category_leaf_id="straight-pants", field_id="length",
                        field_label="裤长", snapshot_version="sv-1", reason_code="insufficient_evidence",
