@@ -304,7 +304,13 @@ def _mutate_review(
             "UPDATE review_tasks SET status='resume_ready',version=?,updated_at=? WHERE id=?",
             (next_version, now, review_id),
         )
-        return {"id": review_id, "version": next_version, "status": "resume_ready"}
+        checkpoint = connection.execute(
+            "SELECT status FROM run_checkpoints WHERE run_id=?", (task["run_id"],)
+        ).fetchone()
+        run_status = checkpoint["status"] if checkpoint else None
+        return {"id": review_id, "version": next_version, "status": "resume_ready",
+                "run_status": run_status,
+                "resume_expected": run_status not in {"failed", "cancelled", "completed"}}
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:

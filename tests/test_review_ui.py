@@ -6,6 +6,41 @@ from local_review.ui import SCRIPT, page as review_page
 
 
 class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmation_reports_run_ended_since_page_loaded(self):
+        from playwright.async_api import async_playwright
+        from local_review.ui import STYLES
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                tab = await browser.new_page()
+                html = re.sub(r'<script[^>]+src="[^"]+"[^>]*></script>', '', review_page(True, embedded=True))
+                await tab.set_content(html)
+                await tab.add_style_tag(content=STYLES)
+                await tab.evaluate('''() => {
+                  let confirmed = false;
+                  window.fetch = async (path, options={}) => {
+                    const reply = data => new Response(JSON.stringify(data), {status:200, headers:{'content-type':'application/json'}});
+                    if (path === '/api/reviews') return reply({tasks:confirmed ? [] : [{
+                      id:'review', version:1, run_status:'waiting_review', title:'商品', platform_id:'pdd', field_label:'风格',
+                      suggested_value_id:null, options:[{value_id:'american',label:'美式'}], evidence:{}, asset_ids:[], custom_allowed:false}]});
+                    if (path.endsWith('/claim')) return reply({version:2,status:'claimed'});
+                    if (path.endsWith('/confirm')) {
+                      confirmed=true;
+                      return reply({status:'resume_ready',run_status:'failed',resume_expected:false});
+                    }
+                    throw Error('unexpected request');
+                  };
+                }''')
+                await tab.add_script_tag(content=SCRIPT)
+                await tab.get_by_role('button',name='美式',exact=True).click()
+                await tab.get_by_role('button',name='确认并继续',exact=True).click()
+                await tab.locator('#empty').wait_for(state='visible')
+                self.assertTrue(await tab.locator('#status').is_visible())
+                self.assertIn('审核已保存', await tab.locator('#status').inner_text())
+                self.assertIn('重新运行', await tab.locator('#status').inner_text())
+            finally:
+                await browser.close()
+
     async def test_model_board_displays_results_failures_and_zero_reason(self):
         from playwright.async_api import async_playwright
         static = Path(__file__).resolve().parents[1]/'local_review'/'static'

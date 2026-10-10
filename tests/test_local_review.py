@@ -507,6 +507,8 @@ class LocalReviewApiTests(unittest.TestCase):
         confirmed = self.client.post('/api/reviews/review-failed-run/no_fill', headers=headers,
                                      json={'version':claim.json()['version']})
         self.assertEqual(confirmed.status_code, 200)
+        self.assertEqual(confirmed.json().get('run_status'), 'failed')
+        self.assertFalse(confirmed.json()['resume_expected'])
         with connect(self.settings) as connection:
             self.assertEqual(connection.execute("SELECT status FROM run_checkpoints WHERE run_id='run-failed-review'").fetchone()[0], 'failed')
 
