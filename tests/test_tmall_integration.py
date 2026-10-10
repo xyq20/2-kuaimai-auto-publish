@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import kuaimai_erp
+from model_judgments import summarize
 from tmall_form_listing import TmallFormListingError, TmallProductWriteRequired
 from tmall_size_sources import TmallSizeReviewRequired
 
@@ -83,6 +84,7 @@ def _product():
             },
         ),
         category_hints=("男装", "休闲裤"),
+        garment_kind="pants",
     )
 
 
@@ -91,6 +93,9 @@ def _listing(require_full_form_error=None):
         open=AsyncMock(),
         apply_recommended_category=AsyncMock(return_value="男装 > 休闲裤"),
         fill_product_identity=AsyncMock(return_value={"style_code": "STYLE-TMALL"}),
+        restore_product_season=AsyncMock(return_value="2026年秋季"),
+        fill_leather_shoe_listing_date=AsyncMock(return_value=None),
+        fill_initial_product_materials=AsyncMock(return_value={}),
         require_full_form=AsyncMock(),
         inspect_initial_product_images=AsyncMock(
             return_value={"count": 1, "expected_count": 1, "decoded": True}
@@ -616,6 +621,27 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         controls.resolve_tmall_size_sources.assert_called_once()
 
+    async def test_image_reset_season_is_restored_before_initial_materials_and_final_validation(self):
+        listing = _listing(TmallProductWriteRequired("首次产品信息"))
+        state = {'season': True}
+        async def reset(*args, **kwargs):
+            state['season'] = False
+            return {'count': 5}
+        async def restore(*args, **kwargs):
+            state['season'] = True
+            return '2026年秋季'
+        async def require_season(*args, **kwargs):
+            self.assertTrue(state['season'], '图片替换清空了上市季节，必须恢复后才能继续')
+            return {}
+        listing.sync_initial_product_images.side_effect = reset
+        listing.sync_inherited_main_images.side_effect = reset
+        listing.restore_product_season.side_effect = restore
+        listing.fill_initial_product_materials = AsyncMock(side_effect=require_season)
+        listing.validate_remaining_required_fields.side_effect = require_season
+        with tempfile.TemporaryDirectory() as directory, self._patched_flow(listing):
+            await kuaimai_erp.run_browser_automation(self._args(), _product(), Path(directory), LOGGER)
+        self.assertEqual(listing.restore_product_season.await_count, 2)
+
     async def test_existing_tmall_form_does_not_wait_for_first_time_sync(self):
         listing = _listing()
         with tempfile.TemporaryDirectory() as directory, self._patched_flow(
@@ -803,6 +829,8 @@ class TmallMainErrorIntegrationTests(unittest.TestCase):
             kuaimai_erp, "publish_to_selected_douyin_shops", new=publish
         ), patch.object(
             Path, "write_text", autospec=True
+        ), patch.object(
+            kuaimai_erp, "write_model_judgment_report", return_value={"summary": summarize([], [])}
         ), patch(
             "sys.argv", ["kuaimai_erp", "--platform", "tmall", "--no-save"]
         ):

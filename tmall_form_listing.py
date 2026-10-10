@@ -1081,6 +1081,42 @@ class TmallFormListing(TaobaoListing):
         )
         return {"values": actual}
 
+    async def restore_product_season(self, fields: Any, *, confirmed: Optional[str] = None) -> Optional[str]:
+        """图片更新会重建产品模型，恢复已确认的季节并等待回读稳定。"""
+        if is_footwear_category(await self._category_text()):
+            return None
+        label = "上市年份季节"
+        expected = confirmed or _required_source(_fields_mapping(fields), label, ("上市季节",))
+        await self._expand_product_identity_if_needed()
+        await self._wait_for_loading_masks()
+        # Re-resolve the locator on each attempt: image uploads can replace the
+        # entire product-info subtree after the upload counter reaches its goal.
+        for attempt in range(2):
+            item = await self._tmall_form_item(label, scope=self.panel)
+            actual = await self._fill_exact_form_item(label, item, expected)
+            await self._wait_for_loading_masks()
+            stable = True
+            for _ in range(3):
+                await asyncio.sleep(0.2)
+                item = await self._tmall_form_item(label, scope=self.panel)
+                selects = item.locator('.el-select')
+                if await selects.count() == 1:
+                    values = await self._read_select_values(selects.first, multi=False)
+                else:
+                    inputs = item.locator('input:not([type="hidden"]):visible')
+                    values = ((await inputs.first.input_value()).strip(),) if await inputs.count() == 1 else ()
+                if values != (actual,):
+                    stable = False
+                    break
+            if stable:
+                if self.logger is not None:
+                    self.logger.info("天猫图片更新后上市年份季节复核通过：%s", actual)
+                return actual
+            if self.logger is not None:
+                self.logger.info("天猫图片更新后上市年份季节被重置，重新填写已确认值：%s", actual)
+            expected = actual
+        raise TmallFormListingError("天猫图片更新后上市年份季节反复被清空或改写，禁止继续保存")
+
     async def _wait_for_product_identity_items(
         self,
         labels: Sequence[str] = ("货号", "品牌"),

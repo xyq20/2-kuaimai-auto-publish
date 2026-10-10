@@ -5737,6 +5737,11 @@ async def run_browser_automation(
                                 uploader=sync_image_group,
                             )
                         )
+                        tmall_stage = "product_season_after_images"
+                        tmall_report["season_after_initial_images"] = await tmall.restore_product_season(
+                            product.tmall_fields,
+                            confirmed=identity.get("values", {}).get("上市年份季节"),
+                        )
                         matched_existing = tmall_report["initial_product_images_ready"].get(
                             "matched_existing_product"
                         ) is True
@@ -5788,6 +5793,12 @@ async def run_browser_automation(
                                 "form_mode": "matched_existing" if matched_existing else "initial",
                                 "initial_product_publish": initial_product_publish,
                             }
+                        )
+                    if tmall_report.get("form_mode") == "existing":
+                        tmall_stage = "product_season_after_images"
+                        tmall_report["season_after_initial_images"] = await tmall.restore_product_season(
+                            product.tmall_fields,
+                            confirmed=identity.get("values", {}).get("上市年份季节"),
                         )
                     tmall_report["api_json_validation"] = (
                         await tmall_api_index.safe_summary(
@@ -5882,6 +5893,11 @@ async def run_browser_automation(
                     }
                     tmall_stage = "after_sales"
                     after_sales = await tmall.fill_after_sales(product.tmall_fields)
+                    tmall_stage = "product_season_before_save"
+                    tmall_report["season_before_save"] = await tmall.restore_product_season(
+                        product.tmall_fields,
+                        confirmed=identity.get("values", {}).get("上市年份季节"),
+                    )
                     # 图片、物流和售后字段会让 Vue 迟到重渲染数值输入框；
                     # 把纯展示格式清理放在全部写入操作之后，防止 155 再显示为
                     # 155.00。这里不改数据模型，也不触发保存。

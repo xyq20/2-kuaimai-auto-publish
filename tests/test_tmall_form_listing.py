@@ -16,6 +16,46 @@ from tmall_form_listing import (
 
 
 class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restore_product_season_after_image_reset_preserves_confirmed_choice(self):
+        listing = await self._listing('''
+          <div class="el-form-item" id="season"><label class="el-form-item__label">上市年份季节</label>
+            <div class="el-form-item__content"><div class="el-select">
+              <input class="el-input__inner" readonly onclick="this.parentElement.querySelector('.el-select-dropdown').style.display='block'">
+              <div class="el-select-dropdown" style="display:none"><ul>
+                <li class="el-select-dropdown__item" onclick="window.picks++;this.closest('.el-select').querySelector('input').value=this.textContent;this.closest('.el-select-dropdown').style.display='none'">2026年秋季</li>
+              </ul></div>
+            </div></div>
+          </div><script>window.picks=0</script>
+        ''')
+        listing._category_text = AsyncMock(return_value='男装 > 休闲裤')
+        fields = {'上市年份季节': '2026/2026年秋季'}
+        result = await listing.restore_product_season(fields, confirmed='2026年秋季')
+        self.assertEqual(result, '2026年秋季')
+        self.assertEqual(await self.page.locator('#season input').input_value(), result)
+        picks = await self.page.evaluate('window.picks')
+        await listing.restore_product_season(fields, confirmed=result)
+        self.assertEqual(await self.page.evaluate('window.picks'), picks)
+        # A late image callback clears the choice after the first successful
+        # select readback. Recovery must detect it and bind the choice again.
+        await self.page.evaluate('''() => {
+            document.querySelector('#season input').value='';
+            document.querySelector('#season li').addEventListener('click', () => {
+                setTimeout(() => document.querySelector('#season input').value='', 100);
+            }, {once:true});
+        }''')
+        self.assertEqual(await listing.restore_product_season(fields, confirmed=result), result)
+        self.assertEqual(await self.page.evaluate('window.picks'), picks + 2)
+        await self.page.evaluate('''() => {
+            document.querySelector('#season input').value='';
+            document.querySelector('#season li').addEventListener('click', () => {
+                setTimeout(() => document.querySelector('#season input').value='', 100);
+            });
+        }''')
+        with self.assertRaisesRegex(TmallFormListingError, '反复被清空'):
+            await listing.restore_product_season(fields, confirmed=result)
+        listing._category_text.return_value = '男鞋 > 皮鞋'
+        self.assertIsNone(await listing.restore_product_season({}))
+
     async def asyncSetUp(self):
         from playwright.async_api import async_playwright
 
