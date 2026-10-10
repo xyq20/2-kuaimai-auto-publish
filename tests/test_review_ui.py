@@ -65,6 +65,51 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_full_workbench_review_uses_width_and_keeps_actions_visible(self):
+        from playwright.async_api import async_playwright
+        from local_review.ui import STYLES
+        static = Path(__file__).resolve().parents[1] / 'local_review' / 'static'
+        html = re.sub(r'<script[^>]+src="[^"]+"[^>]*></script>', '', (static / 'index.html').read_text())
+        inner = re.sub(r'<script[^>]+src="[^"]+"[^>]*></script>', '', review_page(False, embedded=True))
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                tab = await browser.new_page()
+                await tab.set_content(html)
+                await tab.add_style_tag(content=(static / 'styles.css').read_text())
+                await tab.evaluate("""inner => {
+                    document.body.classList.add('review-active');
+                    document.querySelectorAll('main').forEach(e=>e.hidden=e.id!=='review-view');
+                    document.getElementById('review-frame').srcdoc=inner;
+                }""", inner)
+                frame = tab.frames[-1]
+                await frame.wait_for_selector('#confirm', state='attached')
+                await frame.add_style_tag(content=STYLES)
+                await frame.add_script_tag(content=SCRIPT)
+                await frame.evaluate("""() => {
+                    document.getElementById('login').hidden=true;
+                    render({title:'费尔岛羊毛针织衫',platform_id:'pdd',field_label:'风格',
+                      options:Array.from({length:78},(_,i)=>({value_id:String(i),label:'候选'+i})),
+                      evidence:{},asset_ids:[],custom_allowed:false});
+                }""")
+                for width,height in [(1920,920),(1440,800),(1024,700),(390,750)]:
+                    await tab.set_viewport_size({'width':width,'height':height})
+                    await tab.wait_for_timeout(80)
+                    panel = await tab.locator('#review-frame').bounding_box()
+                    workspace = await tab.locator('.workspace').bounding_box()
+                    self.assertGreater(panel['width'], workspace['width'] * .8)
+                    self.assertLessEqual(panel['y'] + panel['height'], height)
+                    for selector in ['#skip','#no-fill','#confirm']:
+                        box = await frame.locator(selector).bounding_box()
+                        self.assertGreaterEqual(box['x'], panel['x'])
+                        self.assertLessEqual(box['x'] + box['width'], panel['x'] + panel['width'])
+                        self.assertLessEqual(box['y'] + box['height'], height)
+                    if width >= 1024:
+                        columns = await frame.locator('#review .layout').evaluate('(e)=>getComputedStyle(e).gridTemplateColumns')
+                        self.assertEqual(len(columns.split()), 2)
+            finally:
+                await browser.close()
+
     async def test_embedded_submit_error_stays_in_view(self):
         from playwright.async_api import async_playwright
         from local_review.ui import STYLES

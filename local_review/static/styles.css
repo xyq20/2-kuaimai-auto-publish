@@ -73,5 +73,5 @@ body.review-active{overflow:hidden}
 /* Size the review area from the actual header/sidebar, including narrow screens. */
 body.review-active .workspace{height:100dvh;display:flex;flex-direction:column;min-height:0}
 body.review-active .topbar{flex:0 0 auto}
-body.review-active #review-view{height:auto;flex:1 1 0;min-height:0;padding-bottom:20px}
+body.review-active #review-view{width:100%;margin:0;align-self:stretch;height:auto;flex:1 1 0;min-height:0;padding-bottom:20px}
 @media(max-width:650px){body.review-active .workspace{height:calc(100dvh - 65px)}}
