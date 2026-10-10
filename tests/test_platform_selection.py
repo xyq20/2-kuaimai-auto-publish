@@ -122,7 +122,7 @@ class PlatformBatchTests(unittest.IsolatedAsyncioTestCase):
                 product,
                 timeout_seconds=30,
                 logger=LOGGER,
-                platform_label="抖音资料持久化结果",
+                platform_label="微信小店关键字段（重新加载服务端数据）",
                 force_reload=True,
             )
 

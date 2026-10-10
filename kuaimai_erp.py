@@ -6205,7 +6205,10 @@ async def run_browser_automation(
                         product,
                         timeout_seconds=args.timeout,
                         logger=logger,
-                        platform_label="微信小店关键字段",
+                        platform_label="微信小店关键字段（重新加载服务端数据）",
+                        # Saving may leave the shared drawer with pre-save detail
+                        # state. Verify in a fresh editor, never that cached panel.
+                        force_reload=True,
                     )
                 )
                 persisted_wxsph = WxsphFormListing(
@@ -6216,12 +6219,25 @@ async def run_browser_automation(
                     category_hints=product.category_hints,
                 )
                 await persisted_wxsph.open()
-                persisted_report = await persisted_wxsph.verify_persisted_values(
-                    product.wxsph_fields,
-                    expected_attributes=wxsph_report["attributes"]["attributes"],
-                    expected_freight=wxsph_report.get("freight"),
-                    expected_category=wxsph_report.get("category_selection", {}).get("selected", ""),
-                )
+                try:
+                    persisted_report = await persisted_wxsph.verify_persisted_values(
+                        product.wxsph_fields,
+                        expected_attributes=wxsph_report["attributes"]["attributes"],
+                        expected_freight=wxsph_report.get("freight"),
+                        expected_category=wxsph_report.get("category_selection", {}).get("selected", ""),
+                    )
+                except WxsphFormListingError as exc:
+                    (artifact_dir / "wxsph-after-save-validation.json").write_text(
+                        json.dumps({
+                            "status": "failed",
+                            "readback_source": "fresh_product_editor",
+                            "style_code": product.style_code,
+                            "expected_attributes": wxsph_report["attributes"]["attributes"],
+                            "error": str(exc),
+                        }, ensure_ascii=False, indent=2), encoding="utf-8",
+                    )
+                    logger.error("微信小店重新加载商品后的持久化校验仍不一致：%s", exc)
+                    raise
                 (artifact_dir / "wxsph-after-save-validation.json").write_text(
                     json.dumps(persisted_report, ensure_ascii=False, indent=2),
                     encoding="utf-8",
