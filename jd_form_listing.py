@@ -580,6 +580,7 @@ class JdFormListing(YouzanFormListing):
                 self.page.remove_listener("response", previous_handler)
             except Exception:
                 pass
+        self._api_http_failures: Dict[str, int] = {}
         self._api_observations: List[Mapping[str, Any]] = []
         self._api_capture_tasks: List[asyncio.Task[Any]] = []
         self._api_request_sequence: Dict[int, int] = {}
@@ -596,6 +597,14 @@ class JdFormListing(YouzanFormListing):
                 path = urlsplit(response.url).path
             except Exception:
                 return
+            if path.startswith("/jd/"):
+                status = int(response.status)
+                if status >= 400:
+                    self._api_http_failures[path] = status
+                    if self.logger is not None:
+                        self.logger.warning("京东接口请求失败：HTTP %s，路径 %s", status, path)
+                elif 200 <= status < 300:
+                    self._api_http_failures.pop(path, None)
             if path != JD_PROPERTIES_ENDPOINT:
                 return
             task = asyncio.create_task(self._capture_api_response(response))
@@ -3579,6 +3588,7 @@ class JdFormListing(YouzanFormListing):
         """A stable partial attribute list does not mean JD finished loading."""
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         logged = False
+        refreshed = False
         while asyncio.get_running_loop().time() < deadline:
             actions = await self._header_actions("SKU属性", "批量设置")
             if len(actions) == 1:
@@ -3588,8 +3598,20 @@ class JdFormListing(YouzanFormListing):
             if not logged and self.logger is not None:
                 self.logger.info("京东资料尚未加载完整：等待 SKU属性批量入口，暂不填写商品属性")
                 logged = True
+            if not refreshed and self.panel is not None:
+                empty = "暂无属性" in await self.panel.inner_text()
+                refreshes = await self._innermost_visible_text(self.panel, "刷新数据")
+                if empty and len(refreshes) == 1:
+                    refreshed = True
+                    if self.logger is not None:
+                        self.logger.info("京东商品属性为空：尝试一次页面刷新数据，重新等待 SKU 属性入口")
+                    await refreshes[0].click(timeout=5_000)
             await asyncio.sleep(.25)
-        raise JdFormListingError("京东资料尚未加载完整：SKU属性批量设置入口未出现，请刷新京东资料后重试")
+        failures = getattr(self, "_api_http_failures", {})
+        if failures:
+            detail = "；".join("HTTP {0} {1}".format(status, path) for path, status in sorted(failures.items()))
+            raise JdFormListingError("京东属性加载失败：{0}；等待或刷新后仍未恢复，已停止填写和保存".format(detail))
+        raise JdFormListingError("京东资料尚未加载完整：SKU属性批量设置入口未出现，已停止填写和保存")
 
     async def apply_sku_thickness(self, fields: Optional[Mapping[str, str]] = None) -> Mapping[str, str]:
         if self.panel is None:

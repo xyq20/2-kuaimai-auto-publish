@@ -2219,6 +2219,44 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         await listing.wait_for_sku_attributes_ready(timeout_seconds=3)
         self.assertEqual(len(await listing._header_actions("SKU属性", "批量设置")), 1)
 
+    async def test_records_jd_http_failure_and_clears_it_after_success(self):
+        listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE)
+        endpoint = "/jd/getProductSchemas.json"
+        listing._api_response_handler(SimpleNamespace(url="https://example.com" + endpoint, status=403))
+        self.assertEqual(listing._api_http_failures, {endpoint: 403})
+        listing._api_response_handler(SimpleNamespace(url="https://example.com" + endpoint, status=200))
+        self.assertEqual(listing._api_http_failures, {})
+
+    async def test_refreshes_empty_attributes_once_and_waits_for_sku_header(self):
+        listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE)
+        await self.page.evaluate("""() => {
+            const header = document.getElementById('sku-batch').closest('th');
+            const row = header.parentElement;
+            header.remove();
+            const empty = document.createElement('div');
+            empty.innerHTML = '暂无属性 <button>刷新数据</button>';
+            window.refreshCount = 0;
+            empty.querySelector('button').onclick = () => {
+                window.refreshCount++;
+                setTimeout(() => { row.appendChild(header); empty.remove(); }, 100);
+            };
+            document.querySelector('[role=tabpanel]').appendChild(empty);
+        }""")
+        await listing.wait_for_sku_attributes_ready(timeout_seconds=2)
+        self.assertEqual(await self.page.evaluate("window.refreshCount"), 1)
+
+    async def test_persistent_empty_attributes_reports_http_failure(self):
+        listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE)
+        await self.page.locator("#sku-batch").evaluate("el => el.closest('th').remove()")
+        await self.page.locator('[role=tabpanel]').evaluate("""el => {
+            window.refreshCount = 0;
+            el.insertAdjacentHTML('beforeend', '<div>暂无属性 <button onclick="window.refreshCount++">刷新数据</button></div>');
+        }""")
+        listing._api_http_failures = {"/jd/getCategoryProperties.json": 403}
+        with self.assertRaisesRegex(JdFormListingError, "403.*getCategoryProperties"):
+            await listing.wait_for_sku_attributes_ready(timeout_seconds=.5)
+        self.assertEqual(await self.page.evaluate("window.refreshCount"), 1)
+
     async def test_incomplete_jd_form_reports_loading_problem_without_filling(self):
         listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE)
         await self.page.locator("#sku-batch").evaluate("el => el.closest('th').remove()")
