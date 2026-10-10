@@ -88,6 +88,7 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                 await frame.add_script_tag(content=SCRIPT)
                 await frame.evaluate("""() => {
                     document.getElementById('login').hidden=true;
+                    message('');
                     render({title:'费尔岛羊毛针织衫',platform_id:'pdd',field_label:'风格',
                       options:Array.from({length:78},(_,i)=>({value_id:String(i),label:'候选'+i})),
                       evidence:{},asset_ids:[],custom_allowed:false});
@@ -103,6 +104,7 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                         box = await frame.locator(selector).bounding_box()
                         self.assertGreaterEqual(box['x'], panel['x'])
                         self.assertLessEqual(box['x'] + box['width'], panel['x'] + panel['width'])
+                        self.assertLessEqual(box['y'] + box['height'], panel['y'] + panel['height'])
                         self.assertLessEqual(box['y'] + box['height'], height)
                     if width >= 1024:
                         columns = await frame.locator('#review .layout').evaluate('(e)=>getComputedStyle(e).gridTemplateColumns')
