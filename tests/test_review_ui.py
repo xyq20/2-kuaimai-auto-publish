@@ -77,7 +77,8 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                 await tab.evaluate('''() => {
                   window.requests=[];
                   const task={id:'target',version:1,run_status:'failed',title:'商品',platform_id:'xhs',field_label:'细分风格',
-                    options:[{value_id:'style',label:'美式休闲'}],evidence:{},asset_ids:[],custom_allowed:false};
+                    options:[{value_id:'young',label:'18-24岁'},{value_id:'adult',label:'25-34岁'}],
+                    suggested_value_id:'young,adult',evidence:{},asset_ids:[],custom_allowed:false};
                   window.fetch=async path=>{
                     window.requests.push(path);
                     return new Response(JSON.stringify(path.includes('/claim')?{version:2,status:'claimed'}:
@@ -90,6 +91,12 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('/api/reviews/target/claim',await tab.evaluate('window.requests'))
                 self.assertIn('审核后需重新运行',await tab.locator('#progress').inner_text())
                 self.assertEqual(await tab.locator('#confirm').inner_text(),'确认并保存审核')
+                self.assertEqual(await tab.locator('#suggestion').inner_text(), '18-24岁、25-34岁')
+                self.assertEqual(await tab.locator('[aria-pressed=true]').count(), 2)
+                self.assertFalse(await tab.evaluate('selectionDiffers()'))
+                await tab.get_by_role('button', name='25-34岁', exact=True).click()
+                self.assertTrue(await tab.evaluate('selectionDiffers()'))
+                self.assertTrue(await tab.locator('#reason-label').is_visible())
             finally: await browser.close()
 
     async def test_expired_claim_retries_same_selection_after_reclaim(self):

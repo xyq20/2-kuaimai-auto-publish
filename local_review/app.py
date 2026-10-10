@@ -125,11 +125,11 @@ def _review_tasks(settings: Settings, user_id: str, run_id: str = "") -> list[di
             "JOIN products p USING(product_version) JOIN option_snapshots s USING(snapshot_version) "
             "WHERE p.deleting=0 AND r.status IN ('pending','claimed') "
             "AND NOT EXISTS(SELECT 1 FROM run_checkpoints c WHERE c.run_id=r.run_id "
-            "AND (c.status='completed' OR (c.status='failed' AND ?=''))) "
+            "AND c.status='completed') "
             "AND (?='' OR r.run_id=?) "
             "AND (r.claimed_by IS NULL OR r.claimed_by=? OR r.lease_until<=?) "
             "ORDER BY r.created_at,r.id LIMIT 50",
-            (run_id, run_id, run_id, user_id, now),
+            (run_id, run_id, user_id, now),
         ).fetchall()
         tasks: list[dict[str, Any]] = []
         for row in rows:
@@ -270,7 +270,7 @@ def _mutate_review(
         require(
             no_fill
             or task["suggested_value_id"] is None
-            or parts == [task["suggested_value_id"]]
+            or set(parts) == set(re.split(r"[,，、;；]", task["suggested_value_id"]))
             or bool(reason),
             422,
             "correction_reason_required",

@@ -470,7 +470,7 @@ def ingest_event(settings: Settings, data: Any) -> tuple[int, dict[str, Any]]:
                 payload["suggested_value_id"] = payload.get("suggested_value_id") or None
                 require(
                     payload["suggested_value_id"] is None
-                    or sum(1 for option in options if option["value_id"] == payload["suggested_value_id"]) == 1,
+                    or _candidate_selection_is_unique(options, payload["suggested_value_id"]),
                     422,
                     "suggested_candidate_not_unique",
                 )

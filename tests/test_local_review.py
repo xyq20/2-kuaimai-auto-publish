@@ -387,6 +387,27 @@ class LocalReviewApiTests(unittest.TestCase):
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
 
+    def test_multi_candidate_suggestion_can_be_reviewed_without_correction(self):
+        self.product_and_snapshot()
+        payload = dict(id="multi", run_id="run", device_id="mac-1", product_version="pv-1",
+                       platform_id="jd", category_leaf_id="straight-pants", field_id="length",
+                       field_label="裤长", snapshot_version="sv-1", reason_code="insufficient_evidence",
+                       evidence_json={}, suggested_value_id="short,long")
+        from local_review.service import ingest_event, ApiError
+        for bad in ("short,missing", "short,short"):
+            with self.subTest(suggestion=bad), self.assertRaises(ApiError):
+                ingest_event(self.settings, {"idempotency_key": "bad-" + bad, "event_type": "review.created",
+                                             "payload": {**payload, "suggested_value_id": bad}})
+        self.event("multi", "review.created", payload)
+        self.login()
+        headers = {"Origin": "http://testserver"}
+        task = self.client.get("/api/reviews").json()["tasks"][0]
+        self.assertEqual(task["suggested_value_id"], "short,long")
+        claim = self.client.post("/api/reviews/multi/claim", headers=headers, json={"version": task["version"]}).json()
+        response = self.client.post("/api/reviews/multi/confirm", headers=headers,
+                                    json={"version": claim["version"], "final_value_id": "long,short"})
+        self.assertEqual(response.status_code, 200, response.text)
+
     def test_failed_run_reviews_are_available_in_focused_run_queue(self):
         self.product_and_snapshot()
         self.event(
@@ -426,7 +447,7 @@ class LocalReviewApiTests(unittest.TestCase):
             {**checkpoint, "status": "failed", "version": 2},
         )
         self.login()
-        self.assertEqual(self.client.get("/api/reviews").json()["tasks"], [])
+        self.assertEqual([t["id"] for t in self.client.get("/api/reviews").json()["tasks"]], ["review-failed-run"])
 
         focused = self.client.get('/api/reviews?run_id=run-failed-review').json()['tasks']
         self.assertEqual([task['id'] for task in focused], ['review-failed-run'])
