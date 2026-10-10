@@ -810,7 +810,10 @@ class TmallMainErrorIntegrationTests(unittest.TestCase):
             kuaimai_erp.JdFormListingError("京东资料尚未加载完整：SKU属性批量设置入口未出现"), "jd"
         )
 
-    def _assert_business_error(self, error, platform):
+    def test_unexpected_failure_also_requests_diagnosis(self):
+        self._assert_business_error(RuntimeError("unexpected"), "jd", unexpected=True)
+
+    def _assert_business_error(self, error, platform, unexpected=False):
         logger = Mock()
         save = AsyncMock()
         publish = AsyncMock()
@@ -833,16 +836,21 @@ class TmallMainErrorIntegrationTests(unittest.TestCase):
             kuaimai_erp, "publish_to_selected_douyin_shops", new=publish
         ), patch.object(
             Path, "write_text", autospec=True
-        ), patch.object(
+        ), patch.object(kuaimai_erp, "diagnose_failure") as diagnose, patch.object(
             kuaimai_erp, "write_model_judgment_report", return_value={"summary": summarize([], [])}
         ), patch(
             "sys.argv", ["kuaimai_erp", "--platform", platform, "--no-save"]
         ):
             result = kuaimai_erp.main()
 
-        self.assertEqual(result, 2)
-        logger.error.assert_called_once_with("%s", error)
-        logger.exception.assert_not_called()
+        self.assertEqual(result, 1 if unexpected else 2)
+        if unexpected:
+            logger.exception.assert_called_once()
+        else:
+            logger.error.assert_called_once_with("%s", error)
+            logger.exception.assert_not_called()
+        diagnose.assert_called_once()
+        self.assertIs(diagnose.call_args.args[0], error)
         save.assert_not_awaited()
         publish.assert_not_awaited()
 

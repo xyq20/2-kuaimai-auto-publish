@@ -7358,6 +7358,9 @@ async def run_all_implemented_platforms(
         await close_shared_browser_session(shared_session)
 
 
+from failure_diagnosis import diagnose_failure
+
+
 def main() -> int:
     args = build_parser().parse_args()
     selected_platforms = validate_execution_mode(args)
@@ -7503,10 +7506,12 @@ def main() -> int:
     ) as exc:
         model_run_status, model_stop_reason = "failed", str(exc)
         logger.error("%s", exc)
+        diagnose_failure(exc, artifact_dir, logger, ocr_session)
         return 2
-    except Exception:
-        model_run_status, model_stop_reason = "failed", "程序出现未预期错误，请查看错误日志"
+    except Exception as exc:
+        model_run_status, model_stop_reason = "failed", str(exc) or type(exc).__name__
         logger.exception("程序出现未预期错误")
+        diagnose_failure(exc, artifact_dir, logger, ocr_session)
         return 1
     finally:
         if redactor is None:
