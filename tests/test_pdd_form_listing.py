@@ -269,6 +269,20 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
             await select.locator(".el-select-dropdown").is_visible()
         )
 
+    async def test_cached_field_locator_survives_conditional_field_insertion(self):
+        listing = await self._listing()
+        items = await listing._attribute_items()
+        label, cached = next(v for v in items.values() if v[0] == '版型')
+        await cached.evaluate("""node => {
+          const extra = document.createElement('div');
+          extra.className='el-form-item';
+          extra.innerHTML='<label class="el-form-item__label">新增属性</label><div class="el-form-item__content"><input value="保持原样"></div>';
+          node.before(extra);
+        }""")
+        result = await listing.fill_attribute(label, '宽松', item=cached)
+        self.assertEqual(result, ('宽松',))
+        self.assertEqual(await self.page.locator('input[value="保持原样"]').input_value(), '保持原样')
+
     async def test_material_uses_unique_platform_synonym(self):
         listing = await self._listing()
         await self.page.locator(".complex-wrap").evaluate(

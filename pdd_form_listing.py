@@ -810,7 +810,8 @@ class PddFormListing(TaobaoListing):
             label_node = item.locator(":scope > .el-form-item__label").first
             if not await label_node.count():
                 continue
-            label = re.sub(r"^\s*\*\s*", "", (await label_node.inner_text()).strip())
+            raw_label = (await label_node.inner_text()).strip()
+            label = re.sub(r"^\s*\*\s*", "", raw_label)
             label = label.replace("重要", "").strip()
             normalized = normalize_label(label)
             if not normalized:
@@ -819,7 +820,13 @@ class PddFormListing(TaobaoListing):
             key = normalized if counts[normalized] == 1 else "{0}#{1}".format(
                 normalized, counts[normalized]
             )
-            result[key] = (label, item)
+            # Conditional attributes can appear/disappear after each choice.
+            # Anchor the live locator to its own label, not the old DOM index.
+            stable_item = items.filter(has=self.page.locator(
+                ":scope > .el-form-item__label",
+                has_text=re.compile(r"^\s*" + re.escape(raw_label) + r"\s*$"),
+            )).nth(counts[normalized] - 1)
+            result[key] = (label, stable_item)
         if not result:
             raise PddFormListingError("拼多多类目属性区域为空")
         return result
@@ -930,6 +937,10 @@ class PddFormListing(TaobaoListing):
             page_label, item = records[0]
         else:
             page_label = label
+        current_label = await item.locator(":scope > .el-form-item__label").inner_text()
+        current_label = re.sub(r"^\s*\*\s*", "", current_label).replace("重要", "").strip()
+        if normalize_label(current_label) != normalize_label(page_label):
+            raise PddFormListingError(f"拼多多字段定位变化：期望 {page_label}，实际 {current_label}；已阻止写入")
         await item.scroll_into_view_if_needed()
         selects = item.locator(":scope > .el-form-item__content .el-select")
         standalone_inputs = item.locator(
