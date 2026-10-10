@@ -5,6 +5,12 @@ import logging
 
 
 REASONS = {
+    "deepseek_server_error": "DeepSeek 服务器返回 HTTP 5xx，转人工审核",
+    "deepseek_http_rejected": "DeepSeek 返回未预期的 HTTP 错误，转人工审核",
+    "deepseek_connection_failed": "无法连接 DeepSeek（网络、DNS 或 TLS 连接失败），转人工审核",
+    "deepseek_transport_failed": "DeepSeek 请求传输中断，转人工审核",
+    "deepseek_invalid_response": "DeepSeek 响应格式异常，未取得有效消息，转人工审核",
+    "deepseek_invalid_json_output": "DeepSeek 已返回消息，但模型内容不是有效 JSON 对象，转人工审核",
     "judgment_request_rejected": "判断请求被服务端校验拦截，未调用模型",
     "deepseek_not_configured": "未配置 DeepSeek key，未调用模型，转人工审核",
     "deepseek_timeout": "DeepSeek 请求超时，转人工审核",

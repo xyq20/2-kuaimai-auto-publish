@@ -26,13 +26,19 @@ def request_json(settings: Settings, system: str, evidence: dict) -> dict:
             timeout=30,
         )
         response.raise_for_status()
-        envelope = response.json()
-        choice = envelope["choices"][0]
+        try:
+            envelope = response.json()
+            choice = envelope["choices"][0]
+        except (ValueError, KeyError, TypeError, IndexError):
+            raise JudgmentUnavailable("deepseek_invalid_response") from None
         if choice.get("finish_reason") != "stop":
             raise JudgmentUnavailable("deepseek_incomplete_output")
-        result = json.loads(choice["message"]["content"])
-        if not isinstance(result, dict):
-            raise ValueError("object required")
+        try:
+            result = json.loads(choice["message"]["content"])
+            if not isinstance(result, dict):
+                raise ValueError("object required")
+        except (ValueError, KeyError, TypeError):
+            raise JudgmentUnavailable("deepseek_invalid_json_output") from None
         return result
     except JudgmentUnavailable:
         raise
@@ -42,7 +48,12 @@ def request_json(settings: Settings, system: str, evidence: dict) -> dict:
         code = {401: "deepseek_auth_failed", 403: "deepseek_auth_failed",
                 402: "deepseek_insufficient_balance", 400: "deepseek_invalid_request",
                 422: "deepseek_invalid_request", 429: "deepseek_rate_limited"}.get(
-                    error.response.status_code, "deepseek_request_failed")
+                    error.response.status_code,
+                    "deepseek_server_error" if error.response.status_code >= 500 else "deepseek_http_rejected")
         raise JudgmentUnavailable(code) from None
-    except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
-        raise JudgmentUnavailable("deepseek_request_failed") from None
+    except httpx.ConnectError:
+        raise JudgmentUnavailable("deepseek_connection_failed") from None
+    except httpx.HTTPError:
+        raise JudgmentUnavailable("deepseek_transport_failed") from None
+    except (ValueError, KeyError, TypeError, IndexError):
+        raise JudgmentUnavailable("deepseek_invalid_response") from None
