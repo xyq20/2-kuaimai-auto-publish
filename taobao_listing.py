@@ -2410,18 +2410,19 @@ class TaobaoListing:
                     )
                 return None
 
+        multi = await select.locator(".el-select__tags").count() > 0
         schema_version = canonical_sha256(
             {
                 "platform_id": "tb",
                 "category_leaf_id": category_id,
                 "field_id": field_id,
+                "control_type": "multi_select" if multi else "select",
                 "options": [
                     {"value_id": value.value_id, "label": value.label}
                     for value in candidates
                 ],
             }
         )
-        multi = await select.locator(".el-select__tags").count() > 0
         resolved_values = []
         for group in groups:
             request_candidates, excel_value = await self._excel_before_review(

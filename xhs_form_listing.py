@@ -1481,6 +1481,7 @@ class XhsFormListing(TaobaoListing):
                 "platform_id": "xhs",
                 "category_leaf_id": category_id,
                 "field_id": field_id,
+                "control_type": "multi_select" if multi else "select",
                 "options": [
                     {"value_id": value.value_id, "label": value.label}
                     for value in candidates

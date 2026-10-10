@@ -946,6 +946,7 @@ class YouzanFormListing(TaobaoListing):
                 "platform_id": "yz",
                 "category_leaf_id": category_id,
                 "field_id": field_id,
+                "control_type": "multi_select" if multi else "select",
                 "options": [
                     {"value_id": value.value_id, "label": value.label}
                     for value in candidates
@@ -962,6 +963,7 @@ class YouzanFormListing(TaobaoListing):
                     candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
                     excel_value="/".join(group), evidence={},
                     custom_allowed=bool(field.get("custom_allowed")), schema_version=schema_version,
+                    control_type="multi_select" if multi else "select",
                 ),
             )
             resolved = await runtime.resolve(
@@ -975,7 +977,7 @@ class YouzanFormListing(TaobaoListing):
                     evidence={"excel": bool(excel_value.strip())},
                     custom_allowed=bool(field.get("custom_allowed")),
                     schema_version=schema_version,
-                    control_type="select",
+                    control_type="multi_select" if multi else "select",
                 )
             )
             if resolved is None or getattr(resolved, "is_no_fill", False):

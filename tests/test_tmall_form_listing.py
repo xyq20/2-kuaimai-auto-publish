@@ -310,6 +310,14 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             (("regular", "常规"), ("thick", "加厚")),
         )
 
+        select = self.page.locator("#thickness-item .el-select")
+        await select.evaluate("el => el.insertAdjacentHTML('afterbegin', '<div class=el-select__tags></div>')")
+        await select.locator('.el-select-dropdown').evaluate("el => el.style.display='block'")
+        with patch.object(listing, '_open_select', new=AsyncMock()):
+            await listing._resolve_learning_select_groups("厚薄", select, (("常规",),))
+        self.assertEqual(runtime.requests[-1].control_type, "multi_select")
+        self.assertNotEqual(request.schema_version, runtime.requests[-1].schema_version)
+
     async def test_learning_uses_api_category_and_dom_prop_candidates_when_saved_detail_omits_options(self):
         class Runtime:
             def __init__(self):
