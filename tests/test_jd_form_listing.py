@@ -2206,6 +2206,25 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(await actions[0].get_attribute("id"), "sku-batch")
 
+    async def test_waits_for_delayed_sku_header_before_considering_form_ready(self):
+        listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE)
+        await self.page.evaluate("""() => {
+            const header = document.getElementById('sku-batch').closest('th');
+            const row = header.parentElement;
+            header.remove();
+            window.restoreSkuHeader = () => row.appendChild(header);
+        }""")
+        self.assertEqual(await listing._header_actions("SKU属性", "批量设置"), [])
+        await self.page.evaluate("setTimeout(window.restoreSkuHeader, 1200)")
+        await listing.wait_for_sku_attributes_ready(timeout_seconds=3)
+        self.assertEqual(len(await listing._header_actions("SKU属性", "批量设置")), 1)
+
+    async def test_incomplete_jd_form_reports_loading_problem_without_filling(self):
+        listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE)
+        await self.page.locator("#sku-batch").evaluate("el => el.closest('th').remove()")
+        with self.assertRaisesRegex(JdFormListingError, "尚未加载完整.*SKU属性"):
+            await listing.wait_for_sku_attributes_ready(timeout_seconds=.1)
+
     async def test_reapplies_each_echoed_color_spec_value_only(self):
         listing = await self._open(COLOR_SPEC_VALUE_FIXTURE)
 

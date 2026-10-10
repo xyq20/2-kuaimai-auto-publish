@@ -803,14 +803,18 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 class TmallMainErrorIntegrationTests(unittest.TestCase):
     def test_product_write_required_is_reported_as_safe_business_error(self):
+        self._assert_business_error(TmallProductWriteRequired("天猫后续表单需要独立写入"), "tmall")
+
+    def test_jd_loading_failure_reports_specific_business_error(self):
+        self._assert_business_error(
+            kuaimai_erp.JdFormListingError("京东资料尚未加载完整：SKU属性批量设置入口未出现"), "jd"
+        )
+
+    def _assert_business_error(self, error, platform):
         logger = Mock()
         save = AsyncMock()
         publish = AsyncMock()
-        browser_run = AsyncMock(
-            side_effect=TmallProductWriteRequired(
-                "天猫后续表单需要独立写入"
-            )
-        )
+        browser_run = AsyncMock(side_effect=error)
         with patch.object(
             kuaimai_erp, "setup_logging", return_value=logger
         ), patch.object(
@@ -832,12 +836,12 @@ class TmallMainErrorIntegrationTests(unittest.TestCase):
         ), patch.object(
             kuaimai_erp, "write_model_judgment_report", return_value={"summary": summarize([], [])}
         ), patch(
-            "sys.argv", ["kuaimai_erp", "--platform", "tmall", "--no-save"]
+            "sys.argv", ["kuaimai_erp", "--platform", platform, "--no-save"]
         ):
             result = kuaimai_erp.main()
 
         self.assertEqual(result, 2)
-        logger.error.assert_called_once()
+        logger.error.assert_called_once_with("%s", error)
         logger.exception.assert_not_called()
         save.assert_not_awaited()
         publish.assert_not_awaited()

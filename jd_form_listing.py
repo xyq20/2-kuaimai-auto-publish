@@ -3575,9 +3575,26 @@ class JdFormListing(YouzanFormListing):
                 await asyncio.sleep(0.15)
         raise JdFormListingError(str(last_error or "京东批量设置超时"))
 
+    async def wait_for_sku_attributes_ready(self, *, timeout_seconds: float = 30.0) -> None:
+        """A stable partial attribute list does not mean JD finished loading."""
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        logged = False
+        while asyncio.get_running_loop().time() < deadline:
+            actions = await self._header_actions("SKU属性", "批量设置")
+            if len(actions) == 1:
+                return
+            if len(actions) > 1:
+                raise JdFormListingError("京东 SKU 属性批量设置不是唯一项：{0}".format(len(actions)))
+            if not logged and self.logger is not None:
+                self.logger.info("京东资料尚未加载完整：等待 SKU属性批量入口，暂不填写商品属性")
+                logged = True
+            await asyncio.sleep(.25)
+        raise JdFormListingError("京东资料尚未加载完整：SKU属性批量设置入口未出现，请刷新京东资料后重试")
+
     async def apply_sku_thickness(self, fields: Optional[Mapping[str, str]] = None) -> Mapping[str, str]:
         if self.panel is None:
             raise JdFormListingError("请先打开京东资料")
+        await self.wait_for_sku_attributes_ready()
         triggers = await self._header_actions("SKU属性", "批量设置")
         if len(triggers) == 0:
             raise JdFormListingError('京东 SKU 属性没有可定位的"批量设置"按钮')
@@ -4302,6 +4319,7 @@ class JdFormListing(YouzanFormListing):
         sku_paths: Sequence[Path] = (),
     ) -> Mapping[str, Any]:
         category = await self.apply_category(fields.fields)
+        await self.wait_for_sku_attributes_ready()
         # Category confirmation returns before all dependent JD controls have
         # necessarily finished replacing their previous values.  Wait for the
         # attribute section to settle so identity fields cannot read a stale

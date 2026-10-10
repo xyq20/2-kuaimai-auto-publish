@@ -7496,6 +7496,7 @@ def main() -> int:
         PlatformDiscoveryError,
         PddFormListingError,
         WxsphFormListingError,
+        JdFormListingError,
         XhsDataError,
         XhsFormListingError,
         RecognitionError,
