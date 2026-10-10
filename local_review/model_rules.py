@@ -78,20 +78,20 @@ def save_proposal(settings, data, context, proposal):
     now = utc_now()
     with connect(settings) as c:
         c.execute('INSERT OR IGNORE INTO model_learning_rules VALUES(?,?,?,?,?,?,?,?,?,?)',
-                  (ident, key, canonical_json(scope(data)), canonical_json(evidence(data, context)), version, 'active' if check['passed'] else 'pending_review',
+                  (ident, key, canonical_json(scope(data)), canonical_json(evidence(data, context)), version, 'active' if check['passed'] else 'advisory',
                    canonical_json(proposal), canonical_json(check), now, now))
     return {'id': ident, **check}
 
 
-def approved_guidance(settings, data, context):
-    """Approved complex rules inform the model; they never execute code or bypass gates."""
+def learned_guidance(settings, data, context):
+    """Model summaries are auxiliary memory, never human evidence or executable rules."""
     result = []
     with connect(settings) as c:
-        for row in c.execute("SELECT * FROM model_learning_rules WHERE scope_key=? AND status='approved_guidance' ORDER BY created_at DESC", (digest(scope(data)),)).fetchall():
+        for row in c.execute("SELECT * FROM model_learning_rules WHERE scope_key=? AND status='advisory' ORDER BY created_at DESC", (digest(scope(data)),)).fetchall():
             if (row['evidence_version'] != digest(evidence(data, context))
                     or json.loads(row['proposal_json']).get('_candidate_labels') != sorted(o['label'] for o in data['options'])):
                 c.execute("UPDATE model_learning_rules SET status='suspended',updated_at=? WHERE id=?", (utc_now(), row['id']))
                 continue
             result.append({'rule_id': row['id'], 'proposal': json.loads(row['proposal_json']),
-                           'scope': json.loads(row['scope_json']), 'source': 'human_approved_guidance'})
-    return result[:5]
+                           'scope': json.loads(row['scope_json']), 'source': 'model_summary', 'human_confirmed': False})
+    return result[:1]

@@ -60,3 +60,15 @@ class ModelRuleTests(unittest.TestCase):
             self.assertIsNone(reuse(self.settings, {**self.data,key:'different'}, self.context))
         self.context['history_summary']['human_records_matched'] = 99
         self.assertIsNone(reuse(self.settings, self.data, self.context))
+
+    def test_complex_summary_is_available_without_review_but_never_auto_executes(self):
+        from local_review.model_rules import learned_guidance
+        data = {**self.data, 'field_label': '适用年龄'}
+        result = save_proposal(self.settings, data, self.context, self.proposal)
+        self.assertFalse(result['passed'])
+        self.assertIsNone(reuse(self.settings, data, self.context))
+        summary = learned_guidance(self.settings, data, self.context)
+        self.assertEqual(summary[0]['source'], 'model_summary')
+        self.assertFalse(summary[0]['human_confirmed'])
+        self.context['human_examples'][0]['no_fill'] = True
+        self.assertEqual(learned_guidance(self.settings, data, self.context), [])
