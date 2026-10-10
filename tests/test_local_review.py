@@ -387,6 +387,28 @@ class LocalReviewApiTests(unittest.TestCase):
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
 
+    def test_complex_model_rule_requires_explicit_approval_and_can_be_disabled(self):
+        from local_review.model_rules import save_proposal, approved_guidance
+        data = dict(platform_id="douyin", category_leaf_id="knit", field_label="适用年龄",
+                    control_type="multi_select", excel_value="青年", evidence={},
+                    options=[{"value_id":"age","label":"18-24岁"}])
+        context = {"human_examples": [], "history_summary": {"human_records_matched":0}}
+        rule = save_proposal(self.settings, data, context,
+                             {"relation":"inferred","selected_labels":["18-24岁"],"exceptions":["须核对商品适用人群"]})
+        self.assertFalse(rule["passed"])
+        self.assertEqual(approved_guidance(self.settings, data, context), [])
+        self.assertEqual(self.client.get('/api/model-rules').status_code, 401)
+        self.login()
+        task = self.client.get('/api/model-rules').json()['rules'][0]
+        path = '/api/model-rules/' + rule['id']
+        response = self.client.post(path+'/approve', headers={"Origin":"http://testserver"},
+                                    json={"updated_at":task['updated_at']})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(approved_guidance(self.settings, data, context)), 1)
+        task = self.client.get('/api/model-rules').json()['rules'][0]
+        self.client.post(path+'/disable', headers={"Origin":"http://testserver"}, json={"updated_at":task['updated_at']})
+        self.assertEqual(approved_guidance(self.settings, data, context), [])
+
     def test_multi_candidate_suggestion_can_be_reviewed_without_correction(self):
         self.product_and_snapshot()
         payload = dict(id="multi", run_id="run", device_id="mac-1", product_version="pv-1",

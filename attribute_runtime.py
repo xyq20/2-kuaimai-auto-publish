@@ -441,6 +441,7 @@ class AttributeRuntime:
             logging.info("大模型历史检索：%s | %s；人工历史匹配 %s 条，提供 %s 条；保存回读提供 %s 条",
                          request.platform_id, request.field_label, history.get("human_records_matched", 0),
                          history.get("human_records_supplied", 0), history.get("verified_readbacks_supplied", 0))
+        event["rule_validation"] = answer.get("rule_validation")
         event["history_summary"] = history
         event["learning_review_ids"] = answer.get("learning_review_ids", [])
         ids, confidence = answer.get("value_ids"), answer.get("confidence")
@@ -497,6 +498,7 @@ class AttributeRuntime:
             "reason": answer["reason"], "treatment_reason": treatment, "evidence_kinds": kinds,
             "learning_review_ids": answer.get("learning_review_ids", []),
             "history_summary": history,
+            "rule_validation": answer.get("rule_validation"),
             "product_evidence": answer.get("product_evidence", {}),
             "assessment": answer.get("assessment", {}), "adoption_policy": policy,
             "grounded_support": answer.get("grounded_support", []),

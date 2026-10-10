@@ -636,6 +636,37 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
         return _response({"ok": True})
 
+    @app.get("/rules")
+    async def rule_page(request: Request):
+        _require_user(request)
+        from .rule_ui import PAGE
+        return HTMLResponse(PAGE)
+
+    @app.get("/api/model-rules")
+    async def model_rules(request: Request):
+        _require_user(request)
+        with connect(configured) as connection:
+            rows = connection.execute("SELECT * FROM model_learning_rules ORDER BY created_at DESC LIMIT 100").fetchall()
+        return _response({"rules": [{"id": r["id"], "status": r["status"], "updated_at": r["updated_at"],
+            "scope": json.loads(r["scope_json"]), "proposal": json.loads(r["proposal_json"]),
+            "validation": json.loads(r["validation_json"]), "evidence": json.loads(r["evidence_json"])} for r in rows]})
+
+    @app.post("/api/model-rules/{rule_id}/{action}")
+    async def model_rule_action(rule_id: str, action: str, request: Request):
+        _same_origin(request)
+        user = _require_user(request)
+        data = await _json_body(request)
+        require(action in {"approve", "disable"}, 400, "invalid_rule_action")
+        with transaction(configured) as connection:
+            row = connection.execute("SELECT * FROM model_learning_rules WHERE id=?", (rule_id,)).fetchone()
+            require(row is not None, 404, "rule_missing")
+            require(data.get("updated_at") == row["updated_at"], 409, "rule_changed")
+            require(action == "disable" or row["status"] == "pending_review", 409, "rule_not_pending")
+            status = "approved_guidance" if action == "approve" else "disabled"
+            connection.execute("UPDATE model_learning_rules SET status=?,updated_at=? WHERE id=?", (status, utc_now(), rule_id))
+            connection.execute("INSERT INTO model_rule_actions(rule_id,user_id,action,created_at) VALUES(?,?,?,?)", (rule_id,user["id"],action,utc_now()))
+        return _response({"status": status})
+
     @app.get("/api/reviews")
     async def reviews(request: Request):
         user = _require_user(request)
