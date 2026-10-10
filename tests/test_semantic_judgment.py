@@ -103,6 +103,19 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         self.client.semantic_judge.assert_not_called()
         await self.runtime.drain()
 
+    async def test_multiselect_preflight_reuses_full_human_combination(self):
+        from learning_models import CandidateSnapshot
+        request=dataclasses.replace(self.request,control_type='multi_select',excel_value='通用/青年,中年',
+            candidates=(CandidateValue('all','通用'),CandidateValue('young','青年'),CandidateValue('middle','中年')))
+        snapshot=CandidateSnapshot(request.platform_id,request.category_leaf_id,request.field_id,
+            request.field_label,request.candidates,request.schema_version,False)
+        self.store.save_candidate_snapshot(snapshot)
+        self.store.save_review_resolution(product_version='product',platform_id='wxsph',
+            snapshot_version=snapshot.snapshot_version,review_id='review',final_value_id='young,middle')
+        result=self.runtime.reusable_choice(request)
+        self.assertEqual((result.value_id,result.label,result.source),('young,middle','青年,中年','human_override'))
+        self.client.semantic_judge.assert_not_called()
+
     async def test_failed_confirmed_write_uses_original_intent_for_model_recovery(self):
         from learning_models import CandidateSnapshot
         snapshot = CandidateSnapshot(self.request.platform_id, self.request.category_leaf_id,

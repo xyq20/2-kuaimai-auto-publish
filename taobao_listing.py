@@ -1324,6 +1324,11 @@ class TaobaoListing:
         return tuple(result)
 
     async def _open_select(self, select: Any, *, multi: bool) -> None:
+        # Element's filter input click toggles an already open multi-select.
+        # Reuse its visible popper when filling the next choice.
+        already_open = await select.evaluate("element => Boolean(element.__vue__ && element.__vue__.visible)")
+        if already_open and await self._active_select_dropdown(select) is not None:
+            return
         if multi:
             search = select.locator(".el-select__tags input.el-select__input").first
             if await search.count() and await search.is_visible():

@@ -59,6 +59,81 @@ class DeepSeekIntegrationTests(unittest.TestCase):
         with transaction(self.settings) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM review_actions").fetchone()[0], 0)
 
+    def test_multi_exact_mapping_retries_invalid_provenance_with_full_groups(self):
+        from local_review.semantic import judge_attribute
+        payload = {'product_version':'p','platform_id':'xhs','category_leaf_id':'c','field_id':'audience',
+            'field_label':'适用对象','control_type':'multi_select','snapshot_version':'audience-s',
+            'excel_value':'通用/青年,中年/青中年',
+            'evidence':{'full_excel_value':'通用/青年,中年/青中年',
+                        'requested_groups':[['通用','青年'],['中年','青中年']],
+                        'validation_error':'dropdown is hidden','bounded_write_retry':True},
+            'options':[{'value_id':'all','label':'通用'},{'value_id':'young','label':'青年'},
+                       {'value_id':'middle','label':'中年'}]}
+        wrong = {'value_ids':['all','middle'],'confidence':.72,'reason':'误记历史回读为人工',
+                 'evidence_kinds':['excel','human_learning']}
+        good = {**wrong,'reason':'每组首个真实候选：通用和中年','evidence_kinds':['excel'],
+                'assessment':{'relation':'equivalent','source_text':payload['excel_value'],
+                              'assumptions':[],'conflicts':[],'competing_value_ids':[]}}
+        with patch('local_review.semantic.request_json', side_effect=[wrong,good]) as call:
+            result = judge_attribute(self.settings,payload)
+        self.assertEqual(result['status'],'suggested')
+        self.assertEqual(result['value_ids'],['all','middle'])
+        self.assertEqual(call.call_count,2)
+        sent=call.call_args.args[2]
+        self.assertEqual([o['value_id'] for o in sent['request']['options']],['all','middle'])
+        self.assertNotIn('validation_error',sent['request']['evidence'])
+        self.assertEqual(sent['execution_state']['validation_error'],'dropdown is hidden')
+        self.assertIn('human_learning_without_records',sent['validation_feedback'])
+
+    def test_unknown_model_candidate_still_rejected_after_one_retry(self):
+        from local_review.semantic import judge_attribute
+        payload={'product_version':'p','platform_id':'xhs','category_leaf_id':'c','field_id':'category_path',
+                 'field_label':'商品类目','control_type':'category','snapshot_version':'s',
+                 'excel_value':'毛衣','evidence':{},'options':[{'value_id':'knit','label':'针织衫'}]}
+        wrong={'value_ids':['invented'],'confidence':.99,'reason':'候选不存在','evidence_kinds':['excel']}
+        with patch('local_review.semantic.request_json',return_value=wrong) as call:
+            result=judge_attribute(self.settings,payload)
+        self.assertEqual(result['reason_code'],'deepseek_invalid_judgment')
+        self.assertEqual(call.call_count,2)
+        self.assertIn('candidate_not_in_live_options',result['reason'])
+
+    def test_multiselect_learning_excludes_single_and_reuses_confirmed_combination(self):
+        from local_review.semantic import judge_attribute
+        with transaction(self.settings) as connection:
+            create_user(connection,'admin','1234',role='admin')
+        headers={'Origin':'http://testserver'}
+        self.client.post('/api/login',headers=headers,json={'username':'admin','password':'1234'})
+        intent='通用/青年,中年/青中年'
+        options=[{'value_id':'all','label':'通用','position':0},
+                 {'value_id':'young','label':'青年','position':1},
+                 {'value_id':'middle','label':'中年','position':2}]
+        for kind, selected in [('select','all'),('multi_select','young,middle')]:
+            self.event(kind+'-snapshot','snapshot.created',{'snapshot_version':kind,
+                'platform_id':'xhs','category_leaf_id':'c','field_id':'audience','field_label':'适用对象',
+                'schema_version':kind,'custom_allowed':False,'control_type':kind,'options':options})
+            self.event(kind+'-review','review.created',{'id':kind,'run_id':'run','device_id':'device',
+                'product_version':'p','platform_id':'xhs','category_leaf_id':'c','field_id':'audience',
+                'field_label':'适用对象','canonical_field':None,'snapshot_version':kind,
+                'reason_code':'uncertain','suggested_value_id':None,
+                'evidence_json':{'reuse_context':{'control_type':kind,'excel_candidates':intent.split('/')}}})
+            claimed=self.client.post('/api/reviews/'+kind+'/claim',headers=headers,json={'version':1}).json()
+            result=self.client.post('/api/reviews/'+kind+'/confirm',headers=headers,
+                json={'version':claimed['version'],'final_value_id':selected})
+            self.assertEqual(result.status_code,200,result.text)
+        context=judgment_context(self.settings,'p','xhs','适用对象','multi_select',intent,'c')
+        self.assertEqual([e['review_id'] for e in context['human_examples']],['multi_select'])
+        self.assertEqual(set(context['human_examples'][0]['selected_labels']),{'青年','中年'})
+        payload={'product_version':'p','platform_id':'xhs','category_leaf_id':'c','field_id':'audience',
+            'field_label':'适用对象','control_type':'multi_select','snapshot_version':'multi_select',
+            'excel_value':intent,'evidence':{'requested_groups':[['通用','青年'],['中年','青中年']]},
+            'options':[{k:o[k] for k in ('value_id','label')} for o in options]}
+        with patch('local_review.semantic.request_json') as call:
+            result=judge_attribute(self.settings,payload)
+        call.assert_not_called()
+        self.assertEqual(set(result['value_ids']),{'young','middle'})
+        self.assertFalse(result['api_called'])
+        self.assertEqual(result['learning_review_ids'],['multi_select'])
+
     def test_verified_model_experience_is_context_and_never_a_human_vote(self):
         from local_review.service import _condition_signature
         self.event('excel-evidence', 'text_facts.created', {'product_version':'p', 'source':'excel',
@@ -75,6 +150,43 @@ class DeepSeekIntegrationTests(unittest.TestCase):
         self.assertEqual(judgment_context(self.settings, 'p', 'jd', '商品类目', 'category')['verified_model_examples'], [])
         with transaction(self.settings) as connection:
             self.assertEqual(_condition_signature(connection, 'p'), signature)
+
+    def test_conflicting_or_no_fill_human_records_do_not_auto_reuse_combination(self):
+        from local_review.semantic import judge_attribute
+        payload={'product_version':'p','platform_id':'xhs','category_leaf_id':'c','field_id':'audience',
+            'field_label':'适用对象','control_type':'multi_select','snapshot_version':'s',
+            'excel_value':'青年,中年','evidence':{},
+            'options':[{'value_id':'young','label':'青年'},{'value_id':'middle','label':'中年'}]}
+        base={'review_id':'r','same_product':True,'same_category':True,'control_type':'multi_select',
+              'excel_candidates':['青年,中年'],'selected_labels':['青年','中年'],'no_fill':False}
+        for other in ({**base,'review_id':'r2','selected_labels':['青年']},
+                      {**base,'review_id':'r2','selected_labels':[],'no_fill':True}):
+            with self.subTest(other=other), \
+                 patch('local_review.semantic.judgment_context',return_value={'human_examples':[base,other]}), \
+                 patch('local_review.semantic.request_json',return_value={'value_ids':[],'reason':'人工记录冲突，无法确定'}) as call:
+                result=judge_attribute(self.settings,payload)
+                self.assertEqual(result['reason_code'],'deepseek_uncertain')
+                self.assertEqual(call.call_count,1)
+
+    def test_other_product_multi_learning_is_not_excluded_by_excel_first_alternative(self):
+        from local_review.semantic import judge_attribute
+        intent='通用/青年,中年/青中年'
+        options=[{'value_id':'all','label':'通用'},{'value_id':'young','label':'青年'},
+                 {'value_id':'middle','label':'中年'}]
+        payload={'product_version':'p','platform_id':'xhs','category_leaf_id':'c','field_id':'audience',
+            'field_label':'适用对象','control_type':'multi_select','snapshot_version':'s',
+            'excel_value':intent,'options':options,
+            'evidence':{'requested_groups':[['通用','青年'],['中年','青中年']]}}
+        context={'human_examples':[{'review_id':'other','same_product':False,'same_category':True,
+            'control_type':'multi_select','excel_candidates':intent.split('/'),
+            'selected_labels':['青年','中年'],'no_fill':False}]}
+        answer={'value_ids':['young','middle'],'confidence':.9,'reason':'参考同类商品多选人工组合',
+                'evidence_kinds':['excel','human_learning']}
+        with patch('local_review.semantic.judgment_context',return_value=context), \
+             patch('local_review.semantic.request_json',return_value=answer) as call:
+            result=judge_attribute(self.settings,payload)
+        self.assertEqual(call.call_args.args[2]['request']['options'],options)
+        self.assertEqual(result['value_ids'],['young','middle'])
 
     def test_ocr_endpoint_only_accepts_real_non_numeric_row_ids(self):
         payload = {'product_version':'p','garment_kind':'clothing',

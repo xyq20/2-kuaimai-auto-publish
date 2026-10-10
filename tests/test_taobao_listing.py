@@ -594,6 +594,24 @@ class TaobaoPureFunctionTests(unittest.TestCase):
 
 
 class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_multiselect_keeps_existing_dropdown_open(self):
+        await self.page.set_content("""<div class="el-select" id="audience">
+          <div class="el-select__tags"><input class="el-select__input" onclick="toggle()"></div>
+          <input class="el-input__inner" onclick="toggle()">
+          <div class="el-select-dropdown" style="display:block"><ul><li class="el-select-dropdown__item">青年</li><li class="el-select-dropdown__item">中年</li></ul></div>
+        </div><script>
+        const el=document.getElementById('audience');
+        el.__vue__={visible:true,multiple:true,popperElm:el.querySelector('.el-select-dropdown')};
+        window.clickCount=0;
+        function toggle(){window.clickCount++;el.__vue__.visible=!el.__vue__.visible;el.__vue__.popperElm.style.display=el.__vue__.visible?'block':'none';}
+        </script>""")
+        select=self.page.locator('#audience')
+        await self.listing._open_select(select,multi=True)
+        self.assertTrue(await select.evaluate('el=>el.__vue__.visible'))
+        self.assertEqual(await self.page.evaluate('window.clickCount'),0)
+        _,options=await self.listing._visible_dom_options(select,timeout_seconds=.2)
+        self.assertEqual([o['name'] for o in options],['青年','中年'])
+
     async def _failed_write_fixture(self, *, confidence=.99, always_fail=False):
         from tests.test_attribute_runtime import FakeClient
         await self.listing.apply_recommended_category()

@@ -84,7 +84,8 @@ def record_event(owner, event, *, sink=None, logger=None):
 
 def summarize(decisions, events, *, run_status="running", stop_reason=""):
     requests = [event for event in events if event["status"] != "skipped"]
-    calls = sum(event.get("api_called") is True for event in requests)
+    calls = sum(event.get("api_call_count", 1) if type(event.get("api_call_count", 1)) is int and event.get("api_call_count", 1) > 0 else 1
+                for event in requests if event.get("api_called") is True)
     unknown = sum(event.get("api_called") is None for event in requests)
     skipped = Counter(event.get("reason_code", "") for event in events if event["status"] == "skipped")
     explanation = ""

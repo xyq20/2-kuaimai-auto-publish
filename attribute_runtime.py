@@ -579,7 +579,7 @@ class AttributeRuntime:
             code = str(answer.get("reason_code") or "deepseek_invalid_judgment")
             status = "review_required" if code == "deepseek_uncertain" else (
                 "rejected" if code in {"deepseek_invalid_judgment", "deepseek_invalid_ocr_judgment"} else "unavailable")
-            record_event(self, {**event, "status": status, "api_called": api_called(answer),
+            record_event(self, {**event, "status": status, "api_called": api_called(answer), "api_call_count": answer.get("api_call_count", 1),
                          "model": answer.get("model", ""), "reason_code": code,
                          "reason": reason_text(code) + ("；模型说明：" + str(answer["reason"])[:2000] if answer.get("reason") else "")},
                          sink=self.model_decision_sink)
@@ -603,7 +603,7 @@ class AttributeRuntime:
         ready = policy["auto_adopt"]
         treatment = policy["reason"]
         record_event(self, {**event, "status": "adopted" if ready else "review_required",
-                     "api_called": api_called(answer), "model": answer.get("model", ""),
+                     "api_called": api_called(answer), "api_call_count": answer.get("api_call_count", 1), "model": answer.get("model", ""),
                      "selected_labels": labels, "confidence": confidence,
                      "reason": answer["reason"] + "；" + treatment}, sink=self.model_decision_sink)
         trace = {
@@ -660,6 +660,16 @@ class AttributeRuntime:
         if len(matches) == 1:
             return ResolvedAttribute(matches[0].value_id, matches[0].label,
                                      "human_override", snapshot.snapshot_version)
+        if request.control_type in MULTI_SELECT_CONTROL_TYPES:
+            parts = split_multi_choice(value)
+            grouped = [[candidate for candidate in request.candidates
+                        if part in (candidate.value_id, candidate.label)] for part in parts]
+            if grouped and all(len(group) == 1 for group in grouped):
+                chosen = [group[0] for group in grouped]
+                if len({candidate.value_id for candidate in chosen}) == len(chosen):
+                    return ResolvedAttribute(",".join(c.value_id for c in chosen),
+                                             ",".join(c.label for c in chosen),
+                                             "human_override", snapshot.snapshot_version)
         if not matches and request.custom_allowed:
             return ResolvedAttribute(value, value, "human_override", snapshot.snapshot_version)
         return None
