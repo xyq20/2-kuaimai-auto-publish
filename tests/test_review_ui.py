@@ -43,7 +43,9 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                 text = await board.inner_text()
                 self.assertIn('直筒', text)
                 self.assertIn('自动采用', text)
-                self.assertIn('请求超时', text)
+                self.assertNotIn('请求超时', text)
+                self.assertEqual(await board.locator('.model-judgment-item').count(), 1)
+                self.assertTrue(await tab.locator('#run-error').is_visible())
                 self.assertIn('回读通过', text)
                 self.assertEqual(await board.locator('.model-metric').count(), 4)
                 await tab.evaluate('''() => {
@@ -54,12 +56,10 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                   renderJob(window.pendingJob);
                 }''')
                 self.assertTrue(await tab.locator('#run-review').is_visible())
-                await board.locator('.model-trace summary').click()
-                await tab.evaluate('renderJob(window.pendingJob)')
-                self.assertTrue(await board.locator('.model-trace').evaluate('node => node.open'))
-                await board.get_by_role('button',name='审核这一项').click()
+                self.assertEqual(await board.locator('.model-judgment-item').count(), 0)
+                await tab.locator('#run-review').click()
                 self.assertEqual(await tab.locator('#review-frame').get_attribute('src'),
-                                 '/review?embedded=1&run_id='+'a'*32+'&review_id=r1')
+                                 '/review?embedded=1&run_id='+'a'*32)
                 await tab.set_viewport_size({'width':390,'height':844})
                 self.assertTrue(await tab.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
             finally:

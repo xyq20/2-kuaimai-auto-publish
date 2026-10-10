@@ -302,6 +302,14 @@ def parse_material_components(value: str) -> Tuple[Tuple[str, Optional[str]], ..
     return tuple(rows)
 
 
+def reviewed_selection_labels(label, candidates, *, multi):
+    """Split confirmed combinations only on an actual multi-select control."""
+    if multi and not any(v.label == label for v in candidates):
+        from attribute_runtime import split_multi_choice
+        return split_multi_choice(label)
+    return (label,)
+
+
 def preferred_exact_candidate_label(
     candidate_labels: Sequence[str], aliases: Sequence[str]
 ) -> Optional[str]:
@@ -2334,6 +2342,7 @@ class TaobaoListing:
                 ],
             }
         )
+        multi = await select.locator(".el-select__tags").count() > 0
         resolved_values = []
         for group in groups:
             request_candidates, excel_value = await self._excel_before_review(
@@ -2344,6 +2353,7 @@ class TaobaoListing:
                     candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
                     excel_value="/".join(group), evidence={},
                     custom_allowed=custom_allowed, schema_version=schema_version,
+                    control_type="multi_select" if multi else "select",
                 ),
             )
             resolved = await runtime.resolve(
@@ -2357,12 +2367,12 @@ class TaobaoListing:
                     evidence={"excel": bool(excel_value.strip())},
                     custom_allowed=custom_allowed,
                     schema_version=schema_version,
-                    control_type="select",
+                    control_type="multi_select" if multi else "select",
                 )
             )
             if resolved is None or getattr(resolved, "is_no_fill", False):
                 return ()
-            resolved_values.append(resolved.label)
+            resolved_values.extend(reviewed_selection_labels(resolved.label, candidates, multi=multi))
         return tuple(resolved_values)
 
     async def fill_attribute(
@@ -2507,12 +2517,21 @@ class TaobaoListing:
                     return None
                 if resolved_values is not None:
                     groups = tuple((value,) for value in resolved_values)
-            return await self._select_values(
-                select,
-                groups,
-                label=page_label,
-                multi=multi,
-            )
+            actual = await self._select_values(select, groups, label=page_label, multi=multi)
+            runtime = self.attribute_runtime
+            if actual is None and callable(getattr(runtime, "resolve_unmatched_page_options", None)) and not runtime.review_pending_or_omitted(self.attribute_platform_id, page_label):
+                await self._open_select(select, multi=multi)
+                _dropdown, options = await self._visible_dom_options(select)
+                await self._dismiss_select_dropdown(select)
+                await runtime.resolve_unmatched_page_options(
+                    platform_id=self.attribute_platform_id,
+                    category_leaf_id=str(getattr(self.api_index, "active_category_id", "") or ""),
+                    field_label=page_label, excel_value=str(expected), options=tuple(options),
+                    multi=multi, force_review=True,
+                )
+                if self.logger:
+                    self.logger.warning("属性“%s”审核值未能写入，已重新提交人工审核", page_label)
+            return actual
 
         if len(visible_inputs) != 1:
             raise TaobaoListingError(

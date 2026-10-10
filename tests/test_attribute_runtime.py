@@ -60,6 +60,20 @@ def make_length_request(**overrides):
 
 
 class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_confirmed_write_forces_review_instead_of_reusing_choice(self):
+        from learning_models import CandidateSnapshot
+        request = make_length_request(excel_value='长裤')
+        snapshot = CandidateSnapshot(request.platform_id, request.category_leaf_id, request.field_id,
+                                     request.field_label, request.candidates, request.schema_version, False)
+        self.store.save_candidate_snapshot(snapshot)
+        self.store.save_review_resolution(product_version='p', platform_id='wxsph',
+            snapshot_version=snapshot.snapshot_version, review_id='old', final_value_id='long')
+        runtime = AttributeRuntime(self.store, FakeClient(), 'run', 'p')
+        runtime.begin_review_collection('wxsph')
+        self.assertIsNone(await runtime.resolve(replace(request, evidence={'force_review':True,'selection_only':True})))
+        self.assertEqual(len(runtime.deferred_reviews), 1)
+        await runtime.drain()
+
     async def test_unmatched_visible_select_enters_review_for_unmapped_field(self):
         client = FakeClient({
             "status": "review_required",

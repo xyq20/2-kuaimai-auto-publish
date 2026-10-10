@@ -255,6 +255,7 @@ class AttributeRuntime:
         excel_value: str,
         options: Tuple[Mapping[str, Any], ...],
         multi: bool = False,
+        force_review: bool = False,
     ) -> Optional[ResolvedAttribute]:
         """Submit an unmatched visible dropdown to the normal review pipeline.
 
@@ -295,7 +296,7 @@ class AttributeRuntime:
             field_label=field_label,
             candidates=tuple(candidates),
             excel_value=excel_value,
-            evidence={"excel": True, "live_dom": True},
+            evidence={"excel": True, "live_dom": True, **({"force_review": True, "selection_only": True} if force_review else {})},
             custom_allowed=False,
             schema_version=schema_version,
             control_type="multi_select" if multi else "select",
@@ -892,6 +893,14 @@ class AttributeRuntime:
         if full_confirmed is not None:
             snapshot = full_snapshot
         self.store.save_candidate_snapshot(snapshot)
+        if request.evidence.get("force_review") and request.evidence.get("selection_only"):
+            try:
+                canonical_field = map_platform_field(request.platform_id, request.field_label)
+            except FieldMappingError:
+                canonical_field = None
+            self._queue_candidate_snapshot(snapshot, canonical_field, request.control_type)
+            await self._raise_review(request, snapshot, canonical_field, "platform_write_failed")
+            return None
         confirmed_value = self.store.load_review_resolution(
             product_version=self.product_version,
             platform_id=canonical_platform_name(request.platform_id),

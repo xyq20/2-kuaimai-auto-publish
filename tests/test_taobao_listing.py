@@ -404,6 +404,13 @@ function openTaobao() {
 
 
 class TaobaoPureFunctionTests(unittest.TestCase):
+    def test_reviewed_material_combination_uses_real_control_cardinality(self):
+        from taobao_listing import reviewed_selection_labels
+        options = (CandidateValue('wool','羊毛'),CandidateValue('nylon','锦纶'))
+        self.assertEqual(reviewed_selection_labels('羊毛,锦纶',options,multi=True), ('羊毛','锦纶'))
+        self.assertEqual(reviewed_selection_labels('羊毛,锦纶',options,multi=False), ('羊毛,锦纶',))
+        self.assertEqual(reviewed_selection_labels('羊毛,锦纶',(CandidateValue('both','羊毛,锦纶'),),multi=True), ('羊毛,锦纶',))
+
     def test_auto_category_mode_keeps_dynamic_recommendation_flow_for_pants(self):
         product = SimpleNamespace(garment_kind="pants")
         self.assertEqual(resolve_taobao_category_mode(product, "auto"), "recommended")

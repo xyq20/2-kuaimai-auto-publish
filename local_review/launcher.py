@@ -20,7 +20,7 @@ from zipfile import BadZipFile
 from .config import PROJECT_DIR, Settings
 from .database import connect, utc_now
 from .service import ApiError, require
-from platform_registry import PLATFORM_SPECS
+from platform_registry import PLATFORM_SPECS, canonical_platform_name
 
 PLATFORMS = {s.cli_name: s.display_name.replace("资料", "") for s in PLATFORM_SPECS if s.enabled_in_all}
 ACTIVE = {"running", "waiting_review", "stopping"}
@@ -361,6 +361,8 @@ class Launcher:
             stages[list(stages)[current]] = result["status"]
         elif current < len(stages):
             stages[list(stages)[current]] = job["status"]
+        for task in review_tasks:
+            task["platform_id"] = canonical_platform_name(task["platform_id"])
         result.update(stages=[{"platform": name, "status": status} for name, status in stages.items()], pending_reviews=pending)
         if logs:
             result["review_tasks"] = review_tasks
