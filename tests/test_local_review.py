@@ -459,6 +459,14 @@ class LocalReviewApiTests(unittest.TestCase):
 
         focused = self.client.get('/api/reviews?run_id=run-failed-review').json()['tasks']
         self.assertEqual([task['id'] for task in focused], ['review-failed-run'])
+        # A subsequent run retires the failed run from the default queue only.
+        self.event("newer-run", "checkpoint.updated", {
+            **checkpoint, "run_id": "newer-run", "status": "running", "version": 1,
+        })
+        self.assertEqual(self.client.get('/api/reviews').json()['tasks'], [])
+        self.assertEqual([t['id'] for t in self.client.get(
+            '/api/reviews?run_id=run-failed-review').json()['tasks']], ['review-failed-run'])
+
         self.assertEqual(focused[0]['run_status'], 'failed')
         headers = {'Origin':'http://testserver'}
         claim = self.client.post('/api/reviews/review-failed-run/claim', headers=headers, json={'version':1})
