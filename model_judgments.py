@@ -31,6 +31,7 @@ REASONS = {
     "review_learning": "人工学习库已满足复用条件，无需模型判断",
     "ocr_rule_match": "OCR 规则已通过行列和数值校验，无需模型判断",
     "ocr_reused": "OCR 已复用本次确认含义，无需重复调用模型",
+    "ocr_structure_invalid": "尺码原图与 Excel 的尺寸资料未通过校验；文字含义判断无法修复，请核对原始资料",
 }
 
 

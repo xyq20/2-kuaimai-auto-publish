@@ -135,14 +135,19 @@ def _review_tasks(settings: Settings, user_id: str, run_id: str = "") -> list[di
         ).fetchall()
         tasks: list[dict[str, Any]] = []
         for row in rows:
-            assets = connection.execute(
-                "SELECT id FROM assets WHERE product_version=? "
-                "ORDER BY CASE WHEN kind='learning_thumbnail' THEN 0 ELSE 1 END,"
-                "created_at,id LIMIT 8",
-                (row["product_version"],),
-            ).fetchall()
             task = dict(row)
             evidence = json.loads(task.pop("evidence_json"))
+            if task["field_id"].startswith("ocr:"):
+                assets = connection.execute(
+                    "SELECT id FROM assets WHERE product_version=? AND sha256=? AND kind='original' LIMIT 1",
+                    (task["product_version"], evidence.get("source_sha256")),
+                ).fetchall()
+            else:
+                assets = connection.execute(
+                    "SELECT id FROM assets WHERE product_version=? "
+                    "ORDER BY CASE WHEN kind='learning_thumbnail' THEN 0 ELSE 1 END,created_at,id LIMIT 8",
+                    (task["product_version"],),
+                ).fetchall()
             options = json.loads(task.pop("options_json"))
             task.update(
                 custom_allowed=not task["field_id"].startswith("ocr:") and not evidence.get("selection_only", False) and (

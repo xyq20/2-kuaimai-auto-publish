@@ -10,7 +10,7 @@ import size_image_recognition as recognition
 from attribute_runtime import AttributeRuntime, ReviewBatchRequired
 from learning_store import LearningStore
 from local_review.config import Settings
-from tests.test_size_image_recognition import _wool_clothing_tokens
+from tests.test_size_image_recognition import _wool_clothing_tokens, _measurement_tokens, _token
 
 
 def unfamiliar_tokens():
@@ -49,6 +49,60 @@ class OCRSemanticTests(unittest.IsolatedAsyncioTestCase):
         with session.activate(), patch.object(recognition, "vision_ocr", return_value=_wool_clothing_tokens()):
             self.assertEqual(recognition.recognize_size_names(self.chart, "clothing"), ("M", "L", "XL", "2XL"))
         self.client.ocr_judge.assert_not_called()
+
+    async def test_table_title_and_notes_are_not_measurement_labels(self):
+        from ocr_semantics import OCRJudgmentRequired
+        tokens = _measurement_tokens() + (
+            _token('-下装/Bottoms（CM）-', .05, .115, width=.20),
+            _token('注：手工测量', .05, .90, width=.20),
+        )
+        error = OCRJudgmentRequired(self.chart, tokens, 'pants', lambda _: None, '')
+        self.assertEqual(error.label_token_ids, (0, 1, 2))
+
+    async def test_missing_size_cannot_be_fixed_by_reviewing_row_meanings(self):
+        from ocr_semantics import OCRSemanticSession, OCRJudgmentRequired
+        from ocr_review import resolve_ocr_failure
+        session = OCRSemanticSession()
+        tokens = _measurement_tokens() + (_token('-下装/Bottoms（CM）-', .05, .115, width=.20),)
+        with session.activate(), patch.object(recognition, 'vision_ocr', return_value=tokens):
+            with self.assertRaises(OCRJudgmentRequired) as caught:
+                recognition.recognize_size_lengths(self.chart, ('S', 'M', '3XL'), 'pants')
+        with self.assertRaises(recognition.RecognitionError) as failure:
+            await resolve_ocr_failure(self.runtime, self.client, session, caught.exception, logging.getLogger(__name__))
+        self.assertIn('3XL', str(failure.exception))
+        self.assertIn('Excel', str(failure.exception))
+        self.assertIn('原图', str(failure.exception))
+        self.client.ocr_judge.assert_not_called()
+        self.assertEqual(self.store.connection.execute("SELECT count(*) FROM sync_outbox WHERE event_type='review.created'").fetchone()[0], 0)
+        self.assertEqual(session.model_events[-1]['reason_code'], 'ocr_structure_invalid')
+
+    async def test_structural_cell_failure_does_not_send_known_rows_for_semantic_review(self):
+        from ocr_semantics import OCRSemanticSession, OCRJudgmentRequired
+        from ocr_review import resolve_ocr_failure
+        tokens = tuple(t for t in _measurement_tokens() if t.text != '104')
+        session = OCRSemanticSession()
+        with session.activate(), patch.object(recognition, 'vision_ocr', return_value=tokens):
+            with self.assertRaises(OCRJudgmentRequired) as caught:
+                recognition.recognize_size_lengths(self.chart, ('S', 'M'), 'pants')
+        with self.assertRaises(recognition.RecognitionError):
+            await resolve_ocr_failure(self.runtime, self.client, session, caught.exception, logging.getLogger(__name__))
+        self.client.ocr_judge.assert_not_called()
+
+    async def test_semantic_review_carries_the_actual_chart_and_text_coordinates(self):
+        import hashlib
+        from ocr_semantics import OCRSemanticSession
+        from ocr_review import resolve_ocr_failure
+        self.client.ocr_judge.return_value = {'status': 'review_required'}
+        session = OCRSemanticSession()
+        error = await self.failure(session)
+        with self.assertRaises(ReviewBatchRequired) as caught:
+            await resolve_ocr_failure(self.runtime, self.client, session, error, logging.getLogger(__name__))
+        request = caught.exception.reviews[0].request
+        digest = hashlib.sha256(self.chart.read_bytes()).hexdigest()
+        self.assertEqual(request.evidence['source_sha256'], digest)
+        self.assertEqual(request.evidence['source_filename'], 'size.jpg')
+        self.assertEqual(request.evidence['ocr_bbox'], {k: getattr(error.tokens[0], k) for k in ('x', 'y', 'width', 'height')})
+        self.client.upload_asset.assert_called_once_with('product', digest, 'original', 'image/jpeg', b'chart')
 
     async def test_model_only_changes_label_and_all_size_readers_reuse_it(self):
         from ocr_semantics import OCRSemanticSession

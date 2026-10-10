@@ -16,6 +16,35 @@ from local_review.service import analyze_product
 
 
 class LocalReviewApiTests(unittest.TestCase):
+    def test_ocr_review_shows_only_its_source_chart_and_never_a_product_photo(self):
+        self.product_and_snapshot()
+        digests = {}
+        ids = {}
+        for name, product, kind in [('photo', 'pv-1', 'learning_thumbnail'), ('chart', 'pv-1', 'original')]:
+            body = name.encode()
+            digests[name] = hashlib.sha256(body).hexdigest()
+            response = self.client.put('/api/device/assets/' + digests[name],
+                headers={**self.device_headers, 'X-Product-Version': product, 'X-Asset-Kind': kind, 'Content-Type': 'image/jpeg'},
+                content=body)
+            self.assertEqual(response.status_code, 201, response.text)
+            ids[name] = response.json()['asset_id']
+        self.event('ocr-snapshot', 'snapshot.created', {
+            'snapshot_version': 'ocr-sv', 'platform_id': 'douyin', 'category_leaf_id': 'ocr:pants',
+            'field_id': 'ocr:waist', 'field_label': '尺码 OCR 含义 · WST', 'canonical_field': None,
+            'schema_version': 'ocr-v1', 'control_type': 'ocr_semantic', 'custom_allowed': False,
+            'options': [{'value_id': 'waist', 'label': '腰围', 'position': 0}]})
+        for name, digest in [('correct', digests['chart']), ('missing', '0' * 64), ('legacy', None)]:
+            self.event(name, 'review.created', {
+                'id': name, 'run_id': 'run', 'device_id': 'mac', 'product_version': 'pv-1',
+                'platform_id': 'douyin', 'category_leaf_id': 'ocr:pants', 'field_id': 'ocr:waist',
+                'field_label': '尺码 OCR 含义 · WST', 'canonical_field': None, 'snapshot_version': 'ocr-sv',
+                'reason_code': 'field_mapping_required', 'evidence_json': {'ocr_text': 'WST', 'source_sha256': digest}})
+        self.login()
+        tasks = {t['id']: t for t in self.client.get('/api/reviews').json()['tasks']}
+        self.assertEqual(tasks['correct']['asset_ids'], [ids['chart']])
+        self.assertEqual(tasks['missing']['asset_ids'], [])
+        self.assertEqual(tasks['legacy']['asset_ids'], [])
+
     def test_no_fill_requires_claim_and_resumes_only_current_review(self):
         self.product_and_snapshot()
         self.event("no-fill-review", "review.created", {

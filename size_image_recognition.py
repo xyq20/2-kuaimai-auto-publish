@@ -30,6 +30,22 @@ class RecognitionError(RuntimeError):
     pass
 
 
+class SizeSetMismatch(RecognitionError):
+    """Size columns disagree with Excel; row-name corrections cannot fix this."""
+
+    def __init__(self, actual: Sequence[str], expected: Sequence[str], source: str):
+        self.actual = tuple(actual)
+        self.expected = tuple(expected)
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        details = []
+        if missing:
+            details.append("缺少：" + ", ".join(missing))
+        if extra:
+            details.append("多出：" + ", ".join(extra))
+        super().__init__(f"{source} 尺码集合不一致（{' ；'.join(details)}）")
+
+
 class _CacheUnavailable(RuntimeError):
     pass
 
@@ -591,14 +607,7 @@ def _require_size_set(actual: Sequence[str], expected: Sequence[str], source: st
     expected_set = set(expected)
     if actual_set == expected_set:
         return
-    details = []
-    missing = sorted(expected_set - actual_set)
-    extra = sorted(actual_set - expected_set)
-    if missing:
-        details.append("缺少：" + ", ".join(missing))
-    if extra:
-        details.append("多出：" + ", ".join(extra))
-    raise RecognitionError(f"{source} 尺码集合不一致（{' ；'.join(details)}）")
+    raise SizeSetMismatch(actual, expected, source)
 
 
 def _number(text: str) -> Optional[Number]:

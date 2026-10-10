@@ -25,6 +25,7 @@ class OCRJudgmentRequired(RuntimeError):
         self.tokens = tokens
         self.garment_kind = garment_kind
         self.parser = parser
+        self.failure = None
         self.key = canonical_sha256({"path": str(path.resolve()), "tokens": [asdict(t) for t in tokens]})
 
     @property
@@ -34,10 +35,16 @@ class OCRJudgmentRequired(RuntimeError):
         if not headers:
             return ()
         first_column = min(_center_x(t) for t in headers)
-        header_y = min(_center_y(t) for t in headers)
+        header_bottom = max(t.y + t.height for t in headers)
+        numeric = [t for t in self.tokens if _number(t.text) is not None]
+        # A row name must sit below the header and align with multiple data
+        # cells. Header titles and footnotes cannot be corrected into rows.
         return tuple(i for i, t in enumerate(self.tokens)
                      if _number(t.text) is None and _normalize_size(t.text) is None
-                     and _center_x(t) < first_column and _center_y(t) > header_y)
+                     and _center_x(t) < first_column and _center_y(t) > header_bottom
+                     and sum(_center_x(n) > t.x + t.width
+                             and abs(_center_y(n) - _center_y(t)) <= max(t.height, n.height) * .8
+                             for n in numeric) >= 2)
 
     def corrected(self, decisions: Mapping[int, str]) -> tuple:
         allowed = MEANINGS.get(self.garment_kind, {})
@@ -93,6 +100,7 @@ def parse_chart(path: Path, garment_kind: str, parser: Callable):
         if session is None or garment_kind not in MEANINGS:
             raise
         error.args = (str(failure),)
+        error.failure = failure
         raise error from failure
 
 

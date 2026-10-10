@@ -6,6 +6,62 @@ from local_review.ui import SCRIPT, page as review_page
 
 
 class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ocr_card_explains_question_source_and_allows_only_one_meaning(self):
+        from playwright.async_api import async_playwright
+        from local_review.ui import STYLES
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                tab = await browser.new_page(viewport={'width':1400, 'height':700})
+                html = re.sub(r'<script[^>]+src="[^"]+"[^>]*></script>', '', review_page(False, embedded=True))
+                await tab.set_content(html)
+                await tab.add_style_tag(content=STYLES)
+                await tab.add_script_tag(content=SCRIPT)
+                await tab.evaluate('''() => {
+                    document.getElementById('login').hidden=true;
+                    current={id:'ocr',field_id:'ocr:length',title:'工装裤',platform_id:'douyin',field_label:'尺码 OCR 含义 · 衣身丈',
+                      suggested_value_id:null,options:[{value_id:'length',label:'裤长'},{value_id:'waist',label:'腰围'}],
+                      evidence:{ocr_text:'衣身丈',source_filename:'size.jpg',summary:'识别原文有歧义',ocr_bbox:{x:.1,y:.4,width:.2,height:.03}},
+                      asset_ids:[],custom_allowed:false};
+                    render(current);
+                }''')
+                self.assertIn('衣身丈', await tab.locator('#field-name').inner_text())
+                self.assertIn('对应哪个测量项', await tab.locator('#review-question').inner_text())
+                self.assertTrue(await tab.locator('#review-context').is_visible())
+                self.assertIn('尺码原图', await tab.locator('#image-note').inner_text())
+                self.assertIn('单选', await tab.locator('#option-search-label').inner_text())
+                self.assertEqual(await tab.locator('#no-fill').inner_text(), '不是测量项')
+                await tab.get_by_role('button', name='裤长', exact=True).click()
+                await tab.get_by_role('button', name='腰围', exact=True).click()
+                self.assertEqual(await tab.evaluate('selectedParts'), ['waist'])
+                await tab.route('http://review.test/api/assets/chart', lambda route: route.fulfill(
+                    content_type='image/svg+xml', body='<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="800"><rect width="1000" height="800" fill="white"/></svg>'))
+                await tab.evaluate("const base=document.createElement('base');base.href='http://review.test/';document.head.append(base);current.asset_ids=['chart'];render(current)")
+                await tab.wait_for_function("document.getElementById('product-image').naturalWidth===1000")
+                for width, height in [(1400,700), (900,600), (390,650)]:
+                    await tab.set_viewport_size({'width':width, 'height':height})
+                    await tab.evaluate('highlightOCR(current)')
+                    self.assertTrue(await tab.locator('#ocr-highlight').is_visible())
+                    measured = await tab.locator('#product-image').evaluate('el=>({width:el.clientWidth,height:el.clientHeight})')
+                    mark = await tab.locator('#ocr-highlight').bounding_box()
+                    scale = min(measured['width']/1000, measured['height']/800)
+                    self.assertAlmostEqual(mark['width'], 200*scale, delta=1)
+                    self.assertAlmostEqual(mark['height'], 24*scale, delta=1)
+                    for selector in ['#skip', '#no-fill', '#confirm']:
+                        box = await tab.locator(selector).bounding_box()
+                        self.assertGreaterEqual(box['x'], 0)
+                        self.assertLessEqual(box['x'] + box['width'], width)
+                        self.assertLessEqual(box['y'] + box['height'], height)
+                # Switching back to a normal attribute restores its existing multiple selection.
+                await tab.evaluate("current={...current,field_id:'style',field_label:'风格',evidence:{}};render(current)")
+                self.assertFalse(await tab.locator('#review-context').is_visible())
+                self.assertEqual(await tab.locator('#no-fill').inner_text(), '不填写')
+                await tab.get_by_role('button', name='裤长', exact=True).click()
+                await tab.get_by_role('button', name='腰围', exact=True).click()
+                self.assertEqual(await tab.evaluate('selectedParts'), ['length', 'waist'])
+            finally:
+                await browser.close()
+
     async def test_confirmation_reports_run_ended_since_page_loaded(self):
         from playwright.async_api import async_playwright
         from local_review.ui import STYLES

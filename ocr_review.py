@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict
 import logging
+import hashlib
+import mimetypes
 
 from attribute_runtime import AttributeRequest, ReviewBatchRequired, ReviewRequired
 from learning_client import LearningClientError
 from learning_models import CandidateValue, canonical_sha256
 from ocr_semantics import MEANINGS, OCRJudgmentRequired, OCRSemanticSession, validate_suggestions
-from size_image_recognition import RecognitionError, _matches_alias_composition, _MEASUREMENT_ALIASES, _CLOTHING_MEASUREMENT_ALIASES, _CLOTHING_EXTRA_ROW_ALIASES
+from size_image_recognition import RecognitionError, SizeSetMismatch, _matches_alias_composition, _MEASUREMENT_ALIASES, _CLOTHING_MEASUREMENT_ALIASES, _CLOTHING_EXTRA_ROW_ALIASES
 
 
 def unresolved_labels(error):
@@ -23,11 +25,23 @@ async def resolve_ocr_failure(runtime, client, session: OCRSemanticSession,
                               error: OCRJudgmentRequired, logger: logging.Logger, *, platform_id="base"):
     meanings = MEANINGS[error.garment_kind]
     unknown = unresolved_labels(error)
-    # For a structural failure expose the actual row labels for review rather
-    # than let the model generate numbers to patch a broken grid.
-    label_ids = unknown or error.label_token_ids
-    if not label_ids:
-        raise RecognitionError(f"OCR 无法定位可审核的测量行，请修正尺码图：{error}")
+    if isinstance(error.failure, SizeSetMismatch) or not unknown:
+        from model_judgments import record_event
+        if isinstance(error.failure, SizeSetMismatch):
+            detail = (f"Excel 尺码：{'、'.join(error.failure.expected)}；"
+                      f"尺码原图识别到：{'、'.join(error.failure.actual) or '无'}。"
+                      "请核对 Excel 尺码或补齐原图；测量项含义审核无法补出缺失尺码与尺寸。")
+        else:
+            detail = "当前没有待确认的测量项名称；请核对原图的行列或尺寸数据，含义审核无法修复此问题。"
+        reason = f"{detail}原校验：{error}"
+        record_event(session, {"key": "structure:" + error.key, "platform_id": platform_id,
+                     "field_id": "ocr:chart", "field_label": "尺码资料校验", "excel_value": error.path.name,
+                     "source_image": str(error.path), "status": "skipped", "api_called": False,
+                     "reason_code": "ocr_structure_invalid", "reason": reason}, sink=session.report_sink, logger=logger)
+        raise RecognitionError(reason)
+    label_ids = unknown
+    source_body = await asyncio.to_thread(error.path.read_bytes)
+    source_sha256 = hashlib.sha256(source_body).hexdigest()
     requests = {}
     decisions = dict(session.corrections.get(error.key, {}))
     pending = []
@@ -40,7 +54,9 @@ async def resolve_ocr_failure(runtime, client, session: OCRSemanticSession,
             candidates=tuple(CandidateValue(k, v) for k, v in meanings.items()),
             excel_value=text,
             evidence={"ocr_text": text, "ocr_row_index": ident,
-                      "summary": f"尺码表原文“{text}”。请选择它表示的测量项；尺寸数字保持原图数据。原校验：{error}"},
+                      "source_sha256": source_sha256, "source_filename": error.path.name,
+                      "ocr_bbox": {k: getattr(error.tokens[ident], k) for k in ("x", "y", "width", "height")},
+                      "summary": f"确认尺码原图中“{text}”对应哪个测量项（单选）。只确认文字含义，尺寸数字保持原图数据。若这是标题或备注，选择“不是测量项”。原校验：{error}"},
             custom_allowed=False, schema_version="ocr-v1:" + error.key,
             control_type="ocr_semantic",
         )
@@ -160,6 +176,13 @@ async def resolve_ocr_failure(runtime, client, session: OCRSemanticSession,
                  "reason": "模型置信度或原表结构校验未通过，转人工审核" if suggestions else reason_text(code),
                  "selected_labels": [meanings[suggestions[i][0]] for i in proposed_ids]}, sink=session.report_sink, logger=logger)
     reviews = []
+    # Bind reviews to this chart, never an arbitrary product thumbnail.
+    content_type = mimetypes.guess_type(error.path.name)[0] or "application/octet-stream"
+    try:
+        await asyncio.to_thread(client.upload_asset, runtime.product_version, source_sha256,
+                                "original", content_type, source_body)
+    except LearningClientError:
+        logger.warning("尺码审核原图上传失败；审核页会提示原图不可用")
     for ident in pending:
         request = requests[ident]
         from learning_models import CandidateSnapshot

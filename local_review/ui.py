@@ -13,6 +13,21 @@ STYLES += r"""
 @media(max-width:700px){.embedded #review .actions{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.embedded #review .actions .status{grid-column:1/-1}.embedded #review .actions #skip{grid-column:1}.embedded #review .actions button{min-width:0;padding:12px 6px}}
 """
 
+STYLES += r"""
+.review-media{display:flex;flex-direction:column;min-width:0;min-height:0}
+.photo-frame{position:relative;min-height:0;flex:1}
+.ocr-highlight{position:absolute;border:2px solid #d97706;background:#fbbf2422;border-radius:4px;pointer-events:none}
+#image-note{font-size:13px;color:#6e6e73;line-height:1.5;margin:10px 0 0;flex-shrink:0}
+#image-note:empty{display:none}
+.review-context{padding:12px 16px;border-left:3px solid #0071e3;background:#0071e30a;border-radius:8px;line-height:1.6}
+#review-question{font-size:16px;font-weight:600;margin:0 0 6px}
+#review-instruction{font-size:14px;color:#515154;margin:0}
+.ocr-review #field-name{margin-bottom:14px}
+.ocr-review .label{margin-top:14px}
+.ocr-review .suggestion{font-size:16px;line-height:1.5;margin:6px 0 12px}
+.ocr-review .options button{padding:10px 16px}
+.ocr-review .options button[aria-pressed=true]{padding:9px 15px}
+"""
 
 SCRIPT = r''''use strict';
 if(document.body.classList.contains('embedded')) document.documentElement.style.overflow='hidden';
@@ -28,7 +43,65 @@ function selectionDiffers(){const suggested=current?suggestedParts(current):[];r
 function filterOptions(){const query=normalizeSearch($('option-search').value);let visible=0,total=0;document.querySelectorAll('[data-value-id]').forEach(button=>{total+=1;const matches=!query||normalizeSearch(button.textContent).includes(query)||selectedParts.includes(button.dataset.valueId);button.hidden=!matches;if(matches)visible+=1;});$('option-count').textContent=query?'显示 '+visible+' / '+total:'共 '+total+' 项';}
 function lock(value){busy=value;$('confirm').disabled=value||!selectedParts.length;if($('no-fill'))$('no-fill').disabled=value;$('skip').disabled=value;document.querySelectorAll('[data-value-id],#reason,#option-search,#custom-value').forEach(el=>el.disabled=value);}
 async function api(path,data){const response=await fetch(path,{method:data===undefined?'GET':'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});if(!response.ok){const detail=await response.json().catch(()=>({}));const error=Error(response.status===409?'任务已更新，正在重新获取审核状态。':response.status===401?'登录已过期，请刷新页面重新登录。':response.status===422?(detail.error==='candidate_not_unique'?'候选校验失败，请刷新审核后重新选择。':detail.error==='correction_reason_required'?'请选择改选原因后再确认。':'请检查候选值与改选原因。'):'暂时无法完成，请稍后重试。');error.status=response.status;error.code=detail.error;throw error;}return response.json();}
-function render(task){document.querySelector('.actions').prepend($('status'));$('review').hidden=false;$('empty').hidden=true;$('product-title').textContent=task.title;$('platform').textContent=task.platform_id;$('field-name').textContent=task.field_label;selectedParts=suggestedParts(task).filter(value=>task.options.some(o=>o.value_id===value));$('suggestion').textContent=task.evidence?.selection_only?(task.evidence.summary||'无法手填，请从平台候选中选择'):selectedParts.map(value=>task.options.find(o=>o.value_id===value)?.label).filter(Boolean).join('、')||'需要人工判断';$('option-search').value='';$('custom-value').value='';$('custom-value-label').hidden=!task.custom_allowed;$('options').replaceChildren();for(const option of task.options){const button=document.createElement('button');button.type='button';button.dataset.valueId=option.value_id;button.textContent=option.label;button.setAttribute('aria-pressed',String(selectedParts.includes(option.value_id)));button.onclick=()=>{const index=selectedParts.indexOf(option.value_id);if(index>=0)selectedParts.splice(index,1);else selectedParts.push(option.value_id);$('custom-value').value='';syncPressed();$('reason-label').hidden=!task.suggested_value_id||!selectionDiffers();filterOptions();lock(false);};$('options').append(button);}filterOptions();$('reason').value='';$('reason-label').hidden=true;const image=$('product-image');if(task.asset_ids.length){image.src='/api/assets/'+encodeURIComponent(task.asset_ids[0]);image.hidden=false;$('image-note').textContent='';image.onerror=()=>{image.hidden=true;$('image-note').textContent='商品图暂不可用，请核对判断依据。';};}else{image.removeAttribute('src');image.hidden=true;$('image-note').textContent='尚未上传商品图。';}const evidence=task.evidence;$('evidence').textContent=typeof evidence.summary==='string'?evidence.summary:'本项需要人工确认，请结合商品图片与当前候选值判断。';lock(false);$('field-name').tabIndex=-1;$('field-name').focus();}
+function isOCRReview(task){return String(task?.field_id||'').startsWith('ocr:')||typeof task?.evidence?.ocr_text==='string';}
+function highlightOCR(task){
+  const image=$('product-image'),mark=$('ocr-highlight'),box=task?.evidence?.ocr_bbox;
+  mark.hidden=true;
+  if(!isOCRReview(task)||!box||image.hidden||!image.naturalWidth||![box.x,box.y,box.width,box.height].every(Number.isFinite)||box.x<0||box.y<0||box.width<=0||box.height<=0||box.x+box.width>1.001||box.y+box.height>1.001)return;
+  const scale=Math.min(image.clientWidth/image.naturalWidth,image.clientHeight/image.naturalHeight);
+  const width=image.naturalWidth*scale,height=image.naturalHeight*scale;
+  Object.assign(mark.style,{left:((image.clientWidth-width)/2+box.x*width)+'px',top:((image.clientHeight-height)/2+box.y*height)+'px',width:(box.width*width)+'px',height:(box.height*height)+'px'});
+  mark.hidden=false;
+}
+function render(task){
+  document.querySelector('.actions').prepend($('status'));$('review').hidden=false;$('empty').hidden=true;
+  const ocr=isOCRReview(task),evidence=task.evidence||{};
+  $('review').classList.toggle('ocr-review',ocr);
+  $('product-title').textContent=task.title;
+  const platforms={douyin:'抖音',taobao:'淘宝',tmall:'天猫',pdd:'拼多多',wxsph:'微信小店',jd:'京东',base:'基础资料'};
+  $('platform').textContent=ocr?(platforms[task.platform_id]||task.platform_id)+' · 尺码图文字确认':task.platform_id;
+  $('field-label').textContent=ocr?'待确认的原图文字':'字段名称';
+  $('field-name').textContent=ocr?(evidence.ocr_text||task.field_label):task.field_label;
+  $('review-context').hidden=!ocr;
+  $('review-question').textContent=ocr?'这段文字对应哪个测量项？请选择一项。':'';
+  $('review-instruction').textContent=ocr?'核对左侧尺码原图中标出的文字。只确认文字含义，尺寸数字保持原图数据；若是标题或备注，点击“不是测量项”。':'';
+  selectedParts=suggestedParts(task).filter(value=>task.options.some(o=>o.value_id===value));
+  if(ocr)selectedParts=selectedParts.slice(0,1);
+  $('suggestion-label').textContent=ocr&&!selectedParts.length?'审核提示':'AI 建议';
+  $('suggestion').textContent=ocr?(selectedParts.map(value=>task.options.find(o=>o.value_id===value)?.label).filter(Boolean).join('、')||'暂无通过校验的建议，请核对原图后选择。'):
+    evidence.selection_only?(evidence.summary||'无法手填，请从平台候选中选择'):selectedParts.map(value=>task.options.find(o=>o.value_id===value)?.label).filter(Boolean).join('、')||'需要人工判断';
+  $('option-search-label').textContent=ocr?'选择对应测量项（单选）':'搜索候选值（可多选）';
+  $('option-search').hidden=ocr&&task.options.length<=8;
+  $('options').setAttribute('aria-label',ocr?'对应测量项，单选':'可选属性值，可多选');
+  $('no-fill').textContent=ocr?'不是测量项':'不填写';
+  $('option-search').value='';$('custom-value').value='';$('custom-value-label').hidden=ocr||!task.custom_allowed;
+  $('options').replaceChildren();
+  for(const option of task.options){
+    const button=document.createElement('button');button.type='button';button.dataset.valueId=option.value_id;button.textContent=option.label;
+    button.setAttribute('aria-pressed',String(selectedParts.includes(option.value_id)));
+    button.onclick=()=>{
+      const index=selectedParts.indexOf(option.value_id);
+      if(ocr)selectedParts=index>=0?[]:[option.value_id];
+      else if(index>=0)selectedParts.splice(index,1);else selectedParts.push(option.value_id);
+      $('custom-value').value='';syncPressed();$('reason-label').hidden=!task.suggested_value_id||!selectionDiffers();filterOptions();lock(false);
+    };
+    $('options').append(button);
+  }
+  filterOptions();$('reason').value='';$('reason-label').hidden=true;
+  const image=$('product-image');$('ocr-highlight').hidden=true;image.alt=ocr?'待审核尺码原图':'待审核商品图';
+  image.onload=()=>highlightOCR(current);
+  if(task.asset_ids.length){
+    image.src='/api/assets/'+encodeURIComponent(task.asset_ids[0]);image.hidden=false;
+    $('image-note').textContent=ocr?'尺码原图：'+(evidence.source_filename||'原始尺码表')+' · 标框为待确认文字':'';
+    image.onerror=()=>{image.hidden=true;$('ocr-highlight').hidden=true;$('image-note').textContent=ocr?'尺码原图暂不可用，请先核对原始尺码表再确认。':'商品图暂不可用，请核对判断依据。';};
+  }else{
+    image.removeAttribute('src');image.hidden=true;
+    $('image-note').textContent=ocr?'此条审核未关联尺码原图，请先核对原始尺码表；商品照片无法确认测量项。':'尚未上传商品图。';
+  }
+  $('evidence').textContent=typeof evidence.summary==='string'?evidence.summary:'本项需要人工确认，请结合商品图片与当前候选值判断。';
+  lock(false);$('field-name').tabIndex=-1;$('field-name').focus();
+}
+new ResizeObserver(()=>highlightOCR(current)).observe($('photo-frame'));
 async function next(){message('');lock(true);try{const {tasks}=await reviewTasks();const task=tasks.find(t=>!skipped.has(t.id));if(!task){current=null;$('review').hidden=true;$('empty').hidden=false;$('progress').textContent='待审任务已处理或暂时跳过';return;}const claimed=await api('/api/reviews/'+encodeURIComponent(task.id)+'/claim',{version:task.version});current={...task,...claimed};leaseAt=Date.now();$('progress').textContent='还有 '+tasks.length+' 项待判断';render(current);if(current.run_status==='failed'){$('progress').textContent+=' · 运行已中断，审核后需重新运行';$('confirm').textContent='确认并保存审核';}else{$('confirm').textContent='确认并继续';}}catch(error){message(error.message);$('empty').hidden=false;}finally{lock(false);}}
 async function submit(action){if(busy||!current)return;if(action==='confirm'&&current.suggested_value_id&&selectionDiffers()&&!$('reason').value){message('改选候选后，请选择纠正原因。');$('reason').focus();return;}lock(true);try{const path='/api/reviews/'+encodeURIComponent(current.id)+'/'+action;const payload=()=>({version:current.version,...(action==='confirm'?{final_value_id:selectedParts.join(','),...($('reason').value?{correction_reason:$('reason').value}:{})}:{} )});let result;try{result=await api(path,payload());}catch(error){if(error.status!==409||error.code!=='task_locked_or_updated')throw error;const {tasks}=await reviewTasks();const fresh=tasks.find(task=>task.id===current.id);if(!fresh){current=null;await next();message('这条任务已更新，请核对当前待审字段。');return;}const claimed=await api('/api/reviews/'+encodeURIComponent(fresh.id)+'/claim',{version:fresh.version});current={...fresh,...claimed};leaseAt=Date.now();result=await api(path,payload());}if(action==='skip')skipped.add(current.id);const ended=result?.resume_expected===false||['failed','cancelled','completed'].includes(result?.run_status??current.run_status);current=null;await next();if(action!=='skip')message(ended?'审核已保存。原运行已结束，请重新运行；已确认结果会复用。':'审核已保存，已发送续跑通知；本平台全部审核完成后自动继续。');}catch(error){message(error.message);}finally{lock(false);}}
 const noFillButton=document.createElement('button');noFillButton.id='no-fill';noFillButton.type='button';noFillButton.textContent='不填写';$('confirm').parentElement.insertBefore(noFillButton,$('confirm'));noFillButton.onclick=()=>submit('no_fill');$('confirm').onclick=()=>submit('confirm');$('skip').onclick=()=>submit('skip');$('refresh').onclick=()=>{skipped.clear();next();};$('option-search').oninput=filterOptions;$('custom-value').oninput=event=>{if(!current?.custom_allowed)return;const parts=splitValues(event.target.value);if(parts.length){selectedParts=parts.map(raw=>{const exact=current.options.find(option=>normalizeSearch(option.label)===normalizeSearch(raw));return exact?exact.value_id:raw;});}syncPressed();$('reason-label').hidden=!current.suggested_value_id||!selectionDiffers();lock(false);};
@@ -41,4 +114,4 @@ if(document.body.dataset.authenticated==='true')next();'''
 def page(authenticated: bool, embedded: bool = False) -> str:
     hidden = "hidden" if authenticated else ""
     body_class = "embedded" if embedded else ""
-    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>商品属性审核</title><link rel="icon" href="/workbench/favicon.svg" type="image/svg+xml"><script src="/workbench/theme.js"></script><link rel="stylesheet" href="/app.css"><link rel="stylesheet" href="/workbench/theme.css"><script src="/app.js" defer></script></head><body class="{body_class}" data-authenticated="{str(authenticated).lower()}"><main><header><h1>商品属性审核</h1><div class="review-header-actions"><p id="progress">本机数据 · 一次专注一个判断</p><button class="theme-toggle" type="button" aria-label="切换到深色模式" title="切换到深色模式" data-theme-toggle><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 13.4A8.7 8.7 0 0 1 10.6 3.5 9 9 0 1 0 20.5 13.4Z"/></svg></button></div></header><section id="login" class="card" {hidden}><h2>登录商品工作台</h2><form id="login-form"><label>用户名<input name="username" autocomplete="username" required maxlength="128"></label><label>4 位审核密码<input name="password" type="password" inputmode="numeric" pattern="[0-9]{{4}}" autocomplete="current-password" required minlength="4" maxlength="4"></label><button class="primary" type="submit">登录</button></form></section><section id="review" class="card" hidden><div class="layout"><div><img class="photo" id="product-image" alt="待审核商品图"><p id="image-note"></p></div><div><p class="label" id="platform"></p><h2 id="product-title"></h2><p class="label">字段名称</p><h2 id="field-name"></h2><p class="label">AI 建议</p><p class="suggestion" id="suggestion"></p><label class="option-search" for="option-search">搜索候选值（可多选）<span id="option-count"></span><input id="option-search" type="search" placeholder="输入属性值快速筛选" autocomplete="off"></label><div id="options" class="options" role="group" aria-label="可选属性值，可多选"></div><label id="custom-value-label" class="custom-value" hidden>候选中没有？直接输入（可用逗号分隔多个）<input id="custom-value" type="text" placeholder="输入页面允许的新属性值，逗号分隔" autocomplete="off" maxlength="256"></label><label id="reason-label" hidden>改选原因<select id="reason"><option value="">请选择原因</option><option>图片证据与建议不符</option><option>文字资料与建议不符</option><option>候选映射不准确</option><option>需要人工纠正</option></select></label><details><summary>查看判断依据与相似商品</summary><p id="evidence"></p><p id="similar">暂无经保存回读验证的相似商品。</p></details></div></div><div class="actions"><p id="status" class="status" role="status" aria-live="polite"></p><button id="skip" type="button">暂时跳过</button><button id="confirm" class="primary" type="button" disabled>确认并继续</button></div></section><section id="empty" class="card" hidden>当前没有可处理的审核任务。<p><button id="refresh" type="button">刷新待审任务</button></p></section></main></body></html>'''
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>商品属性审核</title><link rel="icon" href="/workbench/favicon.svg" type="image/svg+xml"><script src="/workbench/theme.js"></script><link rel="stylesheet" href="/app.css"><link rel="stylesheet" href="/workbench/theme.css"><script src="/app.js" defer></script></head><body class="{body_class}" data-authenticated="{str(authenticated).lower()}"><main><header><h1>商品属性审核</h1><div class="review-header-actions"><p id="progress">本机数据 · 一次专注一个判断</p><button class="theme-toggle" type="button" aria-label="切换到深色模式" title="切换到深色模式" data-theme-toggle><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 13.4A8.7 8.7 0 0 1 10.6 3.5 9 9 0 1 0 20.5 13.4Z"/></svg></button></div></header><section id="login" class="card" {hidden}><h2>登录商品工作台</h2><form id="login-form"><label>用户名<input name="username" autocomplete="username" required maxlength="128"></label><label>4 位审核密码<input name="password" type="password" inputmode="numeric" pattern="[0-9]{{4}}" autocomplete="current-password" required minlength="4" maxlength="4"></label><button class="primary" type="submit">登录</button></form></section><section id="review" class="card" hidden><div class="layout"><div class="review-media"><div id="photo-frame" class="photo-frame"><img class="photo" id="product-image" alt="待审核商品图"><span id="ocr-highlight" class="ocr-highlight" hidden aria-hidden="true"></span></div><p id="image-note"></p></div><div><p class="label" id="platform"></p><h2 id="product-title"></h2><p class="label" id="field-label">字段名称</p><h2 id="field-name"></h2><div id="review-context" class="review-context" hidden><p id="review-question"></p><p id="review-instruction"></p></div><p class="label" id="suggestion-label">AI 建议</p><p class="suggestion" id="suggestion"></p><label class="option-search" for="option-search"><span id="option-search-label">搜索候选值（可多选）</span><span id="option-count"></span><input id="option-search" type="search" placeholder="输入属性值快速筛选" autocomplete="off"></label><div id="options" class="options" role="group" aria-label="可选属性值，可多选"></div><label id="custom-value-label" class="custom-value" hidden>候选中没有？直接输入（可用逗号分隔多个）<input id="custom-value" type="text" placeholder="输入页面允许的新属性值，逗号分隔" autocomplete="off" maxlength="256"></label><label id="reason-label" hidden>改选原因<select id="reason"><option value="">请选择原因</option><option>图片证据与建议不符</option><option>文字资料与建议不符</option><option>候选映射不准确</option><option>需要人工纠正</option></select></label><details><summary>查看判断依据与相似商品</summary><p id="evidence"></p><p id="similar">暂无经保存回读验证的相似商品。</p></details></div></div><div class="actions"><p id="status" class="status" role="status" aria-live="polite"></p><button id="skip" type="button">暂时跳过</button><button id="confirm" class="primary" type="button" disabled>确认并继续</button></div></section><section id="empty" class="card" hidden>当前没有可处理的审核任务。<p><button id="refresh" type="button">刷新待审任务</button></p></section></main></body></html>'''
