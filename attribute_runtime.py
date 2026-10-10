@@ -291,7 +291,10 @@ class AttributeRuntime:
             previous = ResolvedAttribute('', original.excel_value, 'page_attempt', '')
         request = self._write_recovery_requests.get(key) if force_review else None
         if request is None:
-            request = replace(original, evidence={
+            full_excel = original.evidence.get("full_excel_value")
+            request = replace(original,
+                excel_value=full_excel if original.control_type in MULTI_SELECT_CONTROL_TYPES and isinstance(full_excel, str) and full_excel.strip() else original.excel_value,
+                evidence={
                 **dict(original.evidence), 'selection_only': True, 'bounded_write_retry': True,
                 'validation_error': str(error), 'failed_selection': previous.label,
                 'failed_selection_value_ids': list(split_multi_choice(previous.value_id)),
@@ -471,6 +474,13 @@ class AttributeRuntime:
                 "control_type": request.control_type,
             },
         }
+        model_event = next((row for row in reversed(self.model_events)
+                            if canonical_platform_name(row.get("platform_id", "")) == canonical_platform_name(request.platform_id)
+                            and row.get("field_id") == request.field_id
+                            and row.get("snapshot_version") == snapshot.snapshot_version
+                            and row.get("status") not in {"skipped", "requesting"}), None)
+        if model_event is not None:
+            evidence["model_judgment"] = dict(model_event)
         payload = {
             "id": review_id,
             "run_id": self.run_id,

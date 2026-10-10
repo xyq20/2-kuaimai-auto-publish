@@ -11,6 +11,32 @@ def is_style_judgment_field(field_label):
     return label in STYLE_JUDGMENT_FIELDS
 
 
+def exact_multiselect_groups(answer, request):
+    groups = request.evidence.get("requested_groups")
+    if request.control_type not in {"multi_select", "multi-select", "multiselect"} or not isinstance(groups, list) or len(groups) < 2:
+        return False
+    if request.evidence.get("full_excel_value") != request.excel_value:
+        return False
+    if (answer.get("assessment") or {}).get("conflicts"):
+        return False
+    expected = []
+    for group in groups:
+        if not isinstance(group, list) or not group:
+            return False
+        chosen = None
+        for text in group:
+            matches = [c.value_id for c in request.candidates if c.label == text]
+            if len(matches) > 1:
+                return False
+            if matches:
+                chosen = matches[0]
+                break
+        if chosen is None:
+            return False
+        expected.append(chosen)
+    return set(expected) == set(answer.get("value_ids", []))
+
+
 def adoption_policy(answer, request, *, allow_auto=True):
     assessment = answer.get("assessment")
     assessment = assessment if isinstance(assessment, dict) else {}
@@ -32,6 +58,10 @@ def adoption_policy(answer, request, *, allow_auto=True):
           and request.evidence.get('failed_selection_source') in {'human_override', 'cross_product_human', 'review_learning'}
           and set(answer.get('value_ids', [])) != set(request.evidence.get('failed_selection_value_ids', []))):
         reason = "模型建议与已有人工选择不同，需要人工确认"
+    elif exact_multiselect_groups(answer, request):
+        return {"version": POLICY_VERSION, "relation": "equivalent", "threshold": None,
+                "auto_adopt": True, "acceptable_value_ids": answer["value_ids"],
+                "reason": "模型组合逐组符合 Excel 顺序精确候选，程序复核通过，自动采用；仍须页面回读"}
     elif relation not in {"equivalent", "inferred"} and not preference:
         reason = "模型未提供完整的语义判定依据"
     elif assessment.get("conflicts") != [] or competing != []:

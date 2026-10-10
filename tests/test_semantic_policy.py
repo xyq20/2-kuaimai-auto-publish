@@ -4,6 +4,17 @@ from semantic_policy import adoption_policy
 
 
 class SemanticPolicyTests(unittest.TestCase):
+    def test_exact_multi_groups_use_excel_order_and_reject_extra_options(self):
+        from learning_models import CandidateValue
+        request = SimpleNamespace(control_type='multi_select', excel_value='通用/青年,中年',
+            evidence={'full_excel_value':'通用/青年,中年','requested_groups':[['通用','青年'],['中年']]},
+            candidates=(CandidateValue('all','通用'),CandidateValue('young','青年'),CandidateValue('middle','中年')))
+        answer = {'value_ids':['all','middle'], 'confidence':.72, 'assessment':{}, 'evidence_kinds':['excel']}
+        self.assertTrue(adoption_policy(answer,request)['auto_adopt'])
+        self.assertFalse(adoption_policy({**answer,'value_ids':['all','young','middle']},request)['auto_adopt'])
+        self.assertFalse(adoption_policy(answer,request,allow_auto=False)['auto_adopt'])
+        self.assertFalse(adoption_policy({**answer,'assessment':{'conflicts':['人工明确不填']}},request)['auto_adopt'])
+
     def preference(self, *, field='风格', control='select', confidence=.72, **assessment):
         from learning_models import CandidateValue
         request = SimpleNamespace(field_label=field, control_type=control,

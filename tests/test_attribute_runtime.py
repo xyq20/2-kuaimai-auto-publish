@@ -98,6 +98,25 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(events[0][0], events[1][0])
         self.assertNotEqual(events[0][2]['id'], events[1][2]['id'])
 
+    async def test_multiselect_recovery_keeps_full_intent_and_model_review_evidence(self):
+        from unittest.mock import AsyncMock, patch
+        request = make_length_request(control_type="multi_select", excel_value="长裤",
+            evidence={"full_excel_value": "短裤,长裤", "previously_resolved_labels": ["短裤"]})
+        client = FakeClient()
+        runtime = AttributeRuntime(self.store, client, 'run', 'p')
+        runtime.begin_review_collection('wxsph')
+        async def judge(req, snapshot, **kwargs):
+            self.assertEqual(req.excel_value, "短裤,长裤")
+            runtime.model_events.append({"platform_id": "wxsph", "field_id": req.field_id,
+                "snapshot_version": snapshot.snapshot_version, "status": "review_required",
+                "api_called": True, "confidence": .72, "selected_labels": ["短裤", "长裤"]})
+        with patch.object(runtime, '_semantic_choice', side_effect=judge):
+            await runtime.recover_failed_write(platform_id='wxsph', field_label='裤长',
+                error='dropdown closed', fallback_request=request)
+        await runtime.drain()
+        reviews = [p for _, kind, p in client.events if kind == 'review.created']
+        self.assertEqual(reviews[-1]['evidence_json']['model_judgment']['selected_labels'], ['短裤', '长裤'])
+
     async def test_failed_confirmed_write_forces_review_instead_of_reusing_choice(self):
         from learning_models import CandidateSnapshot
         request = make_length_request(excel_value='长裤')
