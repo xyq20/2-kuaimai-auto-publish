@@ -96,8 +96,12 @@ class CloudLearningClient:
 
     def _judge(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         status, body = self._request("POST", path, payload, timeout=40)
-        if status == 404:
-            return {"status": "review_required", "reason_code": "semantic_judge_unavailable"}
+        if status in {401, 403, 404, 422}:
+            reason = body.get("error", "")
+            safe_reason = reason if isinstance(reason, str) and re.fullmatch(r"[a-z0-9_:-]{1,80}", reason) else "request_rejected"
+            return {"status": "unavailable", "api_called": False,
+                    "reason_code": "judgment_request_rejected",
+                    "reason": f"本地判断接口拒绝请求：HTTP {status}，{safe_reason}；未进入模型调用"}
         return self._successful_json(status, body)
 
     def ocr_judge(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:

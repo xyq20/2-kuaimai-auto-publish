@@ -5,6 +5,7 @@ import logging
 
 
 REASONS = {
+    "judgment_request_rejected": "判断请求被服务端校验拦截，未调用模型",
     "deepseek_not_configured": "未配置 DeepSeek key，未调用模型，转人工审核",
     "deepseek_timeout": "DeepSeek 请求超时，转人工审核",
     "deepseek_auth_failed": "DeepSeek key 认证失败，转人工审核",

@@ -1402,6 +1402,7 @@ class DouyinListing:
         preflight_schema = canonical_sha256({
             "platform_id": "douyin", "category_leaf_id": category_id,
             "field_id": field_id,
+            "control_type": "multi_select" if multi else "select",
             "options": [{"value_id": v.value_id, "label": v.label} for v in candidates],
         })
         reuse = getattr(runtime, "reusable_choice", None)
@@ -1438,6 +1439,7 @@ class DouyinListing:
                 "platform_id": "douyin",
                 "category_leaf_id": category_id,
                 "field_id": field_id,
+                "control_type": "multi_select" if multi else "select",
                 "options": [
                     {"value_id": value.value_id, "label": value.label}
                     for value in candidates

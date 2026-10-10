@@ -33,6 +33,13 @@ class _Response:
 
 
 class LearningClientTests(unittest.TestCase):
+    def test_judgment_validation_rejection_is_not_unknown_call(self):
+        client = CloudLearningClient("http://localhost", device_token="test")
+        with patch.object(client, "_request", return_value=(422, {"error": "semantic_snapshot_mismatch"})):
+            result = client.semantic_judge({})
+        self.assertIs(result["api_called"], False)
+        self.assertIn("semantic_snapshot_mismatch", result["reason"])
+
     def test_device_token_can_come_from_environment_but_is_required(self):
         with patch.dict(os.environ, {"KUAIMAI_LEARNING_DEVICE_TOKEN": "env-secret"}):
             client = CloudLearningClient("https://review.example")

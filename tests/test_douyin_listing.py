@@ -1292,6 +1292,23 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             (("regular", "常规款"), ("thick", "常规款（加厚）")),
         )
 
+    async def test_control_type_changes_learning_schema(self):
+        await self.test_learning_uses_douyin_api_ids_and_dom_cross_check()
+        runtime = self.listing.attribute_runtime
+        # Isolate the DOM control-kind observation; candidates stay identical.
+        from unittest.mock import MagicMock
+        control = MagicMock()
+        control.locator.return_value.count = AsyncMock(return_value=1)
+        await self.listing._resolve_learning_select_value(
+            "厚度", control, ("常规款",), observed_values=("常规款",))
+        multi = runtime.requests[-1]
+        control.locator.return_value.count = AsyncMock(return_value=0)
+        await self.listing._resolve_learning_select_value(
+            "厚度", control, ("常规款",), observed_values=("常规款",))
+        single = runtime.requests[-1]
+        self.assertEqual(multi.control_type, "multi_select")
+        self.assertNotEqual(multi.schema_version, single.schema_version)
+
     async def test_learning_defers_to_excel_search_when_initial_options_do_not_match(self):
         class Runtime:
             def __init__(self):
