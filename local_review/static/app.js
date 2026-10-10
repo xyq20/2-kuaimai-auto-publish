@@ -371,6 +371,7 @@ function renderJob(job) {
   const visibleEvents = events.filter(row => row.status !== 'skipped' &&
     !decisions.some(decision => decision.key === row.key || decision.request_key === row.key));
   const cards = [...decisions, ...visibleEvents].filter(row => row.selected_labels?.length && row.status !== 'review_required');
+  judgment.hidden = cards.length === 0;
   const expandedTraces = new Set([...judgment.querySelectorAll('.model-trace[open]')].map(node => node.closest('article').dataset.judgmentKey));
   const judgmentScroll = judgment.querySelector('.model-judgment-list')?.scrollTop || 0;
   const cardHTML = cards.map(row => {

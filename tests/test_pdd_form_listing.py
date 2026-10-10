@@ -269,6 +269,20 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
             await select.locator(".el-select-dropdown").is_visible()
         )
 
+    async def test_failed_historical_selection_creates_forced_review(self):
+        runtime = SimpleNamespace(resolve_unmatched_page_options=AsyncMock(return_value=None),
+                                  review_pending_or_omitted=lambda *args: False)
+        listing = await self._listing(runtime)
+        listing._resolve_learning_groups = AsyncMock(return_value=(('修身,宽松',),))
+        listing._select_values = AsyncMock(return_value=None)
+        result = await listing.fill_attribute('版型', '原始风格')
+        self.assertIsNone(result)
+        kwargs = runtime.resolve_unmatched_page_options.await_args.kwargs
+        self.assertTrue(kwargs['force_review'])
+        self.assertFalse(kwargs['multi'])
+        self.assertEqual(kwargs['excel_value'], '原始风格')
+        self.assertEqual({o['name'] for o in kwargs['options']}, {'修身','宽松'})
+
     async def test_removed_dependent_field_is_skipped_without_blocking_later_fields(self):
         import asyncio
         listing = await self._listing()

@@ -33,8 +33,8 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                   document.getElementById('run-dialog').showModal();
                 }''')
                 board = tab.locator('#model-judgment-details')
-                self.assertTrue(await board.is_visible())
-                self.assertIn('路径校验中断', await board.inner_text())
+                self.assertFalse(await board.is_visible())
+                self.assertTrue(await tab.locator('#run-error').is_visible())
                 await tab.evaluate('''() => renderJob({id:'a'.repeat(32),style_code:'2024',mode:'save',status:'failed',stages:[],
                   model_summary:{api_call_count:2,adopted_count:1,review_count:0,unavailable_count:1,rejected_count:0},
                   model_events:[{key:'bad',platform_id:'xhs',field_label:'商品类目',status:'unavailable',reason:'DeepSeek 请求超时'}],

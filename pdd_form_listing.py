@@ -31,6 +31,7 @@ from platform_schema import FieldSchema
 from taobao_listing import (
     TaobaoListing,
     TaobaoListingError,
+    reviewed_selection_labels,
     excel_aliases,
     material_name_groups,
     normalize_label,
@@ -384,6 +385,7 @@ class PddFormListing(TaobaoListing):
                 ],
             }
         )
+        multi = await select.locator(".el-select__tags").count() > 0
         resolved_groups = []
         for group in normalized_groups:
             request_candidates, excel_value = await self._excel_before_review(
@@ -394,6 +396,7 @@ class PddFormListing(TaobaoListing):
                     candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
                     excel_value="/".join(group), evidence={},
                     custom_allowed=bool(field.custom_allowed), schema_version=schema_version,
+                    control_type="multi_select" if multi else "select",
                 ),
             )
             resolved = await runtime.resolve(
@@ -407,12 +410,12 @@ class PddFormListing(TaobaoListing):
                     evidence={"excel": bool(excel_value)},
                     custom_allowed=bool(field.custom_allowed),
                     schema_version=schema_version,
-                    control_type="select",
+                    control_type="multi_select" if multi else "select",
                 )
             )
             if resolved is None or getattr(resolved, "is_no_fill", False):
                 return ()
-            resolved_groups.append((resolved.label,))
+            resolved_groups.extend((value,) for value in reviewed_selection_labels(resolved.label, candidates, multi=multi))
         return tuple(resolved_groups)
 
     async def _wait_for_loading_masks(self, timeout_seconds: float = 30) -> None:
@@ -1023,7 +1026,26 @@ class PddFormListing(TaobaoListing):
                         page_label,
                     )
                 return None
-            return await self._select_values(select, groups, label=page_label, multi=multi)
+            actual = await self._select_values(select, groups, label=page_label, multi=multi)
+            runtime = self.attribute_runtime
+            if actual is None and callable(getattr(runtime, "resolve_unmatched_page_options", None)) and not runtime.review_pending_or_omitted("pdd", page_label):
+                await self._open_select(select, multi=multi)
+                try:
+                    _dropdown, options = await self._visible_dom_options(select)
+                finally:
+                    try:
+                        await self._dismiss_select_dropdown(select)
+                    except TaobaoListingError:
+                        if self.logger:
+                            self.logger.warning("拼多多属性“%s”下拉未关闭，保留候选并提交审核", page_label)
+                _field, category_id = await self._captured_api_field(page_label)
+                await runtime.resolve_unmatched_page_options(
+                    platform_id="pdd", category_leaf_id=category_id, field_label=page_label,
+                    excel_value=str(expected), options=tuple(options), multi=multi, force_review=True,
+                )
+                if self.logger:
+                    self.logger.warning("拼多多属性“%s”历史审核值无法写入当前控件，已重新提交审核", page_label)
+            return actual
         if len(visible_inputs) != 1:
             raise PddFormListingError(
                 "拼多多属性“{0}”不是唯一的下拉或文本输入控件".format(page_label)
