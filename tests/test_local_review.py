@@ -392,7 +392,7 @@ class LocalReviewApiTests(unittest.TestCase):
         payload = dict(id="multi", run_id="run", device_id="mac-1", product_version="pv-1",
                        platform_id="jd", category_leaf_id="straight-pants", field_id="length",
                        field_label="裤长", snapshot_version="sv-1", reason_code="insufficient_evidence",
-                       evidence_json={}, suggested_value_id="short,long")
+                       evidence_json={"reuse_context": {"control_type": "select", "excel_candidates": ["常规"]}}, suggested_value_id="short,long")
         from local_review.service import ingest_event, ApiError
         for bad in ("short,missing", "short,short"):
             with self.subTest(suggestion=bad), self.assertRaises(ApiError):
@@ -407,6 +407,14 @@ class LocalReviewApiTests(unittest.TestCase):
         response = self.client.post("/api/reviews/multi/confirm", headers=headers,
                                     json={"version": claim["version"], "final_value_id": "long,short"})
         self.assertEqual(response.status_code, 200, response.text)
+        from local_review.semantic import judgment_context
+        context = judgment_context(self.settings, "pv-1", "jd", "裤长", "multi_select", "常规", "straight-pants")
+        self.assertEqual(context["history_summary"]["human_records_supplied"], 1)
+        self.assertEqual(set(context["human_examples"][0]["selected_labels"]), {"长裤", "短裤"})
+        with transaction(self.settings) as connection:
+            connection.execute("UPDATE review_actions SET final_value_id='__NO_FILL__' WHERE review_id='multi'")
+        context = judgment_context(self.settings, "pv-1", "jd", "裤长", "multi_select")
+        self.assertTrue(context["human_examples"][0]["no_fill"])
 
     def test_failed_run_reviews_are_available_in_focused_run_queue(self):
         self.product_and_snapshot()

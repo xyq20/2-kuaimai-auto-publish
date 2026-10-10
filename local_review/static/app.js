@@ -372,6 +372,7 @@ function renderJob(job) {
     const confidence = typeof row.confidence === 'number' ? ` · ${row.confidence.toLocaleString(undefined,{style:'percent',maximumFractionDigits:1})}` : '';
     const detail = [row.treatment_reason, row.model ? `模型：${row.model}` : '',
       row.adoption_policy ? `判断类型：${({equivalent:'同义映射',inferred:'事实推断',unclassified:'依据不完整'})[row.adoption_policy.relation] || row.adoption_policy.relation}；门槛：${Math.round(row.adoption_policy.threshold*100)}%；策略：${row.adoption_policy.version}` : '',
+      row.history_summary ? `历史检索：人工匹配 ${row.history_summary.human_records_matched || 0} 条，提供 ${row.history_summary.human_records_supplied || 0} 条；保存回读 ${row.history_summary.verified_readbacks_supplied || 0} 条` : '',
       row.snapshot_version ? `候选快照：${row.snapshot_version}` : '',
       row.learning_review_ids?.length ? `参考人工审核：${row.learning_review_ids.join('、')}` : '',
       row.source_image ? `OCR 来源：${row.source_image}` : ''].filter(Boolean);

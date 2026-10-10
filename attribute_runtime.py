@@ -436,6 +436,13 @@ class AttributeRuntime:
                 answer = {"reason_code": "judgment_service_unavailable"}
             self._model_judgments[key] = answer if isinstance(answer, Mapping) else {}
         answer = self._model_judgments[key]
+        history = answer.get("history_summary", {})
+        if history:
+            logging.info("大模型历史检索：%s | %s；人工历史匹配 %s 条，提供 %s 条；保存回读提供 %s 条",
+                         request.platform_id, request.field_label, history.get("human_records_matched", 0),
+                         history.get("human_records_supplied", 0), history.get("verified_readbacks_supplied", 0))
+        event["history_summary"] = history
+        event["learning_review_ids"] = answer.get("learning_review_ids", [])
         ids, confidence = answer.get("value_ids"), answer.get("confidence")
         kinds = answer.get("evidence_kinds")
         valid = (
@@ -489,6 +496,7 @@ class AttributeRuntime:
             "selected_value_ids": ids, "selected_labels": labels, "confidence": confidence,
             "reason": answer["reason"], "treatment_reason": treatment, "evidence_kinds": kinds,
             "learning_review_ids": answer.get("learning_review_ids", []),
+            "history_summary": history,
             "product_evidence": answer.get("product_evidence", {}),
             "assessment": answer.get("assessment", {}), "adoption_policy": policy,
             "grounded_support": answer.get("grounded_support", []),
