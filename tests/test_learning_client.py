@@ -300,6 +300,22 @@ class LearningClientTests(unittest.TestCase):
         self.assertEqual(flush_outbox(store, client, now), 1)
         store.mark_delivered.assert_called_once_with(1)
 
+    def test_flush_outbox_quarantines_checkpoint_mismatch_and_continues(self):
+        now = datetime(2026, 9, 9, tzinfo=timezone.utc)
+        stale = OutboxEvent(1, "stale", "stage.completed", {}, 0, now.isoformat(), None)
+        current = OutboxEvent(2, "current", "stage.completed", {}, 0, now.isoformat(), None)
+        store = Mock()
+        store.pending_outbox.side_effect = [(stale, current), (current,)]
+        client = Mock()
+        client.post_event.side_effect = [
+            PermanentCloudError("cloud status 422 (checkpoint_mismatch)"),
+            None,
+        ]
+
+        self.assertEqual(flush_outbox(store, client, now), 1)
+        store.mark_discarded.assert_called_once_with(1, "cloud status 422 (checkpoint_mismatch)")
+        store.mark_delivered.assert_called_once_with(2)
+
 
 if __name__ == "__main__":
     unittest.main()

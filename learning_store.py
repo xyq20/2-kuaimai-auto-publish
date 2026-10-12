@@ -21,7 +21,7 @@ from learning_models import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -156,7 +156,8 @@ class LearningStore:
               attempts INTEGER NOT NULL DEFAULT 0,
               available_at TEXT NOT NULL,
               last_error TEXT,
-              delivered_at TEXT
+              delivered_at TEXT,
+              discarded_at TEXT
             )
             """,
         )
@@ -177,6 +178,16 @@ class LearningStore:
             if "image_version" not in checkpoint_columns:
                 self.connection.execute(
                     "ALTER TABLE run_checkpoints ADD COLUMN image_version TEXT NOT NULL DEFAULT ''"
+                )
+            outbox_columns = {
+                row["name"]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(sync_outbox)"
+                ).fetchall()
+            }
+            if "discarded_at" not in outbox_columns:
+                self.connection.execute(
+                    "ALTER TABLE sync_outbox ADD COLUMN discarded_at TEXT"
                 )
             self.connection.execute(
                 "INSERT INTO schema_meta(key, value) VALUES(?, ?) "
@@ -621,7 +632,7 @@ class LearningStore:
         rows = self.connection.execute(
             "SELECT id, idempotency_key, event_type, payload_json, attempts, "
             "available_at, last_error FROM sync_outbox "
-            "WHERE delivered_at IS NULL AND available_at<=? ORDER BY id LIMIT ?",
+            "WHERE delivered_at IS NULL AND discarded_at IS NULL AND available_at<=? ORDER BY id LIMIT ?",
             (utc_now(), limit),
         ).fetchall()
         return tuple(
@@ -637,11 +648,31 @@ class LearningStore:
             for row in rows
         )
 
+    def earliest_pending_outbox_id(self) -> Optional[int]:
+        """Return the oldest undelivered event, including events in backoff."""
+        row = self.connection.execute(
+            "SELECT id FROM sync_outbox WHERE delivered_at IS NULL AND discarded_at IS NULL ORDER BY id LIMIT 1"
+        ).fetchone()
+        return int(row["id"]) if row is not None else None
+
     def mark_delivered(self, event_id: int) -> None:
         with self.connection:
             self.connection.execute(
                 "UPDATE sync_outbox SET delivered_at=? WHERE id=?",
                 (utc_now(), event_id),
+            )
+
+    def mark_discarded(self, event_id: int, error: str) -> None:
+        """Quarantine an event rejected because its run identity is obsolete.
+
+        Such an event cannot become valid by retrying: the server has no
+        matching checkpoint for its run/product pair. Keeping it pending would
+        block every newer outbox event because delivery is ordered.
+        """
+        with self.connection:
+            self.connection.execute(
+                "UPDATE sync_outbox SET discarded_at=?, last_error=? WHERE id=?",
+                (utc_now(), error[:200], event_id),
             )
 
     def mark_retry(self, event_id: int, error: str, available_at: str) -> None:

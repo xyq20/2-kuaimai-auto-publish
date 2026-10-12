@@ -260,6 +260,12 @@ def flush_outbox(
     """Best-effort delivery; retryable cloud failures remain in the local outbox."""
     delivered = 0
     for event in store.pending_outbox(limit=50):
+        oldest_fn = getattr(store, "earliest_pending_outbox_id", None)
+        oldest = oldest_fn() if callable(oldest_fn) else None
+        if isinstance(oldest, int) and oldest != event.id:
+            if isinstance(oldest, int):
+                break
+            continue
         try:
             client.post_event(
                 event.idempotency_key,
@@ -273,8 +279,13 @@ def flush_outbox(
                 str(caught),
                 (now + timedelta(seconds=delay)).isoformat(),
             )
+            if isinstance(oldest, int):
+                break
             continue
-        except PermanentCloudError:
+        except PermanentCloudError as caught:
+            if "checkpoint_mismatch" in str(caught):
+                store.mark_discarded(event.id, str(caught))
+                continue
             raise
         store.mark_delivered(event.id)
         delivered += 1
@@ -289,6 +300,10 @@ async def flush_outbox_async(
     """Deliver network requests off-thread while keeping SQLite on its owner thread."""
     delivered = 0
     for event in store.pending_outbox(limit=50):
+        oldest_fn = getattr(store, "earliest_pending_outbox_id", None)
+        oldest = oldest_fn() if callable(oldest_fn) else None
+        if isinstance(oldest, int) and oldest != event.id:
+            break
         try:
             await asyncio.to_thread(
                 client.post_event,
@@ -303,8 +318,11 @@ async def flush_outbox_async(
                 str(caught),
                 (now + timedelta(seconds=delay)).isoformat(),
             )
-            continue
-        except PermanentCloudError:
+            break
+        except PermanentCloudError as caught:
+            if "checkpoint_mismatch" in str(caught):
+                store.mark_discarded(event.id, str(caught))
+                continue
             raise
         store.mark_delivered(event.id)
         delivered += 1

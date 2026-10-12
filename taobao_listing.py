@@ -3003,6 +3003,7 @@ class TaobaoListing:
         if await add_button.count() != 1:
             raise TaobaoListingError("淘宝材质成分找不到唯一“添加”按钮")
 
+        effective_expected = []
         for index, (name, percentage) in enumerate(expected):
             before = len(await self._material_rows(item))
             await add_button.click()
@@ -3032,6 +3033,12 @@ class TaobaoListing:
                 raise TaobaoListingError(
                     f"淘宝材质成分第 {index + 1} 行没有 Excel 材质“{name}”的精确候选"
                 )
+            # The platform may not expose the Excel spelling (for example,
+            # “羊皮” is represented by the learned “其他材质” option).  The
+            # value returned by the selector is the value that the page can
+            # actually persist, so subsequent validation must use it rather
+            # than comparing against the unavailable Excel spelling.
+            effective_expected.append((actual_name[0], percentage))
 
             percentage_inputs = []
             inputs = row.locator("input")
@@ -3051,15 +3058,28 @@ class TaobaoListing:
             await percentage_inputs[0].fill(str(percentage))
             await percentage_inputs[0].press("Tab")
 
+        # Keep the internal Vue component in sync with the same effective
+        # platform labels used by the DOM verification above.  A learned
+        # fallback such as “其他材质” must not be re-matched against the
+        # unavailable Excel spelling “羊皮”.
+        component_expected = tuple(
+            (
+                TAOBAO_MATERIAL_OPTION_ALIASES.get(
+                    normalize_option(name), (name,)
+                )[0],
+                percentage,
+            )
+            for name, percentage in effective_expected
+        )
         deadline = asyncio.get_running_loop().time() + 5
         while asyncio.get_running_loop().time() < deadline:
             actual = await self._read_materials(item)
-            if self._material_rows_match(actual, expected):
+            if self._material_rows_match(actual, effective_expected):
                 await sync_and_validate_component()
                 return actual
             await asyncio.sleep(0.05)
         raise TaobaoListingError(
-            f"淘宝材质成分填写后校验失败：期望 {expected!r}，页面为 {actual!r}"
+            f"淘宝材质成分填写后校验失败：期望 {tuple(effective_expected)!r}，页面为 {actual!r}"
         )
 
     @staticmethod

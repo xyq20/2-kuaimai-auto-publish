@@ -29,7 +29,7 @@ class LearningStoreTests(unittest.TestCase):
         self.store.migrate()
         self.store.migrate()
 
-        self.assertEqual(self.store.schema_version(), 3)
+        self.assertEqual(self.store.schema_version(), 4)
         journal_mode = self.store.connection.execute("PRAGMA journal_mode").fetchone()[0]
         foreign_keys = self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0]
         self.assertEqual(journal_mode.casefold(), "wal")
