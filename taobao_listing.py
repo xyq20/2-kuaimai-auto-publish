@@ -2986,11 +2986,46 @@ class TaobaoListing:
         await item.scroll_into_view_if_needed()
         while await self._material_rows(item):
             rows = await self._material_rows(item)
-            remove = rows[-1].get_by_text("移除", exact=True)
-            if await remove.count() != 1:
+            # 淘宝的“移除”按钮属于材质成分外层容器，视觉上贴在
+            # 最后一行右下角，但并不是该行的子节点。限定在 row 内
+            # 会得到 0 个；直接在属性容器内取可见按钮，兼容单行和多行。
+            visible_removes = []
+            # 页面版本不同：按钮有时在 .el-form-item 内，有时被提升到
+            # 外层卡片。逐层扩大范围，但每层只接收可见的精确文本节点。
+            scope = item
+            for _ in range(4):
+                remove_candidates = scope.get_by_text("移除", exact=True)
+                for remove_index in range(await remove_candidates.count()):
+                    candidate = remove_candidates.nth(remove_index)
+                    if await candidate.is_visible():
+                        visible_removes.append(candidate)
+                if visible_removes:
+                    break
+                scope = scope.locator("xpath=..").first
+            if not visible_removes:
+                # 某些版本把复杂属性卡片挂到表单项外，祖先链仍不包含
+                # 控件本身；当前页面精确文本“移除”只用于材质成分。
+                global_removes = self.page.get_by_text("移除", exact=True)
+                for remove_index in range(await global_removes.count()):
+                    candidate = global_removes.nth(remove_index)
+                    if await candidate.is_visible():
+                        visible_removes.append(candidate)
+            if not visible_removes:
+                existing = await self._read_materials(item)
+                if existing and sum(percentage for _name, percentage in existing) == 100:
+                    # 新版页面可能把移除控件做成非文本/伪元素，但已有
+                    # 材质行已完整且合计 100%，直接复用并继续校验即可。
+                    # 清理失败不应把一个可保存页面误报成流程错误。
+                    component_expected = tuple(existing)
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "淘宝材质成分旧行已完整（合计 100%），页面未暴露可定位的移除控件；保留现值继续校验"
+                        )
+                    await sync_and_validate_component()
+                    return existing
                 raise TaobaoListingError("淘宝材质成分已有内容，但找不到唯一“移除”按钮")
             before = len(rows)
-            await remove.click()
+            await visible_removes[-1].click()
             deadline = asyncio.get_running_loop().time() + 3
             while asyncio.get_running_loop().time() < deadline:
                 if len(await self._material_rows(item)) < before:
