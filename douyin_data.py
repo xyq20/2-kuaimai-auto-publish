@@ -248,6 +248,15 @@ def parse_materials(value: Any) -> Tuple[MaterialComponent, ...]:
     components = []
     for part in parts:
         component = first_candidate(part)
+        # A single plain material name (for example “羊皮”) denotes a
+        # one-component fabric.  Treating it as 100% preserves the source
+        # value and lets the platform's live candidate validation decide
+        # whether that material is available.  Never invent percentages for
+        # multiple plain names.
+        if component is None and len(parts) == 1 and not re.search(r"\d\s*%", part):
+            plain = part.strip()
+            if plain and "/" not in plain and not re.search(r"[()（）]", plain):
+                component = MaterialComponent(plain, 100)
         if component is None:
             raise DouyinDataError(
                 f"面料材质格式不正确：{original_text!r}，请使用“棉（100%）”、"

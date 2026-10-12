@@ -117,6 +117,13 @@ class DouyinFieldParsingTests(unittest.TestCase):
                 with self.assertRaisesRegex(DouyinDataError, "百分比合计|格式不正确"):
                     parse_materials(value)
 
+    def test_accepts_single_plain_material_as_one_hundred_percent(self):
+        self.assertEqual(parse_materials("羊皮"), (MaterialComponent("羊皮", 100),))
+
+    def test_does_not_invent_percentages_for_multiple_plain_materials(self):
+        with self.assertRaisesRegex(DouyinDataError, "格式不正确"):
+            parse_materials("羊皮，牛皮")
+
     def test_uses_standalone_material_common_name_as_material_source(self):
         fields = dict(CURRENT_PRODUCT_FIELDS)
         del fields["面料材质/水洗标/吊牌图/面料"]
