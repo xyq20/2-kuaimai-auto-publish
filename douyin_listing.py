@@ -2756,9 +2756,18 @@ class DouyinListing:
                     # report the actual page state.
                     skipped_values[page_label] = str(value)
                     if self.logger is not None:
+                        omitted = bool(
+                            self.attribute_runtime is not None
+                            and self.attribute_runtime.intentionally_omitted(
+                                "douyin", page_label
+                            )
+                        )
                         self.logger.info(
-                            "抖音属性“%s”按审核结果不填写，已从回读目标移除",
+                            "抖音属性“%s”%s，已从回读目标移除",
                             page_label,
+                            "按已确认审核结果不填写"
+                            if omitted
+                            else "审核尚未确认，暂不填写",
                         )
                 else:
                     applied[page_label] = resolved_value
