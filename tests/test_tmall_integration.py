@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import kuaimai_erp
+from model_judgments import summarize
 from tmall_form_listing import TmallFormListingError, TmallProductWriteRequired
 from tmall_size_sources import TmallSizeReviewRequired
 
@@ -83,6 +84,7 @@ def _product():
             },
         ),
         category_hints=("男装", "休闲裤"),
+        garment_kind="pants",
     )
 
 
@@ -91,6 +93,9 @@ def _listing(require_full_form_error=None):
         open=AsyncMock(),
         apply_recommended_category=AsyncMock(return_value="男装 > 休闲裤"),
         fill_product_identity=AsyncMock(return_value={"style_code": "STYLE-TMALL"}),
+        restore_product_season=AsyncMock(return_value="2026年秋季"),
+        fill_leather_shoe_listing_date=AsyncMock(return_value=None),
+        fill_initial_product_materials=AsyncMock(return_value={}),
         require_full_form=AsyncMock(),
         inspect_initial_product_images=AsyncMock(
             return_value={"count": 1, "expected_count": 1, "decoded": True}
@@ -601,10 +606,10 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         controls.prepare_taobao_publish_dialog.assert_not_awaited()
         controls.submit_taobao_publish_dialog.assert_not_awaited()
         listing.require_full_form.assert_awaited_once()
-        listing.wait_for_initial_product_images.assert_awaited_once_with(
+        listing.inspect_initial_product_images.assert_awaited_once_with(
             expected_count=len(_product().main_images),
-            timeout_seconds=self._args().upload_timeout
         )
+        listing.wait_for_initial_product_images.assert_not_awaited()
         listing.sync_initial_product_images.assert_awaited_once_with(
             _product().main_images,
             timeout_seconds=self._args().upload_timeout,
@@ -615,6 +620,27 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
             expected_image_count=len(_product().main_images),
         )
         controls.resolve_tmall_size_sources.assert_called_once()
+
+    async def test_image_reset_season_is_restored_before_initial_materials_and_final_validation(self):
+        listing = _listing(TmallProductWriteRequired("首次产品信息"))
+        state = {'season': True}
+        async def reset(*args, **kwargs):
+            state['season'] = False
+            return {'count': 5}
+        async def restore(*args, **kwargs):
+            state['season'] = True
+            return '2026年秋季'
+        async def require_season(*args, **kwargs):
+            self.assertTrue(state['season'], '图片替换清空了上市季节，必须恢复后才能继续')
+            return {}
+        listing.sync_initial_product_images.side_effect = reset
+        listing.sync_inherited_main_images.side_effect = reset
+        listing.restore_product_season.side_effect = restore
+        listing.fill_initial_product_materials = AsyncMock(side_effect=require_season)
+        listing.validate_remaining_required_fields.side_effect = require_season
+        with tempfile.TemporaryDirectory() as directory, self._patched_flow(listing):
+            await kuaimai_erp.run_browser_automation(self._args(), _product(), Path(directory), LOGGER)
+        self.assertEqual(listing.restore_product_season.await_count, 2)
 
     async def test_existing_tmall_form_does_not_wait_for_first_time_sync(self):
         listing = _listing()
@@ -674,23 +700,36 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_initial_image_timeout_records_stage_and_never_publishes(self):
         listing = _listing(TmallProductWriteRequired("首次待发布"))
+        listing.inspect_initial_product_images.return_value = {
+            "count": 0,
+            "expected_count": 1,
+            "decoded": False,
+        }
         listing.wait_for_initial_product_images.side_effect = TmallFormListingError(
             "图片同步未完成：1/5"
         )
+        listing.sync_initial_product_images.side_effect = TmallFormListingError(
+            "本地图片上传失败"
+        )
         with tempfile.TemporaryDirectory() as directory, self._patched_flow(listing):
-            with self.assertRaisesRegex(TmallFormListingError, "1/5"):
+            with self.assertRaisesRegex(TmallFormListingError, "上传失败"):
                 await kuaimai_erp.run_browser_automation(
                     self._args(), _product(), Path(directory), LOGGER
                 )
             report = (Path(directory) / "tmall-review-required.json").read_text()
-            self.assertIn("tmall_initial_product_images_ready_review_required", report)
+            self.assertIn("tmall_initial_product_images_review_required", report)
             self.assertIn('"form_mode": "initial"', report)
-        listing.sync_initial_product_images.assert_not_awaited()
+        listing.sync_initial_product_images.assert_awaited_once()
         listing.publish_product_information.assert_not_awaited()
         listing.fill_attributes.assert_not_awaited()
 
     async def test_async_product_match_repairs_images_without_publishing(self):
         listing = _listing(TmallProductWriteRequired("首次待发布"))
+        listing.inspect_initial_product_images.return_value = {
+            "count": 0,
+            "expected_count": 1,
+            "decoded": False,
+        }
         listing.wait_for_initial_product_images.side_effect = [
             {"count": 1, "matched_existing_product": True, "decoded": False},
             {"count": 5, "decoded": True},
@@ -764,14 +803,21 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 class TmallMainErrorIntegrationTests(unittest.TestCase):
     def test_product_write_required_is_reported_as_safe_business_error(self):
+        self._assert_business_error(TmallProductWriteRequired("天猫后续表单需要独立写入"), "tmall")
+
+    def test_jd_loading_failure_reports_specific_business_error(self):
+        self._assert_business_error(
+            kuaimai_erp.JdFormListingError("京东资料尚未加载完整：SKU属性批量设置入口未出现"), "jd"
+        )
+
+    def test_unexpected_failure_also_requests_diagnosis(self):
+        self._assert_business_error(RuntimeError("unexpected"), "jd", unexpected=True)
+
+    def _assert_business_error(self, error, platform, unexpected=False):
         logger = Mock()
         save = AsyncMock()
         publish = AsyncMock()
-        browser_run = AsyncMock(
-            side_effect=TmallProductWriteRequired(
-                "天猫后续表单需要独立写入"
-            )
-        )
+        browser_run = AsyncMock(side_effect=error)
         with patch.object(
             kuaimai_erp, "setup_logging", return_value=logger
         ), patch.object(
@@ -790,14 +836,21 @@ class TmallMainErrorIntegrationTests(unittest.TestCase):
             kuaimai_erp, "publish_to_selected_douyin_shops", new=publish
         ), patch.object(
             Path, "write_text", autospec=True
+        ), patch.object(kuaimai_erp, "diagnose_failure") as diagnose, patch.object(
+            kuaimai_erp, "write_model_judgment_report", return_value={"summary": summarize([], [])}
         ), patch(
-            "sys.argv", ["kuaimai_erp", "--platform", "tmall", "--no-save"]
+            "sys.argv", ["kuaimai_erp", "--platform", platform, "--no-save"]
         ):
             result = kuaimai_erp.main()
 
-        self.assertEqual(result, 2)
-        logger.error.assert_called_once()
-        logger.exception.assert_not_called()
+        self.assertEqual(result, 1 if unexpected else 2)
+        if unexpected:
+            logger.exception.assert_called_once()
+        else:
+            logger.error.assert_called_once_with("%s", error)
+            logger.exception.assert_not_called()
+        diagnose.assert_called_once()
+        self.assertIs(diagnose.call_args.args[0], error)
         save.assert_not_awaited()
         publish.assert_not_awaited()
 

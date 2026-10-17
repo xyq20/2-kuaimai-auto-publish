@@ -20,7 +20,9 @@ from size_image_recognition import (
     OCRToken,
     RecognitionError,
     SkuRecommendation,
+    parse_clothing_measurement_table,
     parse_measurement_table,
+    parse_size_names,
     parse_size_lengths,
     recognize_recommendations,
     vision_ocr,
@@ -47,6 +49,28 @@ def _measurement_tokens(*, sizes=("S", "M")):
         tokens.append(_token(size, x, 0.10))
         for y, value in zip((0.30, 0.50, 0.70), column_values):
             tokens.append(_token(str(value), x, y))
+    return tuple(tokens)
+
+
+def _wool_clothing_tokens():
+    """Table text and positions from the NGBL-2024 Vision OCR output."""
+    tokens = [
+        _token("衣长/ENGTH", 0.224, 0.638, width=0.129, height=0.022),
+        _token("胸围/BUST", 0.235, 0.687, width=0.103, height=0.020),
+        _token("袖长/SLEEVE LENGTH", 0.183, 0.737, width=0.203, height=0.022),
+        _token("袖围/BICEP", 0.231, 0.789, width=0.108, height=0.023),
+    ]
+    for size, x, measurements in (
+        ("M", 0.473, (68, 104, 78, 18)),
+        ("L", 0.570, (70, 108, 79, 19)),
+        ("XL", 0.670, (72, 112, 80, 20)),
+        ("2XL", 0.769, (74, 116, 81, 21)),
+    ):
+        tokens.append(_token(size, x, 0.572, height=0.022))
+        tokens.extend(
+            _token(str(value), x, y, height=0.022)
+            for value, y in zip(measurements, (0.638, 0.690, 0.740, 0.793))
+        )
     return tuple(tokens)
 
 
@@ -174,6 +198,156 @@ class VisionOCRUnitTests(unittest.TestCase):
             [("S", 62.5), ("M", 64.5)],
         )
 
+    def test_douyin_clothing_reads_all_visible_measurement_rows(self):
+        tokens = (
+            _token("S", 0.40, 0.10),
+            _token("M", 0.60, 0.10),
+            _token("衣长/LENGTH", 0.05, 0.30, width=0.20),
+            _token("肩宽/SHOULDER WIDTH", 0.05, 0.45, width=0.20),
+            _token("胸围/BUST", 0.05, 0.60, width=0.20),
+            _token("袖长/SLEEVE LENGTH", 0.05, 0.75, width=0.20),
+            _token("63.5", 0.40, 0.30),
+            _token("65", 0.60, 0.30),
+            _token("55", 0.40, 0.45),
+            _token("56.5", 0.60, 0.45),
+            _token("125", 0.40, 0.60),
+            _token("129", 0.60, 0.60),
+            _token("56", 0.40, 0.75),
+            _token("57", 0.60, 0.75),
+        )
+
+    def test_douyin_clothing_defaults_missing_shoulder_width(self):
+        tokens = (
+            _token("S", 0.40, 0.10),
+            _token("M", 0.60, 0.10),
+            _token("L", 0.80, 0.10),
+            _token("衣长/LENGTH", 0.05, 0.30, width=0.20),
+            _token("胸围/BUST", 0.05, 0.45, width=0.20),
+            _token("袖长/SLEEVE LENGTH", 0.05, 0.60, width=0.20),
+            _token("63", 0.40, 0.30), _token("65", 0.60, 0.30), _token("67", 0.80, 0.30),
+            _token("110", 0.40, 0.45), _token("114", 0.60, 0.45), _token("118", 0.80, 0.45),
+            _token("56", 0.40, 0.60), _token("57", 0.60, 0.60), _token("58", 0.80, 0.60),
+        )
+
+        actual = parse_clothing_measurement_table(tokens, ("S", "M", "L"), source="缺少肩宽的尺码表")
+
+        self.assertEqual([actual[size]["shoulder"] for size in ("S", "M", "L")], [10, 11, 12])
+
+    def test_douyin_clothing_recombines_split_sleeve_label(self):
+        tokens = (
+            _token("S", 0.40, 0.10), _token("M", 0.60, 0.10),
+            _token("衣长/LENGTH", 0.05, 0.30, width=0.20),
+            _token("胸围/BUST", 0.05, 0.45, width=0.18),
+            _token("肩宽/SHOULDER", 0.05, 0.60, width=0.20),
+            _token("SLEEVE", 0.05, 0.75, width=0.18), _token("LENGTH", 0.25, 0.75, width=0.10),
+            _token("63", 0.40, 0.30), _token("64", 0.60, 0.30),
+            _token("110", 0.40, 0.45), _token("114", 0.60, 0.45),
+            _token("48", 0.40, 0.60), _token("49", 0.60, 0.60),
+            _token("63", 0.40, 0.75), _token("64", 0.60, 0.75),
+        )
+        actual = parse_clothing_measurement_table(tokens, ("S", "M"), source="拆分英文尺码表")
+        self.assertEqual(actual["S"]["sleeve"], 63)
+        self.assertEqual(actual["M"]["sleeve"], 64)
+
+    def test_douyin_clothing_accepts_common_ocr_misread_for_sleeve(self):
+        tokens = (
+            _token("S", 0.47, 0.075), _token("M", 0.57, 0.075),
+            _token("L", 0.67, 0.075), _token("XL", 0.76, 0.075),
+            _token("衣长/LENGTH", 0.22, 0.17),
+            _token("肩宽/SHOULDER WIDTH", 0.17, 0.245),
+            _token("胸围/BUST", 0.23, 0.32),
+            _token("神长/SLEEVE LENGTH", 0.18, 0.393),
+            _token("袖口/CUFF", 0.23, 0.468),
+            *(_token(value, x, y) for y, values in ((0.17, ("66.5", "68.5", "70.5", "72.5")), (0.245, ("48", "49.5", "51", "52.5")), (0.32, ("114", "118", "122", "126")), (0.393, ("63", "64", "65", "66"))) for x, value in zip((0.47, 0.57, 0.67, 0.76), values)),
+        )
+        actual = parse_clothing_measurement_table(tokens, ("S", "M", "L", "XL"), source="真实 OCR 尺码表")
+        self.assertEqual([actual[size]["sleeve"] for size in ("S", "M", "L", "XL")], [63, 64, 65, 66])
+
+    def test_douyin_clothing_ignores_extra_cuff_row_when_bounding_cells(self):
+        tokens = (
+            _token("S", 0.46, 0.07),
+            _token("M", 0.56, 0.07),
+            _token("衣长/LENGTH", 0.20, 0.17, width=0.14),
+            _token("胸围/BUST", 0.22, 0.25, width=0.11),
+            _token("袖长/SLEEVE LENGTH", 0.17, 0.33, width=0.21),
+            _token("袖口/CUFF", 0.22, 0.40, width=0.11),
+            _token("肩宽/SHOULDER", 0.20, 0.48, width=0.17),
+            _token("63", 0.46, 0.17),
+            _token("65", 0.56, 0.17),
+            _token("112", 0.46, 0.25),
+            _token("116", 0.56, 0.25),
+            _token("78", 0.46, 0.33),
+            _token("79", 0.56, 0.33),
+            _token("24", 0.46, 0.40),
+            _token("25", 0.56, 0.40),
+            _token("10", 0.46, 0.48),
+            _token("11", 0.56, 0.48),
+        )
+
+        actual = parse_clothing_measurement_table(tokens, ("S", "M"), source="上装尺码表")
+
+        self.assertEqual(actual["S"]["sleeve"], 78)
+        self.assertEqual(actual["M"]["sleeve"], 79)
+        self.assertEqual(actual["S"]["shoulder"], 10)
+
+    def test_discovers_clothing_sizes_from_unique_length_header(self):
+        tokens = (
+            _token("上装/Topcoat", 0.17, 0.43, width=0.20),
+            _token("S", 0.46, 0.51),
+            _token("M", 0.56, 0.51),
+            _token("L", 0.66, 0.51),
+            _token("XL", 0.76, 0.51),
+            _token("衣长/LENGTH", 0.21, 0.59, width=0.14),
+            _token("63.5", 0.46, 0.59),
+            _token("65", 0.56, 0.59),
+        )
+
+        self.assertEqual(
+            parse_size_names(tokens, "clothing", source="外套尺码表"),
+            ("S", "M", "L", "XL"),
+        )
+
+    def test_discovers_sizes_when_bilingual_length_label_loses_english_letter(self):
+        self.assertEqual(
+            parse_size_names(_wool_clothing_tokens(), "clothing"),
+            ("M", "L", "XL", "2XL"),
+        )
+
+    def test_reads_lengths_when_bilingual_label_loses_english_letter(self):
+        actual = parse_size_lengths(
+            _wool_clothing_tokens(), ("M", "L", "XL", "2XL"), "clothing"
+        )
+        self.assertEqual(
+            [(item.size, item.length) for item in actual],
+            [("M", 68), ("L", 70), ("XL", 72), ("2XL", 74)],
+        )
+
+    def test_reads_clothing_measurements_when_length_label_loses_english_letter(self):
+        actual = parse_clothing_measurement_table(
+            _wool_clothing_tokens(), ("M", "L", "XL", "2XL")
+        )
+        self.assertEqual(
+            [actual[size]["length"] for size in ("M", "L", "XL", "2XL")],
+            [68, 70, 72, 74],
+        )
+        self.assertEqual(
+            [actual[size]["sleeve"] for size in ("M", "L", "XL", "2XL")],
+            [78, 79, 80, 81],
+        )
+
+    def test_bilingual_length_repair_requires_exact_chinese_and_bounded_english(self):
+        aliases = size_image_recognition._CLOTHING_MEASUREMENT_ALIASES["length"]
+        for text in (
+            "ENGTH", "衣服/ENGTH", "衣长/SLEEVE LENGTH", "衣长/BUST",
+            "衣长/EGTH", "请填写衣长/ENGTH", "衣长/ENGTH 推荐",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(size_image_recognition._matches_alias_composition(text, aliases))
+
+    def test_size_discovery_rejects_unknown_product_family(self):
+        with self.assertRaisesRegex(RecognitionError, "不支持"):
+            parse_size_names(_measurement_tokens(), "footwear")
+
     @patch("size_image_recognition.subprocess.run")
     def test_rejects_other_malformed_token_schema(self, run):
         valid = {"text": "S", "confidence": 0.9, "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.1}
@@ -181,6 +355,36 @@ class VisionOCRUnitTests(unittest.TestCase):
             with self.subTest(item=item):
                 run.return_value = _completed_process([item])
                 with self.assertRaisesRegex(RecognitionError, "OCR 输出格式无效"):
+                    vision_ocr(self.image_path)
+
+    @patch("size_image_recognition.subprocess.run")
+    def test_clips_small_edge_overflow_without_shifting_opposite_edge(self, run):
+        valid = {"text": "模特：航仔", "confidence": 1, "x": 0.44, "y": 0.2, "width": 0.1, "height": 0.02518016236847065}
+        cases = [
+            ({"y": -0.0003389324337117472}, "y", "height", 0.02518016236847065 - 0.0003389324337117472),
+            ({"x": -0.0004}, "x", "width", 0.0996),
+            ({"x": 0.9004}, "x", "width", 0.0996),
+            ({"y": 0.9752}, "y", "height", 0.0248),
+        ]
+        for overrides, position, extent, expected in cases:
+            with self.subTest(overrides=overrides):
+                run.return_value = _completed_process([{**valid, **overrides}])
+                token, = vision_ocr(self.image_path)
+                self.assertEqual(token.text, valid['text'])
+                self.assertGreaterEqual(getattr(token, position), 0)
+                self.assertAlmostEqual(getattr(token, extent), expected)
+                self.assertLessEqual(token.x + token.width, 1)
+                self.assertLessEqual(token.y + token.height, 1)
+
+    @patch("size_image_recognition.subprocess.run")
+    def test_edge_compatibility_rejects_large_or_empty_boxes(self, run):
+        valid = {"text":"S", "confidence":.9, "x":.1, "y":.2, "width":.1, "height":.1}
+        for overrides in ({'y':-.002}, {'x':.9011}, {'y':1.0001},
+                          {'x':-.0008,'width':.0002}, {'width':0}, {'height':-0.0001},
+                          {'confidence':1.0001}, {'y':math.nan}, {'x':True}):
+            with self.subTest(overrides=overrides):
+                run.return_value = _completed_process([{**valid, **overrides}])
+                with self.assertRaises(RecognitionError):
                     vision_ocr(self.image_path)
 
     @patch("size_image_recognition.subprocess.run")
@@ -403,6 +607,49 @@ class SwiftBridgeCompilationTests(unittest.TestCase):
 
 
 class SizeRecommendationParserTests(unittest.TestCase):
+    def test_size_labels_accept_ocr_multiplication_sign_without_accepting_dimensions(self):
+        for text, expected in (("2×L", "2XL"), ("×L", "XL"), (" 2 × l ", "2XL"), ("2XL", "2XL")):
+            with self.subTest(text=text):
+                self.assertEqual(size_image_recognition._normalize_size(text), expected)
+        for text in ("2×4", "2×L推荐", "2×", "20×30CM"):
+            with self.subTest(text=text):
+                self.assertIsNone(size_image_recognition._normalize_size(text))
+
+    def test_measurement_table_matches_ocr_cross_label_to_excel_size(self):
+        actual = parse_measurement_table(
+            _measurement_tokens(sizes=("XL", "2×L")),
+            ("XL", "2XL"),
+        )
+        self.assertEqual(
+            actual,
+            {
+                "XL": size_image_recognition.SizeMeasurements(80, 106, 104),
+                "2XL": size_image_recognition.SizeMeasurements(84, 110, 106),
+            },
+        )
+
+    @unittest.skipUnless(
+        Path("/Volumes/共享文件/谭/products/救援队+NGBL-2035").is_dir(),
+        "需要漏识别 2XL 的原始商品图片",
+    )
+    def test_rescue_product_2xl_range_and_measurements_are_recognized(self):
+        product = Path("/Volumes/共享文件/谭/products/救援队+NGBL-2035")
+        result = recognize_recommendations(
+            product / "尺码信息表/1_08.jpg",
+            product / "身高体重推荐表/1_09.jpg",
+            ("S", "M", "L", "XL", "2XL"),
+        )
+        self.assertEqual(
+            result,
+            (
+                SkuRecommendation("S", 155, 160, 50, 60, 77, 112, 49),
+                SkuRecommendation("M", 160, 170, 60, 70, 81, 116, 50),
+                SkuRecommendation("L", 170, 180, 70, 80, 85, 120, 51),
+                SkuRecommendation("XL", 180, 190, 80, 90, 89, 124, 52),
+                SkuRecommendation("2XL", 190, 200, 90, 100, 93, 128, 53),
+            ),
+        )
+
     def test_measurement_aliases_do_not_confuse_shipping_text_with_hip(self):
         for text in ("HIPLINE", "臀围", "臀围/HIPLINE"):
             with self.subTest(text=text):
@@ -501,6 +748,19 @@ class SizeRecommendationParserTests(unittest.TestCase):
     "需要 macOS Vision 和 xcrun 才能运行本地 OCR 集成测试",
 )
 class VisionOCRIntegrationTests(unittest.TestCase):
+    def test_top_edge_roundoff_does_not_reject_valid_size_chart(self):
+        image = FIXTURE_IMAGE.with_name("vision_ocr_top_edge.jpg")
+        tokens = vision_ocr(image)
+        rows = parse_measurement_table(tokens, ("S", "M", "L", "XL", "2XL"))
+        self.assertEqual(
+            {size: (row.waist, row.hip, row.length) for size, row in rows.items()},
+            {
+                "S": (76, 102, 102), "M": (80, 106, 104),
+                "L": (84, 110, 106), "XL": (88, 114, 108),
+                "2XL": (92, 118, 110),
+            },
+        )
+
     def test_oriented_fixture_recognizes_labels_and_top_left_y_coordinates(self):
         tokens = vision_ocr(FIXTURE_IMAGE)
         recognized = " ".join(token.text.upper() for token in tokens)
@@ -523,3 +783,4 @@ class VisionOCRIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    parse_clothing_measurement_table,

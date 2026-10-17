@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Optional, Tuple
 
 
@@ -141,16 +142,49 @@ def get_platform_spec(value: str) -> PlatformSpec:
     raise ValueError("unknown platform: {0}".format(value))
 
 
+def canonical_platform_name(value: object) -> str:
+    """Return the runner name for either a runner name or persisted platform id."""
+    text = str(value or "").strip()
+    try:
+        return get_platform_spec(text).cli_name
+    except ValueError:
+        return text
+
+
+def platforms_equivalent(left: object, right: object) -> bool:
+    return canonical_platform_name(left) == canonical_platform_name(right)
+
+
 def expand_platform_selection(value: str) -> Tuple[PlatformSpec, ...]:
-    if value == "all":
+    text = value.strip()
+    if text == "all":
         return tuple(spec for spec in PLATFORM_SPECS if spec.enabled_in_all)
-    return (get_platform_spec(value),)
+    names = tuple(part for part in re.split(r"[,，、\s]+", text) if part)
+    if not names:
+        raise ValueError("unknown platform: empty selection")
+    # Resolve aliases before deduplication; preserve the user's chosen order.
+    return tuple(dict.fromkeys(get_platform_spec(name) for name in names))
+
+
+def normalize_platform_selection(value: str) -> str:
+    selected = expand_platform_selection(value)
+    if value.strip() == "all":
+        return "all"
+    return ",".join(spec.cli_name for spec in selected)
+
+
+def is_all_platform_selection(value: str) -> bool:
+    return normalize_platform_selection(value) == "all"
 
 
 __all__ = [
     "PLATFORM_SPECS",
     "PlatformSpec",
+    "canonical_platform_name",
     "expand_platform_selection",
     "get_platform_spec",
+    "is_all_platform_selection",
+    "normalize_platform_selection",
     "platform_cli_choices",
+    "platforms_equivalent",
 ]

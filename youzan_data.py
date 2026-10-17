@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from category_profile import is_footwear_category
+from category_profile import category_input_levels
+
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -73,11 +76,7 @@ def _category_values(fields: Mapping[str, Any]) -> Tuple[str, ...]:
 
 
 def _category_path(value: str) -> Tuple[str, ...]:
-    return tuple(
-        part.strip()
-        for part in re.split(r"[/／>＞]", value)
-        if part.strip()
-    )
+    return tuple("/".join(level) for level in category_input_levels(value))
 
 
 def parse_youzan_fields(fields: Mapping[str, Any]) -> YouzanFields:
@@ -103,7 +102,9 @@ def parse_youzan_fields(fields: Mapping[str, Any]) -> YouzanFields:
     has_pants = "裤" in category_text
     has_coat = any(token in category_text for token in ("外套", "皮衣"))
     garment_kind = (
-        "pants"
+        "footwear"
+        if is_footwear_category(category_text)
+        else "pants"
         if has_pants and not has_coat
         else "coat"
         if has_coat and not has_pants

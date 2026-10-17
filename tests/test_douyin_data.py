@@ -1,4 +1,5 @@
 import json
+import errno
 import tempfile
 import unittest
 from pathlib import Path
@@ -85,11 +86,29 @@ class DouyinFieldParsingTests(unittest.TestCase):
     def test_parses_supported_material_syntaxes(self):
         self.assertEqual(parse_materials("棉（100%）"), (MaterialComponent("棉", 100),))
         self.assertEqual(parse_materials("棉/100%"), (MaterialComponent("棉", 100),))
+        self.assertEqual(
+            parse_materials("棉100%/棉/棉布"),
+            (MaterialComponent("棉", 100),),
+        )
 
     def test_parses_multiple_materials_in_source_order(self):
         self.assertEqual(
-            parse_materials("棉（70%）/聚酯纤维（30%）"),
-            (MaterialComponent("棉", 70), MaterialComponent("聚酯纤维", 30)),
+            parse_materials("棉（100%）/棉布/纯棉"),
+            (MaterialComponent("棉", 100),),
+        )
+        self.assertEqual(
+            parse_materials("棉94%，氨纶6%"),
+            (MaterialComponent("棉", 94), MaterialComponent("氨纶", 6)),
+        )
+        self.assertEqual(
+            parse_materials("棉（94%）；氨纶（6%）"),
+            (MaterialComponent("棉", 94), MaterialComponent("氨纶", 6)),
+        )
+
+    def test_slash_candidates_do_not_create_extra_material_rows(self):
+        self.assertEqual(
+            parse_materials("棉100%/氨纶6%"),
+            (MaterialComponent("棉", 100),),
         )
 
     def test_rejects_incomplete_or_malformed_material_percentages(self):
@@ -98,12 +117,32 @@ class DouyinFieldParsingTests(unittest.TestCase):
                 with self.assertRaisesRegex(DouyinDataError, "百分比合计|格式不正确"):
                     parse_materials(value)
 
+    def test_accepts_single_plain_material_as_one_hundred_percent(self):
+        self.assertEqual(parse_materials("羊皮"), (MaterialComponent("羊皮", 100),))
+
+    def test_does_not_invent_percentages_for_multiple_plain_materials(self):
+        with self.assertRaisesRegex(DouyinDataError, "格式不正确"):
+            parse_materials("羊皮，牛皮")
+
     def test_uses_standalone_material_common_name_as_material_source(self):
         fields = dict(CURRENT_PRODUCT_FIELDS)
         del fields["面料材质/水洗标/吊牌图/面料"]
         fields["面料俗称"] = "棉/100%"
 
         self.assertEqual(parse_douyin_fields(fields).materials, (MaterialComponent("棉", 100),))
+
+    def test_shoe_fields_without_fabric_material_retain_shoe_attributes(self):
+        fields = dict(CURRENT_PRODUCT_FIELDS)
+        del fields["面料材质/水洗标/吊牌图/面料"]
+        fields["鞋面材质"] = "牛皮"
+        fields["鞋底材质"] = "橡胶"
+
+        result = parse_douyin_fields(fields)
+
+        self.assertEqual(result.materials, ())
+        self.assertEqual(result.materials_text, "")
+        self.assertEqual(result.attributes["鞋面材质"], "牛皮")
+        self.assertEqual(result.attributes["鞋底材质"], "橡胶")
 
     def test_rejects_missing_required_fields(self):
         fields = dict(CURRENT_PRODUCT_FIELDS)
@@ -170,6 +209,15 @@ class DouyinFieldParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(DouyinDataError, "价格不是有效数字"):
             parse_douyin_fields(fields)
 
+    def test_accepts_trailing_yuan_but_rejects_ambiguous_price_suffix(self):
+        fields = dict(CURRENT_PRODUCT_FIELDS)
+        fields["价格/京东价/市场价/售卖价/售价"] = "690元"
+        self.assertEqual(parse_douyin_fields(fields).price, "690")
+
+        fields["价格/京东价/市场价/售卖价/售价"] = "690元起"
+        with self.assertRaisesRegex(DouyinDataError, "价格不是有效数字"):
+            parse_douyin_fields(fields)
+
     def test_rejects_invalid_material_percentages(self):
         with self.assertRaisesRegex(DouyinDataError, "0 到 100"):
             parse_materials("棉（101%）")
@@ -196,6 +244,45 @@ class DouyinAssetDiscoveryTests(unittest.TestCase):
             self.assertEqual(result.wash_label_images, (first, tenth, second))
             self.assertEqual(result.size_chart_image, size_chart)
             self.assertEqual(result.height_weight_image, height_weight)
+
+    def test_wash_label_filename_is_not_used_for_matching(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            label = self._write_image(
+                product_dir / "水洗标图片", "吊牌正面-任意名称.jpeg"
+            )
+            size_chart = self._write_image(product_dir / "尺码信息表", "size.jpg")
+            recommendation = self._write_image(
+                product_dir / "身高体重推荐表", "recommendation.jpg"
+            )
+
+            result = read_douyin_assets(product_dir)
+
+            self.assertEqual(result.wash_label_images, (label,))
+            self.assertEqual(result.size_chart_image, size_chart)
+            self.assertEqual(result.height_weight_image, recommendation)
+
+    def test_allows_missing_wash_label_so_page_schema_can_decide_requirement(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            size_chart = self._write_image(product_dir / "尺码信息表", "size.jpg")
+            recommendation = self._write_image(
+                product_dir / "身高体重推荐表", "recommendation.jpg"
+            )
+
+            result = read_douyin_assets(product_dir)
+
+            self.assertEqual(result.wash_label_images, ())
+            self.assertEqual(result.size_chart_image, size_chart)
+            self.assertEqual(result.height_weight_image, recommendation)
+
+    def test_footwear_does_not_require_clothing_recommendation_images(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            result = read_douyin_assets(product_dir, garment_kind="footwear")
+
+            self.assertIsNone(result.size_chart_image)
+            self.assertIsNone(result.height_weight_image)
 
     def test_requires_exactly_one_size_and_recommendation_image(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -224,6 +311,27 @@ class DouyinAssetDiscoveryTests(unittest.TestCase):
 
 
 class KuaimaiIntegrationTests(unittest.TestCase):
+    def test_read_excel_fields_uses_named_columns_and_skips_filter_header(self):
+        rows = (
+            ("序号", "内容", "备注", "属性筛选"),
+            (1, "基础商品标题", None, "商品标题/商品名称"),
+            (2, "NGBL-2068", None, "货号/商家外部编码"),
+        )
+
+        self.assertEqual(
+            kuaimai_erp.read_excel_fields(rows),
+            {
+                "商品标题/商品名称": "基础商品标题",
+                "货号/商家外部编码": "NGBL-2068",
+            },
+        )
+
+    def test_read_excel_fields_rejects_duplicate_labels(self):
+        rows = (("属性", "内容"), ("颜色", "绿色"), ("颜色", "蓝色"))
+
+        with self.assertRaisesRegex(kuaimai_erp.AutomationError, "重复字段.*颜色"):
+            kuaimai_erp.read_excel_fields(rows)
+
     def test_read_excel_fields_and_product_summary_keep_douyin_data_serializable(self):
         rows = (("导购短标题", "短标题", None), ("现货库存", 0, None))
         fields = kuaimai_erp.read_excel_fields(rows)
@@ -301,6 +409,36 @@ class KuaimaiIntegrationTests(unittest.TestCase):
 
 
 class ProductDataReadIntegrationTests(unittest.TestCase):
+    def test_file_io_failure_reports_source_path_as_input_error(self):
+        source = Path("/Volumes/共享文件/谭/products/地头蛇+ML1003/产品信息.xlsx")
+        with patch("io.open", side_effect=OSError(errno.EIO, "Input/output error")):
+            with self.assertRaises(Exception) as caught:
+                kuaimai_erp.read_product_data(source)
+        self.assertIsInstance(caught.exception, kuaimai_erp.AutomationError)
+        self.assertIn(str(source), str(caught.exception))
+        self.assertIn("Input/output error", str(caught.exception))
+        self.assertNotIn("File is not a zip file", str(caught.exception))
+
+    def test_new_product_reports_same_file_io_failure(self):
+        source = Path("/Volumes/共享文件/谭/products/地头蛇+ML1003/产品信息.xlsx")
+        with patch("io.open", side_effect=OSError(errno.EIO, "Input/output error")):
+            with self.assertRaises(Exception) as caught:
+                kuaimai_erp.read_new_product_seed(source)
+        self.assertIsInstance(caught.exception, kuaimai_erp.AutomationError)
+        self.assertIn(str(source), str(caught.exception))
+        self.assertIn("Input/output error", str(caught.exception))
+
+    def test_readable_invalid_excel_is_distinct_from_file_io_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source = Path(temporary_directory) / "产品信息.xlsx"
+            source.write_bytes(b"this is not an xlsx workbook")
+            with self.assertRaises(Exception) as caught:
+                kuaimai_erp.read_product_data(source)
+            self.assertIsInstance(caught.exception, kuaimai_erp.AutomationError)
+            self.assertIn(str(source), str(caught.exception))
+            self.assertIn("格式", str(caught.exception))
+            self.assertNotIn("Input/output error", str(caught.exception))
+
     def _write_image(self, directory: Path, name: str = "1.png") -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / name
@@ -348,13 +486,28 @@ class ProductDataReadIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(product.wxsph_fields)
             self.assertEqual(product.wxsph_fields.fields["吊牌价/价格/基本售价"], "586")
 
+    def test_read_product_data_uses_field_name_after_filter_header(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            product_dir = Path(temporary_directory)
+            self._write_legacy_images(product_dir)
+            excel_path = self._write_excel(
+                product_dir,
+                [("属性", "内容"), *self._base_fields()],
+            )
+
+            product = kuaimai_erp.read_product_data(excel_path)
+
+        self.assertEqual(product.title, "基础商品标题")
+        self.assertEqual(product.style_code, "NGBL-10588")
+        self.assertEqual(product.base_price, "586")
+
     def test_read_product_data_rejects_partial_douyin_signals(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             product_dir = Path(temporary_directory)
             self._write_legacy_images(product_dir)
             excel_path = self._write_excel(product_dir, self._base_fields() + [("导购短标题", "短标题")])
 
-            with self.assertRaisesRegex(DouyinDataError, "面料材质"):
+            with self.assertRaisesRegex(DouyinDataError, "尺码"):
                 kuaimai_erp.read_product_data(excel_path)
 
     def test_non_douyin_platform_can_skip_partial_douyin_inputs(self):
@@ -400,7 +553,9 @@ class MainErrorHandlingTests(unittest.TestCase):
         logger = Mock()
         with patch.object(kuaimai_erp, "setup_logging", return_value=logger), patch.object(
             kuaimai_erp, "resolve_excel_path", return_value=Path("/input/产品信息.xlsx")
-        ), patch.object(kuaimai_erp, "read_product_data", side_effect=DouyinDataError("抖音资料不完整")), patch(
+        ), patch.object(kuaimai_erp, "read_product_data", side_effect=DouyinDataError("抖音资料不完整")), patch.object(
+            kuaimai_erp, "diagnose_failure"
+        ), patch(
             "sys.argv", ["kuaimai_erp", "--dry-run"]
         ):
             self.assertEqual(kuaimai_erp.main(), 2)

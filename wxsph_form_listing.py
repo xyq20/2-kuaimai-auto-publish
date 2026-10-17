@@ -6,19 +6,42 @@ platform form and reads it back; publishing remains disabled by the registry.
 
 from __future__ import annotations
 
+from field_policies import listing_date_text_value, positional_listing_date_value, without_color_attributes
+
+from store_freight import sync_store_freight
+
 import asyncio
 import json
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from playwright.async_api import Error as PlaywrightError
+
+from attribute_runtime import AttributeRequest, ResolvedAttribute
+from category_profile import category_profile, category_path_parts, category_search_terms, choose_category_candidate
+from canonical_fields import is_learning_managed_field
+from learning_models import CandidateValue, canonical_sha256
+from money_values import MoneyValueError, normalize_money_value
+from platform_candidate_source import (
+    select_supports_multiple,
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
+from wxsph_listing import parse_wxsph_attribute_fields
 
 from taobao_listing import (
     TaobaoListingError,
     excel_aliases,
+    material_name_groups,
     normalize_label,
     normalize_option,
+    preferred_exact_candidate_label,
     selection_value_groups,
+    selection_value_groups_for_control,
+    value_candidates,
 )
 from wxsph_data import WxsphFields
 from youzan_form_listing import YouzanFormListing, YouzanFormListingError
@@ -93,7 +116,7 @@ def _numeric_equal(actual: str, expected: str) -> bool:
 
 
 def _required_excel_value(
-    fields: Mapping[str, str], aliases: Sequence[str], label: str
+    fields: Mapping[str, str], aliases: Sequence[str], label: str, *, money: bool = False
 ) -> str:
     wanted = {normalize_label(alias) for alias in aliases}
     matches = [
@@ -107,6 +130,13 @@ def _required_excel_value(
                 label, "/".join(aliases)
             )
         )
+    if money:
+        try:
+            matches = [
+                (key, normalize_money_value(value)) for key, value in matches
+            ]
+        except MoneyValueError as exc:
+            raise WxsphFormListingError(f"Excel 微信小店{label}{exc}") from exc
     values = {value for _key, value in matches}
     if len(values) != 1:
         raise WxsphFormListingError(
@@ -129,11 +159,19 @@ def _first_excel_value(
     return None
 
 
+def _material_name_candidates(value: str) -> Tuple[str, ...]:
+    """Return one slash-joined OR group per comma-separated material.
+
+    Excel uses ``/`` as ordered OR.  A composition suffix belongs to the
+    material alternative itself; commas, enumeration commas and semicolons
+    introduce another material that a multi-select must choose as well.
+    """
+    return tuple("/".join(group) for group in material_name_groups(value))
+
+
 def _material_name(value: str) -> str:
-    text = str(value).strip()
-    text = re.sub(r"\s*[（(]\s*\d+(?:\.\d+)?\s*[%％]\s*[）)]\s*$", "", text)
-    text = re.sub(r"\s*/\s*\d+(?:\.\d+)?\s*[%％]\s*$", "", text)
-    return text.strip()
+    candidates = _material_name_candidates(value)
+    return candidates[0] if candidates else ""
 
 
 def _material_percentage(value: Optional[str]) -> Optional[str]:
@@ -149,6 +187,11 @@ def _material_percentage(value: Optional[str]) -> Optional[str]:
 
 
 def _material_content_text(value: str) -> str:
+    # 微信小店的“材质成分”是普通文本框。多成分时必须保留 Excel
+    # 的完整组合（例如“棉94%，氨纶6%”），不能只提取第一种材质。
+    source = str(value).strip()
+    if len(re.findall(r"\d+(?:\.\d+)?\s*[%％]", source)) >= 2:
+        return source
     name = _material_name(value)
     percentage = _material_percentage(value)
     if percentage is None:
@@ -159,11 +202,51 @@ def _material_content_text(value: str) -> str:
 class WxsphFormListing(YouzanFormListing):
     """Fill and read back WeChat Store attributes, SKU values and weight."""
 
+    attribute_platform_id = "wxsph"
+
     # 快麦在共享编辑抽屉中连续切换平台时，微信小店的页签和
     # 基础信息会先显示，类目属性则由另一个异步请求稍后渲染。
     attribute_wait_timeout_seconds = 30.0
     attribute_retry_after_seconds = 12.0
     attribute_stable_seconds = 0.75
+
+    def __init__(
+        self,
+        page: Any,
+        drawer: Any,
+        logger: Any,
+        *,
+        attribute_runtime: Optional[Any] = None,
+        category_hints: Sequence[str] = (),
+    ) -> None:
+        super().__init__(
+            page,
+            drawer,
+            logger,
+            attribute_runtime=attribute_runtime,
+        )
+        self.category_hints = tuple(
+            str(value).strip() for value in category_hints if str(value).strip()
+        )
+
+        # Install before the product editor is opened whenever the runner can
+        # construct this collector early. FastMai may eagerly request WeChat's
+        # category schema during the first drawer load and never request it
+        # again when the fifth platform tab is selected.
+        self._start_api_capture()
+        self.base_item_id = ""
+        self._resolved_api_options: Dict[str, Dict[str, Tuple[str, str]]] = {}
+
+    @staticmethod
+    def _selection_groups_for_control(
+        page_label: str,
+        value: object,
+        *,
+        multi: bool,
+        category_hints: Sequence[str] = (),
+    ) -> Tuple[Tuple[str, ...], ...]:
+        """Use the same ordered plans and final single-choice fallback globally."""
+        return selection_value_groups_for_control(page_label, value, multi=multi)
 
     def _start_api_capture(self) -> None:
         previous_handler = getattr(self, "_api_response_handler", None)
@@ -229,15 +312,770 @@ class WxsphFormListing(YouzanFormListing):
             "http_status": int(response.status),
             "body": "unavailable",
             "attribute_labels": (),
+            "attribute_fields": (),
+            "category_id": "",
         }
         try:
             payload = await response.json()
             observation["body"] = "json"
             observation["attribute_labels"] = self._api_attribute_labels(payload)
+            if path == "/wxsph/getCategoryProperties.json":
+                observation["attribute_fields"] = parse_wxsph_attribute_fields(
+                    payload
+                )
+                query = parse_qs(urlsplit(response.url).query)
+                category_ids = tuple(query.get("categoryId", ()))
+                if len(category_ids) == 1:
+                    observation["category_id"] = str(category_ids[0])
         except Exception:
             # 只记录脱敏后的结构摘要；响应正文和查询参数均不落盘。
             pass
+        previous = self._api_observations.get(path)
+        if (
+            path == "/wxsph/getCategoryProperties.json"
+            and previous is not None
+            and previous.get("attribute_fields")
+            and not observation.get("attribute_fields")
+        ):
+            # The page can issue a second, auxiliary category-properties call
+            # with an empty data set after the real leaf-category response. Do
+            # not let that later response erase the usable schema captured for
+            # the form currently visible in the drawer.
+            return
         self._api_observations[path] = observation
+
+    async def _captured_api_field(self, page_label: str) -> Tuple[Any, str]:
+        tasks = tuple(getattr(self, "_api_capture_tasks", ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        wanted = normalize_label(page_label)
+        matches = []
+        category_ids = []
+        for observation in getattr(self, "_api_observations", {}).values():
+            category_id = str(observation.get("category_id") or "").strip()
+            if category_id and category_id not in category_ids:
+                category_ids.append(category_id)
+            for field in observation.get("attribute_fields", ()):
+                if normalize_label(field.label) == wanted:
+                    matches.append(field)
+        unique = {
+            (field.source_id, field.schema_key): field
+            for field in matches
+        }
+        if len(unique) != 1:
+            raise WxsphFormListingError(
+                "微信小店属性“{0}”缺少唯一的接口 JSON 字段定义".format(
+                    page_label
+                )
+            )
+        if len(category_ids) != 1:
+            raise WxsphFormListingError(
+                "微信小店属性“{0}”缺少唯一的接口类目 ID".format(page_label)
+            )
+        return next(iter(unique.values())), category_ids[0]
+
+    async def _captured_api_attribute_field_count(self) -> int:
+        """Return the number of parsed category fields captured so far."""
+        tasks = tuple(getattr(self, "_api_capture_tasks", ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return sum(
+            len(tuple(observation.get("attribute_fields", ())))
+            for observation in getattr(self, "_api_observations", {}).values()
+        )
+
+    async def _request_api_attribute_schema(self) -> bool:
+        """Fetch the current category schema when the reused drawer stays quiet."""
+        base_item_id = str(getattr(self, "base_item_id", "") or "").strip()
+        if not base_item_id:
+            return False
+        try:
+            payloads = await self.page.evaluate(
+                """async ({baseItemId}) => {
+                  const requestJson = async (path, params) => {
+                    const url = new URL(path, window.location.origin);
+                    for (const [key, value] of Object.entries(params)) {
+                      url.searchParams.set(key, String(value));
+                    }
+                    const response = await fetch(url.toString(), {
+                      credentials: 'same-origin',
+                      headers: {'Accept': 'application/json'}
+                    });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    return await response.json();
+                  };
+                  const detail = await requestJson('/wxsph/detail.json', {
+                    baseItemId, api_name: 'wxsph_detail'
+                  });
+                  const unwrap = value => {
+                    let current = value;
+                    for (let attempt = 0; attempt < 4; attempt += 1) {
+                      if (!current || typeof current !== 'object') break;
+                      if ('result' in current && 'data' in current) {
+                        if (current.result === true || String(current.result) === '1') {
+                          current = current.data; continue;
+                        }
+                        return {};
+                      }
+                      if (typeof current.success === 'boolean' && 'data' in current) {
+                        if (current.success) { current = current.data; continue; }
+                        return {};
+                      }
+                      if ('code' in current && 'data' in current) {
+                        const code = String(current.code).toUpperCase();
+                        if (['0', '1', '200', 'OK', 'SUCCESS'].includes(code)) {
+                          current = current.data; continue;
+                        }
+                        return {};
+                      }
+                      break;
+                    }
+                    return current || {};
+                  };
+                  const detailBody = unwrap(detail);
+                  const categoryId = detailBody.categoryId || detailBody.category_id || '';
+                  if (!categoryId) return {detail, categoryId: '', properties: null};
+                  const properties = await requestJson(
+                    '/wxsph/getCategoryProperties.json',
+                    {shopId: '', categoryId, api_name: 'wxsph_getCategoryProperties'}
+                  );
+                  return {detail, categoryId: String(categoryId), properties};
+                }""",
+                {"baseItemId": base_item_id},
+            )
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warning("微信小店主动读取类目 JSON 失败：%s", exc)
+            return False
+        if not isinstance(payloads, Mapping):
+            return False
+        properties = payloads.get("properties")
+        fields = parse_wxsph_attribute_fields(properties)
+        category_id = str(payloads.get("categoryId") or "").strip()
+        if not fields or not category_id:
+            return False
+        self._api_observations["/wxsph/getCategoryProperties.json"] = {
+            "path": "/wxsph/getCategoryProperties.json",
+            "http_status": 200,
+            "body": "json",
+            "attribute_labels": self._api_attribute_labels(properties),
+            "attribute_fields": fields,
+            "category_id": category_id,
+        }
+        if self.logger is not None:
+            self.logger.info(
+                "微信小店类目属性接口 JSON 已主动获取：类目字段 %s 个",
+                len(fields),
+            )
+        return True
+
+    async def _ensure_api_attribute_schema(self) -> None:
+        """Retrigger the current tab once when a shared drawer reused stale DOM."""
+        if getattr(self, "attribute_runtime", None) is None:
+            return
+        if await self._captured_api_attribute_field_count():
+            return
+        if await self._request_api_attribute_schema():
+            return
+        if self.logger is not None:
+            self.logger.warning(
+                "微信小店类目属性 DOM 已就绪，但接口 JSON 尚未返回；"
+                "重新激活当前页签一次"
+            )
+        await self._reactivate_attribute_tab()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        while loop.time() < deadline:
+            if await self._captured_api_attribute_field_count():
+                if self.logger is not None:
+                    self.logger.info("微信小店类目属性接口 JSON 已重新获取")
+                return
+            await asyncio.sleep(0.1)
+
+    async def _resolve_learning_select_groups(
+        self,
+        page_label: str,
+        item: Any,
+        groups: Sequence[Sequence[str]],
+    ) -> Optional[Tuple[str, ...]]:
+        runtime = getattr(self, "attribute_runtime", None)
+        if runtime is None:
+            return None
+        managed = is_learning_managed_field("wxsph", page_label)
+        try:
+            field, category_id = await self._captured_api_field(page_label)
+        except WxsphFormListingError as exc:
+            if self.logger is not None:
+                self.logger.info(
+                    "微信小店属性“%s”：接口字段未定位，"
+                    "改用当前 DOM 匹配/直接输入与回读：%s",
+                    page_label,
+                    exc,
+                )
+            return None
+        if not field.source_id:
+            if self.logger is not None:
+                self.logger.info(
+                    "微信小店属性“%s”：接口字段 ID 为空，改用当前 DOM 匹配与回读",
+                    page_label,
+                )
+            return None
+        selects = item.locator(
+            ":scope > .el-form-item__content .el-select:visible"
+        )
+        if await selects.count() != 1:
+            raise WxsphFormListingError(
+                "微信小店属性“{0}”下拉框不唯一".format(page_label)
+            )
+        select = selects.first
+        multi = await select_supports_multiple(select)
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, options = await self._visible_dom_options(select)
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        dom_values = tuple(
+            DomCandidate(
+                str(option.get("value") or ""),
+                str(option.get("name") or ""),
+                not bool(option.get("disabled")),
+            )
+            for option in options
+        )
+        try:
+            visible_candidates = reconcile_candidates(field.option_values, dom_values)
+        except CandidateSourceError as exc:
+            if not managed:
+                return None
+            raise WxsphFormListingError(
+                "微信小店属性“{0}”接口候选与页面候选不一致：{1}".format(
+                    page_label, exc.reason_code
+                )
+            ) from exc
+
+        # The live Element dropdown can be virtualized around the persisted
+        # value, so its DOM is only a verified slice rather than the complete
+        # candidate list.  Once the API field is correlated with that slice,
+        # retain the complete, uniquely identified API options for ordered-OR
+        # resolution.  Otherwise keep the conservative visible-DOM result.
+        api_candidates = tuple(field.option_values)
+        api_ids = tuple(value.value_id.strip() for value in api_candidates)
+        api_labels = tuple(
+            normalize_option(value.label) for value in api_candidates
+        )
+        dom_labels = {
+            normalize_option(value.label) for value in dom_values if value.enabled
+        }
+        api_is_usable = bool(api_candidates) and all(api_ids) and all(api_labels)
+        api_is_usable = api_is_usable and len(api_ids) == len(set(api_ids))
+        api_is_usable = api_is_usable and len(api_labels) == len(set(api_labels))
+        api_is_usable = api_is_usable and bool(set(api_labels).intersection(dom_labels))
+        candidates = api_candidates if api_is_usable else visible_candidates
+        multi = await select_supports_multiple(select)
+        if normalize_label(page_label) == normalize_label("适用对象"):
+            universal = preferred_exact_candidate_label(
+                tuple(value.label for value in candidates), ("通用",)
+            )
+            has_universal_group = any(
+                normalize_option("通用") in {
+                    normalize_option(value) for value in group
+                }
+                for group in groups
+            )
+            if universal is not None and has_universal_group:
+                # “通用”与青年/中年等细分人群互斥。Excel 可能同时保留
+                # 历史细分值，但平台已有“通用”时只填这个确定候选，避免
+                # 无法匹配的第二组把整个字段错误送入人工审核。
+                groups = ((universal,),)
+                if self.logger is not None:
+                    self.logger.info(
+                        "微信小店属性“%s”：已有“通用”候选，忽略互斥细分人群值",
+                        page_label,
+                    )
+        if not multi and len(groups) > 1:
+            # A single-select can consume only one Excel alternative. Keep the
+            # first alternative that is an actual platform candidate; this is
+            # especially important for the shoe-category scene field.
+            matching_groups = tuple(
+                group
+                for group in groups
+                if preferred_exact_candidate_label(
+                    tuple(value.label for value in candidates), group
+                )
+                is not None
+            )
+            groups = matching_groups[:1] or tuple(groups[:1])
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "wxsph",
+                "category_leaf_id": category_id,
+                "field_id": str(field.source_id),
+                "control_type": "multi_select" if multi else "select",
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        candidate_labels = tuple(value.label for value in candidates)
+        resolved_values = []
+        resolved_options: Dict[str, Tuple[str, str]] = {}
+        for group in groups:
+            approval_request = AttributeRequest(
+                platform_id="wxsph", category_leaf_id=category_id,
+                field_id=str(field.source_id), field_label=page_label,
+                candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
+                excel_value="", evidence={}, custom_allowed=bool(field.custom_allowed),
+                schema_version=schema_version,
+                control_type="multi_select" if multi else "select",
+            )
+            approved = (runtime.confirmed_choice(approval_request)
+                        if callable(getattr(runtime, "confirmed_choice", None)) else None)
+            if approved is not None and getattr(approved, "is_no_fill", False):
+                remember = getattr(runtime, "remember_resolved", None)
+                if callable(remember):
+                    remember(approval_request, approved)
+                return ()
+            if approved is not None:
+                if not multi:
+                    candidate_labels = tuple(value.label for value in candidates)
+                    exact_approved = preferred_exact_candidate_label(
+                        candidate_labels, (approved.label,)
+                    )
+                    if exact_approved is None:
+                        # A legacy multi-value approval cannot be pasted into
+                        # a current single-select. If one of its parts is a
+                        # real candidate, keep the first part; otherwise let
+                        # the current Excel OR route choose a value.
+                        parts = tuple(
+                            part.strip()
+                            for part in re.split(r"[,，、;；/／]", approved.label)
+                            if part.strip()
+                        )
+                        exact_approved = preferred_exact_candidate_label(
+                            candidate_labels, parts
+                        )
+                        if exact_approved is None:
+                            approved = None
+                        else:
+                            candidate = next(
+                                value for value in candidates
+                                if normalize_option(value.label)
+                                == normalize_option(exact_approved)
+                            )
+                            approved = ResolvedAttribute(
+                                candidate.value_id,
+                                candidate.label,
+                                "human_override_single_select",
+                                schema_version,
+                            )
+            if approved is not None:
+                resolved_values.append(approved.label)
+                resolved_options[normalize_option(approved.label)] = (approved.value_id, approved.label)
+                if self.logger:
+                    self.logger.info("微信小店属性“%s”：直接复用运营审核值 %s，不试填 Excel 原值", page_label, approved.label)
+                continue
+            request_candidates, excel_value = await self._excel_before_review(
+                select, candidates, group, label=page_label,
+                preflight_request=AttributeRequest(
+                    platform_id="wxsph", category_leaf_id=category_id,
+                    field_id=str(field.source_id), field_label=page_label,
+                    candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
+                    excel_value="/".join(group), evidence={},
+                    custom_allowed=bool(field.custom_allowed), schema_version=schema_version,
+                    control_type="multi_select" if multi else "select",
+                ),
+            )
+            resolved = await runtime.resolve(
+                AttributeRequest(
+                    platform_id="wxsph",
+                    category_leaf_id=category_id,
+                    field_id=str(field.source_id),
+                    field_label=page_label,
+                    candidates=request_candidates,
+                    excel_value=excel_value,
+                    evidence={"excel": bool(excel_value.strip())},
+                    custom_allowed=bool(field.custom_allowed),
+                    schema_version=schema_version,
+                    control_type="multi_select" if multi else "select",
+                )
+            )
+            if resolved is None or getattr(resolved, "is_no_fill", False):
+                return ()
+            if not multi and preferred_exact_candidate_label(
+                tuple(value.label for value in candidates), (resolved.label,)
+            ) is None:
+                preferred = preferred_exact_candidate_label(
+                    tuple(value.label for value in candidates), group
+                )
+                if preferred is not None:
+                    candidate = next(
+                        value for value in candidates
+                        if normalize_option(value.label) == normalize_option(preferred)
+                    )
+                    resolved = ResolvedAttribute(
+                        candidate.value_id,
+                        candidate.label,
+                        "excel_single_select",
+                        schema_version,
+                    )
+                else:
+                    return ()
+            resolved_values.append(resolved.label)
+            resolved_options[normalize_option(resolved.label)] = (
+                resolved.value_id,
+                resolved.label,
+            )
+            if not multi:
+                break
+        self._resolved_api_options[normalize_label(page_label)] = resolved_options
+        return tuple(resolved_values)
+
+    async def _read_select_values(self, select: Any, *, multi: bool) -> Tuple[str, ...]:
+        if multi:
+            # Collapsed tags say “已选择 N”, not the selected values. Reading
+            # the live selection is safe; all mutations still go through DOM.
+            selected = await select.evaluate("""element => {
+              const c = element.__vue__;
+              if (!c || !Array.isArray(c.selected)) return null;
+              return c.selected.map(o => String(
+                o.currentLabel ?? o.label ?? o.displayName ?? o.value ?? '').trim());
+            }""")
+            if selected is not None:
+                return tuple(value for value in selected if value)
+        return await super()._read_select_values(select, multi=multi)
+
+    async def _clear_multi_select(self, select: Any) -> None:
+        current = await self._read_select_values(select, multi=True)
+        if not current:
+            return
+        if await select.locator('.el-select__tags .el-tag__close').count():
+            await super()._clear_multi_select(select)
+            current = await self._read_select_values(select, multi=True)
+        # Some folded multi-selects expose no close icons. Deselect their
+        # actual selected options, not a tag count or a cached option index.
+        for value in current:
+            await self._open_select(select, multi=True)
+            dropdown, _options = await self._visible_dom_options(select)
+            option = dropdown.locator(
+                '.el-select-dropdown__item.selected:visible:not(.is-disabled)'
+            ).filter(has_text=re.compile(r'^\s*' + re.escape(value) + r'\s*$'))
+            if await option.count() != 1:
+                raise TaobaoListingError(f'微信小店无法唯一定位已选项以清空：{value}')
+            await option.click(timeout=3000)
+        remaining = await self._read_select_values(select, multi=True)
+        if remaining:
+            raise TaobaoListingError(f'微信小店清空多选失败，仍有：{remaining!r}')
+        await self._dismiss_select_dropdown(select)
+
+    async def _clear_single_select(self, select: Any) -> None:
+        """Clear a stale single-select value after a reviewed no-fill decision."""
+        current = tuple(
+            value for value in await self._read_select_values(select, multi=False)
+            if str(value).strip()
+        )
+        bound_before = await select.evaluate("""element => {
+          const component = element.__vue__
+            || element.__vueParentComponent?.proxy
+            || element.__vueParentComponent?.ctx;
+          if (!component) return [];
+          const result = [];
+          const append = value => {
+            if (value === undefined || value === null || value === '') return;
+            if (Array.isArray(value)) { value.forEach(append); return; }
+            if (typeof value === 'object') {
+              append(value.value ?? value.id ?? value.valueId);
+              append(value.currentLabel ?? value.label);
+              return;
+            }
+            result.push(String(value).trim());
+          };
+          append(component.value);
+          append(component.selected);
+          append(component.selectedLabel);
+          return [...new Set(result.filter(Boolean))];
+        }""")
+        if not current and not bound_before:
+            return
+        # Element UI serializes the save request from its bound value. Clearing
+        # only the visible input lets a stale Vue value restore itself after
+        # the form is reopened, so clear the component model first.
+        cleared_bound_value = await select.evaluate("""async element => {
+          const component = element.__vue__
+            || element.__vueParentComponent?.proxy
+            || element.__vueParentComponent?.ctx;
+          if (!component) return false;
+          if (typeof component.deleteSelected === 'function') {
+            component.deleteSelected({stopPropagation() {}});
+          } else {
+            const nextValue = component.multiple ? [] : '';
+            component.value = nextValue;
+            if ('selected' in component) {
+              component.selected = component.multiple ? [] : {};
+            }
+            if ('selectedLabel' in component) component.selectedLabel = '';
+            if (typeof component.$emit === 'function') {
+              component.$emit('input', nextValue);
+              component.$emit('change', nextValue);
+              component.$emit('clear');
+            } else if (!('value' in component)) {
+              return false;
+            }
+          }
+          if (typeof component.$nextTick === 'function') {
+            await new Promise(resolve => component.$nextTick(resolve));
+          }
+          const input = element.querySelector('input.el-input__inner');
+          if (input && input.value) {
+            const setter = Object.getOwnPropertyDescriptor(
+              HTMLInputElement.prototype, 'value'
+            )?.set;
+            if (setter) setter.call(input, '');
+            else input.value = '';
+          }
+          element.querySelectorAll('.el-select-dropdown__item.selected')
+            .forEach(option => option.classList.remove('selected'));
+          return true;
+        }""")
+        if not cleared_bound_value:
+            clear = select.locator(".el-select__clear:visible")
+            if await clear.count() == 1:
+                await clear.click(timeout=3000)
+            else:
+                # The clear icon is often virtualized or duplicated by
+                # Element UI. Clear the live control through the DOM and emit
+                # the same events as a final fallback.
+                await select.evaluate("""element => {
+                  const input = element.querySelector('input.el-input__inner');
+                  if (!input) return false;
+                  const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                  )?.set;
+                  if (setter) setter.call(input, '');
+                  else input.value = '';
+                  element.querySelectorAll('.el-select-dropdown__item.selected')
+                    .forEach(option => option.classList.remove('selected'));
+                  for (const type of ['input', 'change', 'blur']) {
+                    input.dispatchEvent(new Event(type, {bubbles: true}));
+                  }
+                  return true;
+                }""")
+        actual = tuple(
+            value for value in await self._read_select_values(select, multi=False)
+            if str(value).strip()
+        )
+        bound = await select.evaluate("""element => {
+          const component = element.__vue__
+            || element.__vueParentComponent?.proxy
+            || element.__vueParentComponent?.ctx;
+          if (!component) return [];
+          const result = [];
+          const append = value => {
+            if (value === undefined || value === null || value === '') return;
+            if (Array.isArray(value)) { value.forEach(append); return; }
+            if (typeof value === 'object') {
+              append(value.value ?? value.id ?? value.valueId);
+              append(value.currentLabel ?? value.label);
+              return;
+            }
+            result.push(String(value).trim());
+          };
+          append(component.value);
+          append(component.selected);
+          append(component.selectedLabel);
+          return [...new Set(result.filter(Boolean))];
+        }""")
+        if actual or bound:
+            raise WxsphFormListingError(
+                "微信小店清空已审核不填写的单选属性失败：仍有 {0!r}".format(
+                    actual or tuple(bound)
+                )
+            )
+
+    async def _apply_resolved_api_options(
+        self,
+        page_label: str,
+        item: Any,
+        exact_values: Sequence[str],
+    ) -> Optional[Tuple[str, ...]]:
+        """Use JSON to resolve labels; select only through real DOM clicks.
+
+        API IDs and Element option values need not use the same namespace.
+        Never synthesize an option or call a component selection method.
+        """
+        known = self._resolved_api_options.get(normalize_label(page_label), {})
+        expected = []
+        for value in exact_values:
+            record = known.get(normalize_option(value))
+            if record is None:
+                return None
+            expected.append(record[1])
+        if not expected:
+            return None
+        selects = item.locator(":scope > .el-form-item__content .el-select:visible")
+        if await selects.count() != 1:
+            return None
+        select = selects.first
+        multi = await select_supports_multiple(select)
+        actual = await self._read_select_values(select, multi=multi)
+        if tuple(map(normalize_option, actual)) == tuple(map(normalize_option, expected)):
+            return actual
+        if multi:
+            await self._clear_multi_select(select)
+        for value in expected:
+            for attempt in range(3):
+                actual = await self._read_select_values(select, multi=multi)
+                if any(normalize_option(selected) == normalize_option(value) for selected in actual):
+                    break
+                await self._open_select(select, multi=multi)
+                dropdown, options = await self._visible_dom_options(select)
+                matches = self._matching_options(value, options)
+                if len(matches) != 1:
+                    await self._dismiss_select_dropdown(select)
+                    return None
+                # Element may replace or animate its popper between reading
+                # candidates and clicking. Recheck the exact label and DOM
+                # value in one live node; a stale popper gets a bounded retry.
+                try:
+                    clicked = await dropdown.evaluate(
+                        """(root, target) => {
+                          const candidates = Array.from(root.querySelectorAll(
+                            '.el-select-dropdown__item:not(.is-disabled)'
+                          )).filter(option => {
+                            const raw = option.__vue__ && option.__vue__.value;
+                            const id = raw == null ? '' : typeof raw === 'object'
+                              ? JSON.stringify(raw) : String(raw);
+                            return (option.innerText || '').trim() === target.name
+                              && id === target.value
+                              && option.getClientRects().length > 0
+                              && getComputedStyle(option).visibility !== 'hidden';
+                          });
+                          if (candidates.length !== 1) return false;
+                          candidates[0].scrollIntoView({block: 'nearest'});
+                          candidates[0].click();
+                          return true;
+                        }""",
+                        {
+                            "name": str(matches[0]["name"]),
+                            "value": str(matches[0].get("value", "")),
+                        },
+                        timeout=750,
+                    )
+                except PlaywrightError:
+                    clicked = False
+                if clicked:
+                    deadline = asyncio.get_running_loop().time() + 1
+                    while asyncio.get_running_loop().time() < deadline:
+                        actual = await self._read_select_values(select, multi=multi)
+                        if any(normalize_option(selected) == normalize_option(value) for selected in actual):
+                            break
+                        await asyncio.sleep(0.05)
+                    else:
+                        clicked = False
+                if clicked:
+                    break
+                await self._dismiss_select_dropdown(select)
+                if self.logger is not None:
+                    self.logger.info(
+                        "微信小店属性“%s”候选层变化，重新定位 %s（第 %s 次）",
+                        page_label, value, attempt + 2,
+                    )
+            else:
+                raise TaobaoListingError(
+                    f"微信小店属性“{page_label}”候选“{value}”重绘后仍无法选中"
+                )
+        deadline = asyncio.get_running_loop().time() + 2
+        while True:
+            actual = await self._read_select_values(select, multi=multi)
+            if tuple(map(normalize_option, actual)) == tuple(map(normalize_option, expected)):
+                await self._dismiss_select_dropdown(select)
+                if self.logger is not None:
+                    self.logger.info(
+                        "微信小店属性“%s”：JSON 确定目标，DOM 点击并回读 %s",
+                        page_label, " / ".join(actual),
+                    )
+                return actual
+            if asyncio.get_running_loop().time() >= deadline:
+                await self._dismiss_select_dropdown(select)
+                raise TaobaoListingError(
+                    f"微信小店属性“{page_label}”DOM 点击回读不一致："
+                    f"期望 {expected!r}，页面为 {list(actual)!r}"
+                )
+            await asyncio.sleep(0.05)
+
+    async def _fill_attribute(
+        self,
+        page_label: str,
+        item: Any,
+        expected: str,
+        *,
+        exact_values: Optional[Sequence[str]] = None,
+        required: bool,
+    ) -> Optional[Tuple[str, ...]]:
+        try:
+            if exact_values is not None:
+                applied = await self._apply_resolved_api_options(
+                    page_label, item, exact_values
+                )
+                if applied is not None:
+                    return applied
+            return await super()._fill_attribute(
+                page_label, item, expected, exact_values=exact_values,
+                required=required,
+            )
+        except (TaobaoListingError, YouzanFormListingError) as exc:
+            if getattr(self, "attribute_runtime", None) is None:
+                raise
+            return await self._review_failed_attribute(
+                page_label, item, tuple(exact_values or (expected,)), str(exc)
+            )
+
+    async def _review_failed_attribute(self, page_label, item, expected, error):
+        """A field write failure is reviewable, not a fatal platform failure."""
+        select = item.locator(
+            ":scope > .el-form-item__content .el-select:visible"
+        ).first
+        multi = await select_supports_multiple(select)
+        # Exhaust the custom input path before asking an operator.
+        try:
+            actual = await self._set_select_values_directly(
+                select, expected, label=page_label, multi=multi
+            )
+            if actual and tuple(map(normalize_option, actual)) == tuple(map(normalize_option, expected)):
+                return actual
+        except (TaobaoListingError, YouzanFormListingError):
+            pass
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, options = await self._visible_dom_options(select)
+        finally:
+            await self._dismiss_select_dropdown(select)
+        # Do not reuse API IDs when API and rendered labels disagree.
+        labels = tuple(dict.fromkeys(str(option.get("name") or "").strip()
+            for option in options if not option.get("disabled") and option.get("name")))
+        field, category_id = await self._captured_api_field(page_label)
+        request = AttributeRequest(
+            platform_id="wxsph", category_leaf_id=category_id,
+            field_id=str(field.source_id), field_label=page_label,
+            candidates=tuple(CandidateValue(label, label) for label in labels),
+            excel_value="", custom_allowed=False,
+            schema_version=canonical_sha256({"field": str(field.source_id),
+                "category": category_id, "dom_labels": labels, "write_recovery": 1}),
+            evidence={"force_review": True, "selection_only": True,
+                "failed_value": " / ".join(expected), "write_error": error,
+                "summary": "程序选择及手填未能通过回读，无法手填，请从页面候选中选择。运营确认值将覆盖 Excel 原值。"},
+        )
+        resolved = await self.attribute_runtime.resolve(request)
+        if resolved is None or getattr(resolved, "is_no_fill", False):
+            if self.logger:
+                self.logger.warning("微信小店属性“%s”写入失败已汇总审核，继续后续字段", page_label)
+            return None
+        # Compare with the approved value, never with the old Excel value.
+        return await self._select_values(select, ((resolved.label,),),
+                                         label=page_label, multi=multi)
 
     async def _api_dom_validation(
         self, dom_labels: Sequence[str]
@@ -308,7 +1146,8 @@ class WxsphFormListing(YouzanFormListing):
             ) from exc
 
     async def open(self) -> "WxsphFormListing":
-        self._start_api_capture()
+        if not hasattr(self, "_api_observations"):
+            self._start_api_capture()
         tab = self.drawer.get_by_role(
             "tab", name="微信小店（视频号）资料", exact=True
         )
@@ -333,6 +1172,202 @@ class WxsphFormListing(YouzanFormListing):
             self.logger.info("微信小店（视频号）资料页签已打开")
         return self
 
+    async def _category_text(self) -> str:
+        if self.panel is None:
+            raise WxsphFormListingError("请先打开微信小店资料")
+        container = self.panel.locator(".platform-category-input:visible")
+        if await container.count() == 1:
+            text = await container.evaluate("""node => Array.from(node.childNodes)
+                .filter(n => n.nodeType === Node.TEXT_NODE)
+                .map(n => n.textContent).join(' ').trim()""")
+            if text:
+                return re.sub(r"\s+", " ", text).strip()
+            # An existing but empty category control is normal on first use.
+            # Let recommendation/Excel selection initialize it instead of
+            # delegating zero paths to Youzan's strict persisted-path reader.
+            paths = container.locator(".current:visible, .category-path:visible")
+            values = {
+                re.sub(r"\s+", " ", (await paths.nth(i).inner_text()).strip())
+                for i in range(await paths.count())
+            } - {""}
+            if not values:
+                return ""
+        return await self._raise_as_wxsph(super()._category_text())
+
+    async def _validate_category_readback(self, expected: str) -> str:
+        deadline = asyncio.get_running_loop().time() + 10
+        actual = ""
+        while asyncio.get_running_loop().time() < deadline:
+            actual = await self._category_text()
+            if category_path_parts(actual) == category_path_parts(expected):
+                return actual
+            await asyncio.sleep(0.1)
+        raise WxsphFormListingError(f"微信小店类目回读不一致：期望 {expected!r}，实际 {actual!r}")
+
+    async def _category_dialog(self) -> Any:
+        """Locate the visible WeChat category dialog without relying on ARIA.
+
+        The live SCM dialog is rendered as an ``.el-dialog`` whose accessible
+        name is not consistently exposed.  A role/name-only locator therefore
+        times out even though the dialog is visibly open.  Prefer the visible
+        Element dialog and use the title or search input as the identity, then
+        fall back to a visible role dialog for the test and older page variants.
+        """
+        deadline = asyncio.get_running_loop().time() + 10
+        last_count = 0
+        while asyncio.get_running_loop().time() < deadline:
+            matches = []
+            dialogs = self.page.locator(".el-dialog:visible")
+            for index in range(await dialogs.count()):
+                dialog = dialogs.nth(index)
+                text = normalize_label(await dialog.inner_text())
+                if normalize_label("修改类目") in text or await dialog.locator(
+                    'input[placeholder="请输入类目关键词，支持模糊查询"]:visible'
+                ).count():
+                    matches.append(dialog)
+            last_count = len(matches)
+            if len(matches) == 1:
+                return matches[0]
+
+            role_dialogs = self.page.locator('[role="dialog"]:visible')
+            role_matches = []
+            for index in range(await role_dialogs.count()):
+                dialog = role_dialogs.nth(index)
+                text = normalize_label(await dialog.inner_text())
+                if normalize_label("修改类目") in text or await dialog.locator(
+                    'input[placeholder="请输入类目关键词，支持模糊查询"]:visible'
+                ).count():
+                    role_matches.append(dialog)
+            if len(role_matches) == 1:
+                return role_matches[0]
+            await asyncio.sleep(0.1)
+        raise WxsphFormListingError(
+            f"微信小店修改类目弹窗未出现或不唯一：{last_count}"
+        )
+
+    async def apply_recommended_category(self) -> str:
+        """Validate recommendations first, then current path, then Excel search."""
+        if self.panel is None:
+            raise WxsphFormListingError("请先打开微信小店资料")
+        hints = self.category_hints
+        if not hints:
+            # Legacy callers that only operate on attributes have no category
+            # intent to validate. Production callers always pass Excel hints.
+            return ""
+        await self._wait_for_loading_masks()
+        predictions = await self._prediction_candidates()
+        current = await self._category_text()
+        self.category_selection = {"previous": current,
+                                   "recommendations": [text for _, text in predictions],
+                                   "excel_hints": list(hints)}
+        if self.logger is not None:
+            self.logger.info("微信小店类目优先校验：已有=%s；页面推荐=%s；Excel=%s",
+                             current, self.category_selection["recommendations"], hints)
+        chosen, strategy = choose_category_candidate([text for _, text in predictions], hints)
+        matches = [(button, text) for button, text in predictions if text == chosen]
+        if len(matches) == 1:
+            button, expected = matches[0]
+            if category_path_parts(current) != category_path_parts(expected):
+                self._api_observations.pop("/wxsph/getCategoryProperties.json", None)
+                self._resolved_api_options.clear()
+                await button.click()
+                self.category_clicked = True
+                await self._wait_for_loading_masks()
+                await self._validate_category_readback(expected)
+            self.category_selection.update(source="validated_recommendation", selected=expected)
+            return expected
+        if choose_category_candidate((current,), hints)[0]:
+            self.category_selection.update(source="validated_current", selected=current)
+            return current
+        modify = self.panel.get_by_role("button", name="修改类目", exact=True)
+        await modify.click()
+        dialog = await self._category_dialog()
+        search = dialog.get_by_placeholder("请输入类目关键词，支持模糊查询", exact=True)
+        selected = None
+        observed_terms: Dict[str, str] = {}
+        search_terms = category_search_terms(hints)
+        for term in search_terms:
+            await search.fill(term)
+            if self.logger is not None:
+                self.logger.info("微信小店类目按 Excel 顺序搜索：%s", term)
+            deadline = asyncio.get_running_loop().time() + 10
+            candidates = []
+            while asyncio.get_running_loop().time() < deadline:
+                rows = self.page.locator(
+                    ".el-popper:visible .categoryList-wrap .item:visible, "
+                    ".el-autocomplete-suggestion:visible li:visible"
+                )
+                candidates = []
+                for index in range(await rows.count()):
+                    row = rows.nth(index)
+                    candidates.append((re.sub(r"\s+", " ", await row.inner_text()).strip(), row))
+                for text, _row in candidates:
+                    observed_terms.setdefault(text, term)
+                chosen, strategy = choose_category_candidate([text for text, _ in candidates], hints)
+                matches = [(text, row) for text, row in candidates if text == chosen]
+                if len(matches) == 1:
+                    selected = matches[0]
+                    break
+                await asyncio.sleep(0.1)
+            if selected is not None:
+                break
+        if selected is None and observed_terms and self.attribute_runtime is not None:
+            paths = list(observed_terms)
+            resolved = await self.attribute_runtime.resolve(AttributeRequest(
+                platform_id="wxsph", category_leaf_id="category-selection",
+                field_id="category_path", field_label="商品类目",
+                candidates=tuple(CandidateValue("path:" + canonical_sha256(path)[:24], path) for path in paths),
+                excel_value=" / ".join(hints),
+                evidence={"excel": True, "live_dom": True, "recommendations": self.category_selection["recommendations"],
+                          "candidate_paths": paths, "excel_category_hints": list(hints)},
+                custom_allowed=False, schema_version=canonical_sha256(paths), control_type="category"))
+            if resolved is None:
+                self.attribute_runtime.raise_deferred_reviews()
+                raise WxsphFormListingError("微信小店类目等待审核")
+            if resolved.label in observed_terms:
+                await search.fill(observed_terms[resolved.label])
+                deadline = asyncio.get_running_loop().time() + 10
+                while asyncio.get_running_loop().time() < deadline:
+                    rows = self.page.locator(
+                        ".el-popper:visible .categoryList-wrap .item:visible, "
+                        ".el-autocomplete-suggestion:visible li:visible"
+                    )
+                    matches = []
+                    for index in range(await rows.count()):
+                        row = rows.nth(index)
+                        text = re.sub(r"\s+", " ", await row.inner_text()).strip()
+                        if text == resolved.label and resolved.value_id == "path:" + canonical_sha256(text)[:24]:
+                            matches.append((text, row))
+                    if len(matches) == 1:
+                        selected = matches[0]
+                        break
+                    await asyncio.sleep(0.1)
+        if selected is None:
+            raise WxsphFormListingError("微信小店类目与 Excel 不匹配，未找到唯一可用候选，停止填写")
+        expected, row = selected
+        await row.click()
+        expected = await self._complete_category_leaf(dialog, expected)
+        deadline = asyncio.get_running_loop().time() + 10
+        while asyncio.get_running_loop().time() < deadline:
+            lines = (await dialog.inner_text()).splitlines()
+            paths = [line.split("：", 1)[-1].strip() for line in lines if line.strip().startswith("已选")]
+            if paths and category_path_parts(paths[-1]) == category_path_parts(expected):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise WxsphFormListingError("微信小店类目确认前完整路径校验失败")
+        self._api_observations.pop("/wxsph/getCategoryProperties.json", None)
+        self._resolved_api_options.clear()
+        await dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$")).click()
+        await dialog.wait_for(state="hidden")
+        self.category_clicked = True
+        await self._wait_for_loading_masks()
+        actual = await self._validate_category_readback(expected)
+        self.category_selection.update(source="excel_search", selected=actual)
+        if self.logger is not None:
+            self.logger.info("微信小店类目已按 Excel 校验并修改：%s", actual)
+        return actual
+
     async def _attribute_vertical_bounds(self) -> Tuple[Optional[float], Optional[float]]:
         if self.panel is None:
             raise WxsphFormListingError("请先打开微信小店资料")
@@ -343,6 +1378,8 @@ class WxsphFormListing(YouzanFormListing):
         )
         for index in range(await headings.count()):
             heading = headings.nth(index)
+            if await heading.evaluate("e => Boolean(e.closest('nav, .anchor-nav, [role=\"navigation\"]'))"):
+                continue
             if not await heading.is_visible():
                 continue
             box = await heading.bounding_box()
@@ -390,6 +1427,16 @@ class WxsphFormListing(YouzanFormListing):
             "tab", name="微信小店（视频号）资料", exact=True
         )
         await tab.wait_for(state="visible", timeout=10_000)
+        if (await tab.get_attribute("aria-selected") or "").casefold() == "true":
+            base_tab = self.drawer.get_by_role(
+                "tab", name="基础资料", exact=True
+            )
+            if await base_tab.count() and await base_tab.first.is_visible():
+                await base_tab.first.click(timeout=10_000)
+                try:
+                    await tab.wait_for(state="visible", timeout=10_000)
+                except Exception:
+                    pass
         await tab.click(timeout=10_000)
         panel = self.drawer.get_by_role(
             "tabpanel", name="微信小店（视频号）资料", exact=True
@@ -460,6 +1507,7 @@ class WxsphFormListing(YouzanFormListing):
         page_items: Mapping[str, Tuple[str, Any]],
     ) -> Dict[str, Tuple[str, str]]:
         sources: Dict[str, List[Tuple[str, str]]] = {}
+        page_items = without_color_attributes(page_items)
         for excel_key, raw_value in fields.items():
             excel_names = set(excel_aliases(excel_key))
             for normalized_page, (page_label, _item) in page_items.items():
@@ -486,7 +1534,11 @@ class WxsphFormListing(YouzanFormListing):
                         page_label, "、".join(key for key, _value in matches)
                     )
                 )
-            assignments[normalized_page] = (page_label, matches[0][1])
+            source_key, source_value = matches[0]
+            paired = positional_listing_date_value(page_label, source_key, source_value)
+            assignments[normalized_page] = (
+                page_label, paired if paired is not None else source_value
+            )
         return assignments
 
     @staticmethod
@@ -522,27 +1574,24 @@ class WxsphFormListing(YouzanFormListing):
         expected: str,
         *,
         is_select: bool,
+        required: bool,
     ) -> Tuple[Optional[str], Optional[Tuple[str, ...]], str]:
         normalized = normalize_label(page_label)
         if normalized in _CONTENT_LABELS:
             if is_select:
-                return "95%及以上", ("95%及以上",), "select_content_band"
-            aliases = (
-                ("面料材质", "面料俗称", "水洗标", "吊牌图", "面料")
-                if normalized == normalize_label("面料材质成分含量")
-                else ("里料材质", "里料")
-                if normalized == normalize_label("里料材质成分含量")
-                else ("材质成分", "材质")
-            )
-            percentage = _material_percentage(_first_excel_value(fields, aliases))
+                return expected, None, "select_content_band"
+            # 百分比是独立字段：只在当前类目实际渲染该输入框时，
+            # 使用分配给该字段的 Excel 值；不能从“面料材质”的 OR
+            # 候选（例如 棉100%/棉/棉布）中擅自提取。
+            percentage = _material_percentage(expected)
             return percentage, None, "numeric_percentage" if percentage else "optional_blank"
 
         if normalized in {
             normalize_label("面料材质"),
             normalize_label("里料材质"),
         }:
-            material = _material_name(expected)
-            return material, (material,), "material_name"
+            materials = _material_name_candidates(expected)
+            return "/".join(materials), None, "material_ordered_or"
 
         if normalized == normalize_label("材质成分") and not is_select:
             content = _material_content_text(expected)
@@ -572,7 +1621,7 @@ class WxsphFormListing(YouzanFormListing):
                 )
             )
         input_box = inputs[0]
-        expected_text = str(expected).strip()
+        expected_text = listing_date_text_value(page_label, expected)
         if (await input_box.input_value()).strip() != expected_text:
             await input_box.fill(expected_text)
             await input_box.press("Tab")
@@ -584,7 +1633,9 @@ class WxsphFormListing(YouzanFormListing):
         return (actual,)
 
     async def fill_category_attributes(self, fields: WxsphFields) -> Mapping[str, Any]:
-        page_items = await self._attribute_items()
+        await self.apply_recommended_category()
+        page_items = without_color_attributes(await self._attribute_items())
+        await self._ensure_api_attribute_schema()
         assignments = await self._attribute_assignments(fields.fields, page_items)
         applied: Dict[str, Tuple[str, ...]] = {}
         skipped_optional: Dict[str, str] = {}
@@ -600,8 +1651,13 @@ class WxsphFormListing(YouzanFormListing):
             _source, expected = assignment
             is_select = await self._is_select(item)
             value, exact_values, rule = self._resolved_attribute_value(
-                fields.fields, page_label, expected, is_select=is_select
+                fields.fields,
+                page_label,
+                expected,
+                is_select=is_select,
+                required=required,
             )
+            learning_resolved = False
             rules[page_label] = rule
             if value is None:
                 if required:
@@ -610,15 +1666,108 @@ class WxsphFormListing(YouzanFormListing):
                     skipped_optional[page_label] = "Excel 未提供该材质的百分比"
                 continue
             if is_select:
-                actual = await self._raise_as_wxsph(
-                    self._fill_attribute(
-                        page_label,
-                        item,
-                        value,
-                        exact_values=exact_values,
-                        required=required,
-                    )
+                select = item.locator(
+                    ":scope > .el-form-item__content .el-select:visible"
+                ).first
+                multi = bool(
+                    await select.count()
+                    and await select_supports_multiple(select)
                 )
+                groups = (
+                    tuple((str(candidate),) for candidate in exact_values)
+                    if exact_values is not None
+                    else await self._excel_groups_for_select(
+                        select, page_label, value, multi=multi)
+                )
+                resolved_values = await self._resolve_learning_select_groups(
+                    page_label,
+                    item,
+                    groups,
+                )
+                if resolved_values == ():
+                    reviewed_no_fill = False
+                    if self.attribute_runtime is not None:
+                        checker = getattr(
+                            self.attribute_runtime, "intentionally_omitted", None
+                        )
+                        if checker is not None:
+                            reviewed_no_fill = bool(
+                                checker(self.attribute_platform_id, page_label)
+                            )
+                    if reviewed_no_fill:
+                        selects = item.locator(
+                            ":scope > .el-form-item__content .el-select:visible"
+                        )
+                        if await selects.count() != 1:
+                            raise WxsphFormListingError(
+                                "微信小店属性“{0}”下拉控件不唯一，无法清空".format(page_label)
+                            )
+                        select = selects.first
+                        multi = await select_supports_multiple(select)
+                        if multi:
+                            await self._clear_multi_select(select)
+                        else:
+                            await self._clear_single_select(select)
+                    skipped_optional[page_label] = (
+                        "审核明确不填写" if reviewed_no_fill else "等待运营审核"
+                    )
+                    if self.logger is not None:
+                        if reviewed_no_fill:
+                            self.logger.info(
+                                "微信小店属性“%s”按审核结论保持空白，继续填写后续字段",
+                                page_label,
+                            )
+                        else:
+                            self.logger.info(
+                                "微信小店属性“%s”已加入本平台待审核汇总，继续填写后续字段",
+                                page_label,
+                            )
+                    continue
+                if resolved_values is not None:
+                    exact_values = resolved_values
+                    learning_resolved = True
+            if is_select:
+                fabric_label = normalize_label(page_label)
+                fabric_values = exact_values
+                if not learning_resolved and (not fabric_values or len(fabric_values) < 2):
+                    # 微信小店实际标签是“面料材质”，而 Excel 常用
+                    # “材质成分/材质”承载原始多成分文本；从原值拆出
+                    # 面料名称后统一走公共“多值失败回退其他”协议。
+                    fabric_values = _material_name_candidates(expected)
+                if (
+                    fabric_label in {
+                        normalize_label("面料"),
+                        normalize_label("面料材质"),
+                        normalize_label("面料俗称"),
+                        normalize_label("材质"),
+                    }
+                    and len(fabric_values or ()) >= 2
+                ):
+                    actual = await self._raise_as_wxsph(
+                        self._fill_fabric_attribute(
+                            page_label,
+                            fabric_values,
+                            item=item,
+                            raw_value=expected,
+                            writer=lambda fallback_value, values: self._fill_attribute(
+                                page_label,
+                                item,
+                                fallback_value,
+                                exact_values=values,
+                                required=required,
+                            ),
+                        )
+                    )
+                else:
+                    actual = await self._raise_as_wxsph(
+                        self._fill_attribute(
+                            page_label,
+                            item,
+                            value,
+                            exact_values=exact_values,
+                            required=required,
+                        )
+                    )
             else:
                 actual = await self._fill_text_attribute(page_label, item, value)
             if actual is not None:
@@ -683,10 +1832,10 @@ class WxsphFormListing(YouzanFormListing):
     def _expected_sku_values(fields: Mapping[str, str]) -> Mapping[str, str]:
         expected = {
             "售卖价": _required_excel_value(
-                fields, ("售卖价", "售价", "价格", "基本售价", "商品价格"), "售卖价"
+                fields, ("售卖价", "售价", "价格", "基本售价", "商品价格"), "售卖价", money=True
             ),
             "市场价": _required_excel_value(
-                fields, ("市场价", "价格", "吊牌价", "商品价格"), "市场价"
+                fields, ("市场价", "价格", "吊牌价", "商品价格"), "市场价", money=True
             ),
             "库存": _required_excel_value(fields, ("数量", "库存"), "库存"),
         }
@@ -929,6 +2078,12 @@ class WxsphFormListing(YouzanFormListing):
     async def apply_batch_delivery(self) -> Mapping[str, Any]:
         if self.panel is None:
             raise WxsphFormListingError("请先打开微信小店资料")
+        # 新版编辑器先选择预售粒度，才显示 SKU 的批量发货设置。
+        modes = self.panel.get_by_role("radio", name="按规格预售", exact=True)
+        if await modes.count():
+            await self._ensure_dialog_radio(self.panel, "按规格预售")
+            if self.logger is not None:
+                self.logger.info("微信小店发货方式已确认：按规格预售")
         buttons = self.panel.get_by_role(
             "button", name="批量编辑发货", exact=True
         )
@@ -939,13 +2094,32 @@ class WxsphFormListing(YouzanFormListing):
                 )
             )
         await buttons.first.click()
-        dialogs = self.page.locator(
-            '.el-dialog:visible, [role="dialog"]:visible'
-        ).filter(has_text="发货方式")
-        try:
-            await dialogs.first.wait_for(state="visible", timeout=15_000)
-        except Exception as exc:
-            raise WxsphFormListingError("微信小店“发货方式”弹窗未打开") from exc
+        # The production modal can lack Element's dialog class/ARIA role.
+        # Locate the smallest visible container owning the title, radio inputs
+        # and confirmation button, excluding the underlying SKU table.
+        dialogs = self.page.locator('[data-kuaimai-delivery-dialog="true"]:visible')
+        deadline = asyncio.get_running_loop().time() + 15
+        while asyncio.get_running_loop().time() < deadline:
+            await self.page.get_by_text('发货方式', exact=True).evaluate_all("""titles => {
+              document.querySelectorAll('[data-kuaimai-delivery-dialog]').forEach(
+                node => node.removeAttribute('data-kuaimai-delivery-dialog'));
+              for (const title of titles) {
+                if (!title.getClientRects().length) continue;
+                for (let node = title.parentElement; node && node !== document.body; node = node.parentElement) {
+                  if (node.querySelector('table, .el-table')) break;
+                  const confirms = [...node.querySelectorAll('button')].filter(
+                    button => button.textContent.trim() === '确定');
+                  if (confirms.length === 1 && node.querySelector('input[type="radio"]')) {
+                    node.setAttribute('data-kuaimai-delivery-dialog', 'true'); break;
+                  }
+                }
+              }
+            }""")
+            if await dialogs.count():
+                break
+            await asyncio.sleep(.1)
+        else:
+            raise WxsphFormListingError("微信小店“发货方式”弹窗未打开或缺少可识别控件")
         if await dialogs.count() != 1:
             raise WxsphFormListingError(
                 "微信小店“发货方式”弹窗不是唯一项：{0}".format(
@@ -1059,7 +2233,8 @@ class WxsphFormListing(YouzanFormListing):
         )
 
     async def _verify_persisted_attributes(
-        self, fields: WxsphFields
+        self, fields: WxsphFields, *,
+        expected_attributes: Optional[Mapping[str, Sequence[str]]] = None,
     ) -> Mapping[str, Any]:
         """Read every Excel-mapped attribute after save without changing it."""
 
@@ -1067,17 +2242,90 @@ class WxsphFormListing(YouzanFormListing):
         assignments = await self._attribute_assignments(fields.fields, page_items)
         persisted: Dict[str, Tuple[str, ...]] = {}
         skipped_optional: Dict[str, str] = {}
+        skipped_reviewed_no_fill: Dict[str, str] = {}
+        skipped_pending_review: Dict[str, str] = {}
         rules: Dict[str, str] = {}
         errors: List[str] = []
 
         for normalized_page, (_source, expected) in assignments.items():
             page_label, item = page_items[normalized_page]
             is_select = await self._is_select(item)
+            required = await self._attribute_is_required(item)
+
+            # A reviewed ``不填写`` decision is part of the saved value
+            # contract.  The saved-readback adapter is a new instance, so it
+            # must consult the same runtime decision before falling back to
+            # the Excel value.  Otherwise an intentionally blank control is
+            # reported as a false mismatch against the original Excel text.
+            intentionally_omitted = False
+            if self.attribute_runtime is not None:
+                checker = getattr(self.attribute_runtime, "intentionally_omitted", None)
+                if checker is not None:
+                    intentionally_omitted = bool(
+                        checker(self.attribute_platform_id, page_label)
+                    )
+            if intentionally_omitted:
+                rules[page_label] = "reviewed_no_fill"
+                if is_select:
+                    selects = item.locator(
+                        ":scope > .el-form-item__content .el-select:visible"
+                    )
+                    if await selects.count() != 1:
+                        errors.append("{0}=下拉控件不唯一".format(page_label))
+                        continue
+                    select = selects.first
+                    multi = await select_supports_multiple(select)
+                    actual = await self._read_select_values(select, multi=multi)
+                    if any(str(value).strip() for value in actual):
+                        errors.append(
+                            "{0}=审核明确不填写，但页面为 {1}".format(
+                                page_label, actual
+                            )
+                        )
+                        continue
+                else:
+                    inputs = await self._editable_value_inputs(item)
+                    if len(inputs) != 1:
+                        errors.append("{0}=输入控件不唯一".format(page_label))
+                        continue
+                    actual_text = (await inputs[0].input_value()).strip()
+                    if actual_text:
+                        errors.append(
+                            "{0}=审核明确不填写，但页面为 {1!r}".format(
+                                page_label, actual_text
+                            )
+                        )
+                        continue
+                skipped_reviewed_no_fill[page_label] = "审核明确不填写"
+                if self.logger is not None:
+                    self.logger.info(
+                        "微信小店保存后回读跳过审核明确不填写属性：%s",
+                        page_label,
+                    )
+                continue
+
+            if self.attribute_runtime is not None:
+                pending_checker = getattr(
+                    self.attribute_runtime, "review_pending_or_omitted", None
+                )
+                if callable(pending_checker) and pending_checker(
+                    self.attribute_platform_id, page_label
+                ):
+                    skipped_pending_review[page_label] = "等待运营审核"
+                    rules[page_label] = "pending_review"
+                    if self.logger is not None:
+                        self.logger.info(
+                            "微信小店保存后回读跳过待审核属性：%s",
+                            page_label,
+                        )
+                    continue
+
             value, exact_values, rule = self._resolved_attribute_value(
                 fields.fields,
                 page_label,
                 expected,
                 is_select=is_select,
+                required=required,
             )
             rules[page_label] = rule
 
@@ -1105,12 +2353,21 @@ class WxsphFormListing(YouzanFormListing):
                     errors.append("{0}=下拉控件不唯一".format(page_label))
                     continue
                 select = selects.first
-                multi = await select.locator(".el-select__tags").count() > 0
+                multi = await select_supports_multiple(select)
                 actual = await self._read_select_values(select, multi=multi)
+                if expected_attributes is not None and page_label in expected_attributes:
+                    # Carry the successfully written decision across the new
+                    # reader instance; operator approval can supersede Excel.
+                    exact_values = tuple(expected_attributes[page_label])
+                    value = " / ".join(exact_values)
                 groups = (
                     tuple((str(candidate),) for candidate in exact_values)
                     if exact_values is not None
-                    else selection_value_groups(page_label, str(value))
+                    else await self._excel_groups_for_select(
+                        select, page_label,
+                        str(value),
+                        multi=multi,
+                    )
                 )
                 matches = bool(groups) and all(
                     any(
@@ -1121,6 +2378,8 @@ class WxsphFormListing(YouzanFormListing):
                     )
                     for group in groups
                 )
+                if exact_values is not None:
+                    matches = matches and len(actual) == len(exact_values)
             else:
                 inputs = await self._editable_value_inputs(item)
                 if len(inputs) != 1:
@@ -1149,16 +2408,26 @@ class WxsphFormListing(YouzanFormListing):
         return {
             "attributes": persisted,
             "skipped_optional_percentages": skipped_optional,
+            "skipped_reviewed_no_fill": skipped_reviewed_no_fill,
+            "skipped_pending_review": skipped_pending_review,
             "rules": rules,
         }
 
     async def verify_persisted_values(
-        self, fields: WxsphFields
+        self, fields: WxsphFields, *,
+        expected_attributes: Optional[Mapping[str, Sequence[str]]] = None,
+        expected_freight: Optional[Mapping[str, Any]] = None,
+        expected_category: str = "",
     ) -> Mapping[str, Any]:
         """Verify critical WeChat Store values after a confirmed save."""
 
         try:
-            attributes = await self._verify_persisted_attributes(fields)
+            if expected_category:
+                await self._validate_category_readback(expected_category)
+            attributes = await self._verify_persisted_attributes(
+                fields, expected_attributes=expected_attributes
+            )
+            freight = await sync_store_freight(self, fields.fields, read_only=True, expected=expected_freight)
             expected_sku = self._expected_sku_values(fields.fields)
             snapshot = await self._sku_table_snapshot()
             rows = self._validate_sku_snapshot(snapshot, expected_sku)
@@ -1181,6 +2450,7 @@ class WxsphFormListing(YouzanFormListing):
             attributes["skipped_optional_percentages"]
         )
         return {
+            "category": expected_category,
             "attributes": attributes,
             "sku_values": expected_sku,
             "row_count": len(rows),
@@ -1192,16 +2462,29 @@ class WxsphFormListing(YouzanFormListing):
             },
             "weight": weight,
             "api_dom_validation": await self._api_dom_validation(dom_labels),
+            "freight": freight,
         }
 
     async def apply_excel_fields(self, fields: WxsphFields) -> Mapping[str, Any]:
         try:
             attributes = await self.fill_category_attributes(fields)
+            raise_reviews = getattr(self.attribute_runtime, 'raise_deferred_reviews', None)
+            if callable(raise_reviews):
+                raise_reviews()
             sku_batch = await self.fill_sku_batch(fields.fields)
             delivery = await self.apply_batch_delivery()
             weight = await self.fill_weight()
+            freight = await sync_store_freight(self, fields.fields)
             errors = await self._visible_validation_errors()
-            if errors:
+            if (
+                errors
+                and not (
+                    self.attribute_runtime is not None
+                    and getattr(
+                        self.attribute_runtime, "has_deferred_reviews", False
+                    )
+                )
+            ):
                 raise WxsphFormListingError(
                     "微信小店页面校验错误：" + "；".join(errors)
                 )
@@ -1213,11 +2496,21 @@ class WxsphFormListing(YouzanFormListing):
             + tuple(attributes["skipped_optional_percentages"])
         )
         return {
+            "category_selection": getattr(self, "category_selection", {}),
             "attributes": attributes,
             "sku_batch": sku_batch,
             "delivery": delivery,
             "weight": weight,
             "api_dom_validation": api_dom_validation,
+            "freight": freight,
+            "deferred_validation_errors": (
+                errors
+                if self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+                else ()
+            ),
         }
 
 

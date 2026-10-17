@@ -212,6 +212,20 @@ class SensitiveLogRedactorTests(unittest.TestCase):
         import kuaimai_erp
         from platform_inspection import SensitiveLogRedactor
 
+        logger = logging.getLogger("kuaimai_erp")
+        original_handlers = list(logger.handlers)
+        original_level = logger.level
+
+        def restore_logger():
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                if handler not in original_handlers:
+                    handler.close()
+            for handler in original_handlers:
+                logger.addHandler(handler)
+            logger.setLevel(original_level)
+
+        self.addCleanup(restore_logger)
         identity = "私密<标题>/42"
         with tempfile.TemporaryDirectory() as directory:
             redactor = SensitiveLogRedactor((identity,))

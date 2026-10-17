@@ -1,7 +1,13 @@
 import unittest
 
+from attribute_runtime import ResolvedAttribute
 from youzan_data import parse_youzan_fields
-from youzan_form_listing import YouzanFormListing, YouzanFormListingError
+from youzan_form_listing import (
+    YouzanFormListing,
+    YouzanFormListingError,
+    choose_youzan_category_text,
+    matching_youzan_category_texts,
+)
 
 
 def select_markup(options, *, empty_message=False):
@@ -20,6 +26,31 @@ def select_markup(options, *, empty_message=False):
 
 
 class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
+    def test_category_hints_choose_first_authored_unique_outerwear_leaf(self):
+        self.assertEqual(
+            choose_youzan_category_text(
+                (
+                    "服装鞋包 > 男装 > 夹克",
+                    "服装鞋包 > 男装 > 男士休闲夹克",
+                ),
+                ("夹克", "外套", "男士休闲夹克", "其他夹克"),
+            ),
+            "服装鞋包 > 男装 > 夹克",
+        )
+
+    def test_category_candidates_keep_ambiguous_new_leaf_for_review(self):
+        hint, candidates = matching_youzan_category_texts(
+            (
+                "服装鞋包 > 男装 > 夹克",
+                "服装鞋包 > 运动户外 > 夹克",
+                "服装鞋包 > 工作服 > 夹克",
+            ),
+            ("夹克", "外套", "男士休闲夹克", "其他夹克"),
+        )
+
+        self.assertEqual(hint, "夹克")
+        self.assertEqual(len(candidates), 3)
+
     async def asyncSetUp(self):
         from playwright.async_api import async_playwright
 
@@ -89,6 +120,10 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
                 <label class="el-form-item__label">面料</label>
                 <div class="el-form-item__content">{material_select}</div>
               </div>
+              <div class="el-form-item" id="thickness">
+                <label class="el-form-item__label">厚薄</label>
+                <div class="el-form-item__content">{thickness_select}</div>
+              </div>
               <div class="el-form-item is-required" id="outer-id">
                 <label class="el-form-item__label">货号</label>
                 <div class="el-form-item__content"><input></div>
@@ -137,6 +172,11 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
                 <label class="el-form-item__label">运费设置</label>
                 <div class="el-form-item__content">{freight_select}</div>
               </div>
+              <div id="services">
+                <label class="el-checkbox"><input type="checkbox"><span class="el-checkbox__label">参加会员折扣</span></label>
+                <label class="el-checkbox"><input type="checkbox"><span class="el-checkbox__label">支持买家申请换货</span></label>
+                <label class="el-checkbox"><input type="checkbox"><span class="el-checkbox__label">7天无理由退货</span></label>
+              </div>
             </div>
             <div class="el-dialog" role="dialog" aria-label="修改类目" style="display:none">
               <input data-category-search oninput="showCategory(this.value)">
@@ -158,6 +198,14 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
               document.querySelectorAll('.category-result').forEach(row => row.onclick = () => {{
                 document.querySelectorAll('.category-result').forEach(other => other.classList.remove('is-selected'));
                 row.classList.add('is-selected');
+                const dialog=document.querySelector('.el-dialog');
+                dialog.querySelector('#guard-menus')?.remove();
+                const menus=document.createElement('div');menus.id='guard-menus';
+                const parts=row.textContent.trim().split(' > ');
+                menus.innerHTML='<div>已选：'+parts.join(' > ')+'</div>'+parts.map((name,i)=>
+                  '<div class="el-cascader-menu"><div class="el-cascader-node" '+
+                  (i<parts.length-1?'aria-haspopup="true"':'')+'><span class="el-cascader-node__label">'+name+'</span></div></div>').join('');
+                dialog.appendChild(menus);
               }});
               function confirmCategory() {{
                 const selected = document.querySelector('.category-result.is-selected');
@@ -207,6 +255,7 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
             </script>
             """.format(
                 material_select=select_markup(["棉"]),
+                thickness_select=select_markup(["常规", "加厚"]),
                 style_select=select_markup(
                     [] if empty_style else ["休闲风", "时尚都市"],
                     empty_message=empty_style,
@@ -227,7 +276,7 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
 
         physical = await listing.select_physical_product()
         category = await listing.apply_category(
-            ("休闲裤", "男士休闲直筒裤", "工装休闲裤")
+            ("休闲裤/男士休闲直筒裤/工装休闲裤",)
         )
 
         self.assertEqual(physical["product_type"], "实物商品")
@@ -239,6 +288,36 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(YouzanFormListingError, "有赞类目接口或 DOM 完整路径不是唯一项"):
             await listing.apply_category(("休闲裤",))
+
+    async def test_category_search_advances_to_next_excel_alternative(self):
+        listing = await self._listing()
+        await self.page.unroute("**/category/base/queryCategoryList.json")
+        searches = []
+
+        async def query(route):
+            term = route.request.post_data_json["queryTxt"]
+            searches.append(term)
+            records = [{"categoryNameList": ["服装鞋包", "男装", "休闲裤"]}] if term == "休闲裤" else []
+            await route.fulfill(headers={"access-control-allow-origin": "*"}, json={
+                "result": 1, "data": {"records": records},
+            })
+
+        await self.page.route("**/category/base/queryCategoryList.json", query)
+        await self.page.evaluate("""() => {
+          const input = document.querySelector('.el-dialog input');
+          input.oninput = async () => {
+            const payload = await (await fetch('https://category.test/category/base/queryCategoryList.json', {
+              method: 'POST', body: JSON.stringify({queryTxt: input.value})
+            })).json();
+            document.getElementById('category-results').style.display = payload.data.records.length ? 'block' : 'none';
+            document.querySelectorAll('.category-result').forEach(row => {
+              row.style.display = payload.data.records.length ? 'block' : 'none';
+            });
+          };
+        }""")
+        category = await listing.apply_category(("男士休闲直筒裤/休闲裤",))
+        self.assertEqual(searches, ["男士休闲直筒裤", "休闲裤"])
+        self.assertEqual(category["selected"], "服装鞋包 > 男装 > 休闲裤")
 
     async def test_fills_attributes_and_clicks_batch_once(self):
         listing = await self._listing()
@@ -290,6 +369,127 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(YouzanFormListingError, "保存后类目属性回读失败"):
             await listing._verify_persisted_attributes(fields)
 
+    async def test_learning_directly_enters_custom_value_before_waiting_for_empty_dropdown(self):
+        async def fulfill_attributes(route):
+            await route.fulfill(
+                content_type="application/json",
+                headers={"access-control-allow-origin": "*"},
+                json={
+                    "result": 1,
+                    "data": {
+                        "result": {
+                            "publicPropertys": [
+                                {
+                                    "propertyGroup": 1,
+                                    "isRequired": False,
+                                    "property": {
+                                        "id": "style-id",
+                                        "name": "款式",
+                                        "valueType": 1,
+                                        "valueNames": [],
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                },
+            )
+
+        listing = await self._listing(empty_style=True)
+        listing.attribute_runtime = object()
+        await self.page.route(
+            "**/yz/getCategoryProperties.json*", fulfill_attributes
+        )
+        await self.page.evaluate(
+            "fetch('https://api.test/yz/getCategoryProperties.json?categoryId=3846')"
+        )
+
+        actual = await listing._fill_attribute(
+            "款式",
+            self.page.locator("#style"),
+            "休闲裤/工装裤/直筒裤",
+            required=False,
+        )
+
+        self.assertEqual(actual, ("休闲裤",))
+        self.assertEqual(
+            await self.page.locator("#style input").input_value(), "休闲裤"
+        )
+
+    async def test_learning_uses_youzan_api_field_and_value_names(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-yz-1",
+                )
+
+        async def fulfill_attributes(route):
+            await route.fulfill(
+                content_type="application/json",
+                headers={"access-control-allow-origin": "*"},
+                json={
+                    "result": 1,
+                    "data": {
+                        "result": {
+                            "publicPropertys": [
+                                {
+                                    "propertyGroup": 1,
+                                    "isRequired": False,
+                                    "property": {
+                                        "id": "thickness-id",
+                                        "name": "厚薄",
+                                        "valueType": 5,
+                                        "valueNames": ["常规", "加厚"],
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                },
+            )
+
+        runtime = Runtime()
+        listing = await self._listing()
+        listing.attribute_runtime = runtime
+        await self.page.route(
+            "**/yz/getCategoryProperties.json*", fulfill_attributes
+        )
+        await self.page.evaluate(
+            "fetch('https://api.test/yz/getCategoryProperties.json?categoryId=3846')"
+        )
+        item = (await listing._attribute_items())["厚薄"][1]
+
+        actual = await listing._fill_attribute(
+            "厚薄",
+            item,
+            "常规",
+            required=False,
+        )
+
+        self.assertEqual(actual, ("常规",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "yz")
+        self.assertEqual(request.category_leaf_id, "3846")
+        self.assertEqual(request.field_id, "thickness-id")
+        self.assertEqual(request.excel_value, "常规")
+        self.assertEqual(
+            tuple((item.value_id, item.label) for item in request.candidates),
+            (("常规", "常规"), ("加厚", "加厚")),
+        )
+
     async def test_fills_pants_sales_and_logistics(self):
         listing = await self._listing()
 
@@ -302,8 +502,36 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
                 "inventory_deduction": "付款减库存",
                 "delivery": ("快递发货",),
                 "freight_template": "T恤、裤子、饰品邮费模版",
+                "services": {"参加会员折扣": True, "支持买家申请换货": True, "7天无理由退货": True},
             },
         )
+
+    async def test_services_are_idempotent_and_readback_checks_missing_choice(self):
+        listing = await self._listing()
+        await listing._service_settings()
+        await listing._service_settings()
+        self.assertEqual(await self.page.locator('#services input:checked').count(), 3)
+        await listing._service_settings(read_only=True)
+        await self.page.locator('#services input').first.uncheck()
+        with self.assertRaisesRegex(YouzanFormListingError, "未勾选"):
+            await listing._service_settings(read_only=True)
+
+    async def test_sku_size_is_not_mapped_to_category_size(self):
+        listing = await self._listing()
+        assignments = await listing._attribute_assignments(
+            {"尺码": "S/M/L", "厚薄": "常规"}, {"尺码": ("尺码", None), "厚薄": ("厚薄", None)}
+        )
+        self.assertNotIn("尺码", assignments)
+        self.assertIn("厚薄", assignments)
+
+    async def test_clear_old_category_size_does_not_change_sku(self):
+        listing = await self._listing()
+        await self.page.locator('body').evaluate('''body => body.insertAdjacentHTML('beforeend',
+            '<div id="excluded-size"><div class="el-select"><div class="el-select__tags"><span class="el-tag">S<i class="el-tag__close" onclick="this.parentElement.remove()"></i></span></div><input class="el-input__inner" readonly></div></div>')''')
+        item = self.page.locator('#excluded-size')
+        await listing._clear_excluded_category_field(item, "尺码")
+        await listing._clear_excluded_category_field(item, "尺码")
+        self.assertEqual(await item.locator('.el-tag').count(), 0)
 
     async def test_fills_coat_freight_and_rejects_duplicate_pants_template(self):
         coat_listing = await self._listing()

@@ -1,7 +1,11 @@
+import json
 import unittest
+from unittest.mock import AsyncMock
 
+from attribute_runtime import NO_FILL_VALUE_ID, ResolvedAttribute
 from wxsph_data import parse_wxsph_fields
 from wxsph_form_listing import WxsphFormListing, WxsphFormListingError
+from taobao_listing import TaobaoListingError
 
 
 def select_markup(options):
@@ -19,6 +23,328 @@ def select_markup(options):
 
 
 class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
+    async def _category_search_listing(self, expression, runtime=None):
+        await self.page.set_content('''
+          <section id="panel"><div class="platform-category-input"><span class="current">男装 > 衬衫</span>
+            <button onclick="document.querySelector('[role=dialog]').style.display='block'">修改类目</button>
+          </div></section>
+          <div role="dialog" aria-label="修改类目" style="display:none">
+            <input placeholder="请输入类目关键词，支持模糊查询" oninput="showCategory(this.value)">
+            <div id="chosen">已选：</div>
+            <button onclick="document.querySelector('.current').textContent=window.chosen;this.parentElement.style.display='none'">确定</button>
+          </div>
+          <div class="el-autocomplete-suggestion"><ul id="results"></ul></div>
+          <script>
+            window.searches=[];
+            function showCategory(value) {
+              window.searches.push(value);
+              const row=document.createElement('li');row.textContent='男装 > '+value;
+              row.onclick=()=>{window.chosen=row.textContent;document.getElementById('chosen').textContent='已选：'+row.textContent;};
+              document.getElementById('results').replaceChildren(row);
+            }
+          </script>
+        ''')
+        listing = WxsphFormListing(self.page, self.page.locator('body'), None,
+                                  category_hints=(expression,), attribute_runtime=runtime)
+        listing.panel = self.page.locator('#panel')
+        return listing
+
+    async def test_category_search_splits_excel_or_before_typing(self):
+        listing = await self._category_search_listing("男装 > 牛仔裤/男士直筒牛仔裤")
+        self.assertEqual(await listing.apply_recommended_category(), "男装 > 牛仔裤")
+        self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤'])
+
+    async def test_category_review_waits_for_all_terms_and_restores_earlier_result(self):
+        runtime = type('Runtime', (), {})()
+
+        async def resolve(request):
+            self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤', '男士直筒牛仔裤'])
+            self.assertEqual({c.label for c in request.candidates}, {'男装 > 工装裤', '男装 > 西裤'})
+            candidate = next(c for c in request.candidates if c.label == '男装 > 工装裤')
+            return ResolvedAttribute(candidate.value_id, candidate.label, 'review', 'snapshot')
+
+        runtime.resolve = AsyncMock(side_effect=resolve)
+        listing = await self._category_search_listing("牛仔裤/男士直筒牛仔裤", runtime)
+        await self.page.evaluate("""() => {
+          window.showCategory = value => {
+            window.searches.push(value);
+            const row=document.createElement('li');
+            row.textContent=value==='牛仔裤' ? '男装 > 工装裤' : '男装 > 西裤';
+            row.onclick=()=>{window.chosen=row.textContent;document.getElementById('chosen').textContent='已选：'+row.textContent;};
+            document.getElementById('results').replaceChildren(row);
+          };
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 工装裤')
+        self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤', '男士直筒牛仔裤', '牛仔裤'])
+
+    def test_shoe_scene_single_select_uses_first_excel_candidate(self):
+        self.assertEqual(
+            WxsphFormListing._selection_groups_for_control(
+                "适用场景", "日常，休闲", multi=False,
+                category_hints=("流行男鞋 > 休闲皮鞋",),
+            ),
+            (("日常，休闲", "日常", "休闲"),),
+        )
+        self.assertEqual(
+            WxsphFormListing._selection_groups_for_control(
+                "适用场景", "日常，休闲", multi=True,
+                category_hints=("流行男鞋 > 休闲皮鞋",),
+            ),
+            (("日常",), ("休闲",)),
+        )
+        self.assertEqual(
+            WxsphFormListing._selection_groups_for_control(
+                "适用场景", "日常，休闲", multi=False,
+                category_hints=("男装 > 卫衣",),
+            ),
+            (("日常，休闲", "日常", "休闲"),),
+        )
+
+    async def test_persisted_readback_uses_pre_save_resolved_values(self):
+        listing = await self._listing()
+        await self.page.locator('#fabric input').evaluate("e => e.value = '棉'")
+        fields = parse_wxsph_fields({'面料材质': '旧 Excel 值'})
+        report = await listing._verify_persisted_attributes(
+            fields, expected_attributes={'面料材质': ('棉',)})
+        self.assertEqual(report['attributes']['面料材质'], ('棉',))
+        await self.page.locator('#fabric input').evaluate("e => e.value = '聚酯纤维'")
+        with self.assertRaises(WxsphFormListingError):
+            await listing._verify_persisted_attributes(
+                fields, expected_attributes={'面料材质': ('棉',)})
+
+    async def test_persisted_readback_honors_reviewed_no_fill(self):
+        class Runtime:
+            @staticmethod
+            def intentionally_omitted(platform_id, field_label):
+                return platform_id == "wxsph" and field_label == "上市时间"
+
+        listing = await self._listing(Runtime())
+        await self.page.locator("[role=tabpanel]").evaluate(
+            """root => root.querySelector('h3').insertAdjacentHTML(
+              'afterend',
+              '<div class="el-form-item is-required" id="listing-date">'
+              + '<label class="el-form-item__label">上市时间</label>'
+              + '<div class="el-form-item__content"><div class="el-select">'
+              + '<input class="el-input__inner" readonly value="">'
+              + '<div class="el-select-dropdown" style="display:none"><ul></ul></div>'
+              + '</div></div></div>'
+            )"""
+        )
+        report = await listing._verify_persisted_attributes(
+            parse_wxsph_fields({"上市时间": "2026/2026年秋季/2026.10.07"}),
+            expected_attributes={},
+        )
+
+        self.assertEqual(
+            report["skipped_reviewed_no_fill"]["上市时间"],
+            "审核明确不填写",
+        )
+        self.assertNotIn("上市时间", report["attributes"])
+
+        await self.page.locator("#listing-date .el-select input").evaluate(
+            "element => element.value = '2026年春季'"
+        )
+        with self.assertRaises(WxsphFormListingError):
+            await listing._verify_persisted_attributes(
+                parse_wxsph_fields({"上市时间": "2026/2026年秋季/2026.10.07"}),
+                expected_attributes={},
+            )
+
+    async def test_reviewed_no_fill_clears_existing_single_select(self):
+        class Runtime:
+            @staticmethod
+            def intentionally_omitted(platform_id, field_label):
+                return platform_id == "wxsph" and field_label == "上市时间"
+
+        listing = await self._listing(Runtime())
+        await self.page.locator("[role=tabpanel]").evaluate(
+            """root => root.querySelector('h3').insertAdjacentHTML(
+              'afterend',
+              '<div class="el-form-item is-required" id="listing-date">'
+              + '<label class="el-form-item__label">上市时间</label>'
+              + '<div class="el-form-item__content"><div class="el-select">'
+              + '<input class="el-input__inner" readonly value="2026年春季">'
+              + '<i class="el-select__clear">×</i>'
+              + '<div class="el-select-dropdown" style="display:none"><ul></ul></div>'
+              + '</div></div></div>'
+            )"""
+        )
+        await self.page.locator("#listing-date .el-select__clear").evaluate(
+            "element => element.addEventListener('click', () => element.previousElementSibling.value = '')"
+        )
+        await listing._clear_single_select(
+            listing.panel.locator("#listing-date .el-select")
+        )
+        self.assertEqual(
+            await self.page.locator("#listing-date .el-select input").input_value(), ""
+        )
+
+    async def test_reviewed_no_fill_clears_single_select_without_clear_icon(self):
+        listing = await self._listing()
+        await self.page.set_content(
+            '<div class="el-select"><input class="el-input__inner" readonly value="2026年春季">'
+            '<div class="el-select-dropdown"><ul><li class="el-select-dropdown__item selected">2026年春季</li></ul></div></div>'
+        )
+        await listing._clear_single_select(self.page.locator(".el-select"))
+        self.assertEqual(await self.page.locator(".el-input__inner").input_value(), "")
+
+    async def test_no_fill_clears_bound_value_before_save(self):
+        listing = await self._listing()
+        await self.page.set_content('<div class="el-select"><input class="el-input__inner" readonly value="2026年春季"></div>')
+        select = self.page.locator('.el-select')
+        await select.evaluate("""element => {
+          window.savedValue = 'spring';
+          element.__vue__ = {
+            value: 'spring',
+            deleteSelected() {
+              this.value = '';
+              window.savedValue = '';
+              element.querySelector('input').value = '';
+            }
+          };
+        }""")
+        await listing._clear_single_select(select)
+        self.assertEqual(await self.page.evaluate('window.savedValue'), '')
+        self.assertEqual(await select.evaluate('e => e.__vue__.value'), '')
+
+    async def test_no_fill_clears_hidden_bound_value_when_input_is_blank(self):
+        listing = await self._listing()
+        await self.page.set_content('<div class="el-select"><input class="el-input__inner" readonly value=""></div>')
+        select = self.page.locator('.el-select')
+        await select.evaluate("""element => {
+          window.savedValue = 'spring';
+          element.__vue__ = {
+            value: 'spring',
+            deleteSelected() {
+              this.value = '';
+              window.savedValue = '';
+            }
+          };
+        }""")
+        await listing._clear_single_select(select)
+        self.assertEqual(await self.page.evaluate('window.savedValue'), '')
+        self.assertEqual(await select.evaluate('e => e.__vue__.value'), '')
+
+    async def test_collapsed_multi_clears_actual_selection_by_dom(self):
+        await self.page.set_content('''<div id="select" class="el-select">
+          <div class="el-select__tags"><span class="el-tag">已选择 1</span></div>
+          <input class="el-input__inner" readonly>
+          <div class="el-select-dropdown"><ul>
+          <li class="el-select-dropdown__item selected">明线</li>
+          <li class="el-select-dropdown__item">做旧</li></ul></div></div>''')
+        await self.page.locator('#select').evaluate("""e => {
+          e.__vue__ = {selected: [{value:'明线', currentLabel:'明线'}]};
+          e.querySelector('li').onclick = ev => {
+            e.__vue__.selected = [];
+            ev.currentTarget.classList.remove('selected');
+          };
+        }""")
+        from unittest.mock import AsyncMock
+        listing = object.__new__(WxsphFormListing)
+        listing._open_select = AsyncMock()
+        listing._dismiss_select_dropdown = AsyncMock()
+        select = self.page.locator('#select')
+        self.assertEqual(await listing._read_select_values(select, multi=True), ('明线',))
+        await listing._clear_multi_select(select)
+        self.assertEqual(await listing._read_select_values(select, multi=True), ())
+
+    async def test_reviewed_label_uses_dom_not_conflicting_api_id(self):
+        listing = await self._listing()
+        item = self.page.locator('#fabric')
+        await item.locator('li').nth(0).evaluate("e => e.textContent = '明线'")
+        await item.locator('li').nth(1).evaluate("e => e.textContent = '做旧'")
+        await item.locator('.el-select').evaluate("""e => {
+          e.__vue__ = {cachedOptions: [
+            {value: 'wrong-id', currentLabel: '明线'},
+            {value: 'right-id', currentLabel: '做旧'}],
+            handleOptionSelect() { throw new Error('must click DOM'); }};
+        }""")
+        listing._resolved_api_options['面料材质'] = {'做旧': ('wrong-id', '做旧')}
+        result = await listing._apply_resolved_api_options('面料材质', item, ('做旧',))
+        self.assertEqual(result, ('做旧',))
+
+    async def test_resolved_option_recovers_when_popper_hides_before_click(self):
+        listing = await self._listing()
+        item = self.page.locator('#fabric')
+        listing._resolved_api_options['面料材质'] = {'棉': ('cotton', '棉')}
+        original = listing._visible_dom_options
+        observations = 0
+
+        async def hide_first_popper(select):
+            nonlocal observations
+            dropdown, options = await original(select)
+            observations += 1
+            if observations == 1:
+                await dropdown.evaluate("element => element.style.display = 'none'")
+            return dropdown, options
+
+        listing._visible_dom_options = hide_first_popper
+
+        actual = await listing._apply_resolved_api_options('面料材质', item, ('棉',))
+
+        self.assertEqual(actual, ('棉',))
+        self.assertEqual(observations, 2)
+        self.assertEqual(await item.locator('.el-select input').input_value(), '棉')
+
+    async def test_approval_is_used_before_excel_write_attempt(self):
+        from unittest.mock import AsyncMock
+        class Runtime:
+            def confirmed_choice(self, request):
+                return ResolvedAttribute('cotton', '棉', 'human_override', 'approved')
+        listing = await self._listing(Runtime())
+        listing._excel_before_review = AsyncMock(side_effect=AssertionError('must not try old Excel'))
+        result = await listing._resolve_learning_select_groups(
+            '面料材质', self.page.locator('#fabric'), (('旧值',),))
+        self.assertEqual(result, ('棉',))
+        listing._excel_before_review.assert_not_awaited()
+
+    async def test_confirmed_no_fill_is_remembered_for_saved_readback(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        class Runtime:
+            def __init__(self):
+                self.remembered = None
+
+            def confirmed_choice(self, request):
+                return ResolvedAttribute(NO_FILL_VALUE_ID, "", "human_no_fill", "schema")
+
+            def remember_resolved(self, request, resolved):
+                self.remembered = (request, resolved)
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+        listing._captured_api_field = AsyncMock(
+            return_value=(
+                SimpleNamespace(
+                    source_id="fabric",
+                    custom_allowed=False,
+                    option_values=(SimpleNamespace(value_id="cotton", label="棉"),),
+                ),
+                "category",
+            )
+        )
+        result = await listing._resolve_learning_select_groups(
+            "面料材质", self.page.locator("#fabric"), (("旧值",),)
+        )
+
+        self.assertEqual(result, ())
+        self.assertIsNotNone(runtime.remembered)
+
+    async def test_registered_choice_survives_option_reordering(self):
+        await self.page.set_content('<div id="select"></div>')
+        select = self.page.locator('#select')
+        await select.evaluate("""element => {
+          element.__vue__ = {cachedOptions: [
+            {value: 'line', currentLabel: '明线'},
+            {value: 'aged', currentLabel: '做旧'}],
+            handleOptionSelect(option) { window.selectedLabel = option.currentLabel; }};
+        }""")
+        listing = object.__new__(WxsphFormListing)
+        self.assertTrue(await listing._apply_registered_vue_option(select,
+            {'source': 'cachedOptions', 'index': '0', 'value': 'aged', 'name': '做旧'}))
+        self.assertEqual(await self.page.evaluate('window.selectedLabel'), '做旧')
+
     async def asyncSetUp(self):
         from playwright.async_api import async_playwright
 
@@ -32,16 +358,27 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.playwright.stop()
 
-    async def _listing(self):
+    async def _listing(self, attribute_runtime=None):
+        response_body = json.dumps(
+            {
+                "attr": [
+                    {"id": "fabric", "name": "面料材质", "inputType": "select", "values": [{"id": "cotton", "name": "棉"}, {"id": "polyester", "name": "聚酯纤维"}]},
+                    {"id": "fabric-percent", "name": "面料材质成分含量"},
+                    {"id": "lining", "name": "里料材质", "inputType": "select", "values": [{"id": "cotton", "name": "棉"}]},
+                    {"id": "lining-percent", "name": "里料材质成分含量"},
+                    {"id": "content-band", "name": "材质成分含量", "inputType": "select", "values": [{"id": "51-70", "name": "51%-70%"}, {"id": "95-plus", "name": "95%及以上"}]},
+                    {"id": "material-content", "name": "材质成分"},
+                    {"id": "scene", "name": "适用场景", "inputType": "select", "values": [{"id": "daily", "name": "日常"}, {"id": "outdoor", "name": "户外"}]},
+                    {"id": "waist", "name": "腰型", "inputType": "select", "values": [{"id": "mid", "name": "中腰"}, {"id": "natural", "name": "自然腰"}]},
+                ]
+            },
+            ensure_ascii=False,
+        )
         await self.page.route(
-            "**/wxsph/getCategoryProperties.json",
+            "**/wxsph/getCategoryProperties.json*",
             lambda route: route.fulfill(
                 content_type="application/json",
-                body='{"attr":['
-                '{"name":"面料材质"},{"name":"面料材质成分含量"},'
-                '{"name":"里料材质"},{"name":"里料材质成分含量"},'
-                '{"name":"材质成分含量"},{"name":"材质成分"},'
-                '{"name":"适用场景"}]}'
+                body=response_body,
             ),
         )
         await self.page.set_content(
@@ -78,6 +415,10 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
               <div class="el-form-item" id="scene">
                 <label class="el-form-item__label">适用场景</label>
                 <div class="el-form-item__content">{scene}</div>
+              </div>
+              <div class="el-form-item" id="waist">
+                <label class="el-form-item__label">腰型</label>
+                <div class="el-form-item__content">{waist}</div>
               </div>
               <h3>规格明细</h3>
               <section id="batch-area">
@@ -118,7 +459,7 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
               function openTab(tab) {{
                 tab.setAttribute('aria-selected', 'true');
                 document.querySelector('[role=tabpanel]').style.display='block';
-                fetch('https://scm.superboss.cc/wxsph/getCategoryProperties.json');
+                fetch('https://scm.superboss.cc/wxsph/getCategoryProperties.json?categoryId=545735');
               }}
               function openSelect(input) {{
                 document.querySelectorAll('.el-select-dropdown').forEach(node => node.style.display='none');
@@ -176,12 +517,69 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
                 lining=select_markup(["棉"]),
                 content_band=select_markup(["51%-70%", "95%及以上"]),
                 scene=select_markup(["日常", "户外"]),
+                waist=select_markup(["中腰", "自然腰"]),
                 unit=select_markup(["%"]),
             )
         )
-        listing = WxsphFormListing(self.page, self.page.locator("body"), None)
+        listing = WxsphFormListing(
+            self.page,
+            self.page.locator("body"),
+            None,
+            attribute_runtime=attribute_runtime,
+        )
         await listing.open()
         return listing
+
+    async def test_actively_fetches_current_schema_when_open_page_emits_no_request(self):
+        async def route_request(route):
+            url = route.request.url
+            if "/wxsph/detail.json" in url:
+                body = {"result": True, "data": {"categoryId": "545735"}}
+            elif "/wxsph/getCategoryProperties.json" in url:
+                body = {
+                    "result": True,
+                    "data": {
+                        "attr": {
+                            "productAttrList": [
+                                {
+                                    "name": "裤长",
+                                    "type": "select_one",
+                                    "typeV2": "select_one",
+                                    "value": "短裤;长裤",
+                                    "isRequired": "true",
+                                }
+                            ]
+                        }
+                    },
+                }
+            else:
+                body = "<html><body>微信小店资料</body></html>"
+                await route.fulfill(content_type="text/html", body=body)
+                return
+            await route.fulfill(
+                content_type="application/json",
+                body=json.dumps(body, ensure_ascii=False),
+            )
+
+        await self.page.route("https://scm.superboss.cc/**", route_request)
+        await self.page.goto("https://scm.superboss.cc/supplier/prod/center")
+        listing = WxsphFormListing(
+            self.page,
+            self.page.locator("body"),
+            None,
+            attribute_runtime=object(),
+        )
+        listing.base_item_id = "base-1"
+
+        await listing._ensure_api_attribute_schema()
+        field, category_id = await listing._captured_api_field("裤长")
+
+        self.assertEqual(category_id, "545735")
+        self.assertEqual(field.source_id, "裤长")
+        self.assertEqual(
+            tuple(option.label for option in field.option_values),
+            ("短裤", "长裤"),
+        )
 
     async def test_waits_for_category_attributes_that_render_after_tab_is_visible(self):
         await self.page.set_content(
@@ -193,6 +591,7 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
             <div id="wxsph-panel" role="tabpanel"
                  aria-label="微信小店（视频号）资料"
                  style="display:none">
+              <nav class="anchor-nav"><button>类目属性</button><button>运费模板</button></nav>
               <h3>类目属性</h3>
               <div id="attribute-root"></div>
               <h3>规格明细</h3>
@@ -224,6 +623,236 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tuple(items), ("面料材质",))
 
+    async def test_reactivates_shared_tab_once_when_attribute_json_was_not_requested(self):
+        response_body = json.dumps(
+            {
+                "attr": [
+                    {
+                        "id": "length",
+                        "name": "裤长",
+                        "inputType": "select",
+                        "values": [{"id": "long", "name": "长裤"}],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        await self.page.route(
+            "**/wxsph/getCategoryProperties.json*",
+            lambda route: route.fulfill(
+                content_type="application/json",
+                body=response_body,
+            ),
+        )
+        await self.page.set_content(
+            """
+            <button id="base-tab" role="tab" aria-selected="true"
+                    onclick="openBase()">基础资料</button>
+            <button id="wxsph-tab" role="tab" aria-selected="false"
+                    data-clicks="0" onclick="openWxsph(this)">
+              微信小店（视频号）资料
+            </button>
+            <div role="tabpanel" aria-label="基础资料">基础资料</div>
+            <div role="tabpanel" aria-label="微信小店（视频号）资料"
+                 style="display:none">
+              <h3>类目属性</h3>
+              <div class="el-form-item is-required">
+                <label class="el-form-item__label">裤长</label>
+                <div class="el-form-item__content"><input></div>
+              </div>
+              <h3>规格明细</h3>
+            </div>
+            <script>
+              function openBase() {
+                document.getElementById('base-tab').setAttribute('aria-selected', 'true');
+                document.getElementById('wxsph-tab').setAttribute('aria-selected', 'false');
+              }
+              function openWxsph(tab) {
+                document.getElementById('base-tab').setAttribute('aria-selected', 'false');
+                tab.setAttribute('aria-selected', 'true');
+                document.querySelector('[aria-label="微信小店（视频号）资料"]').style.display = 'block';
+                const clicks = Number(tab.dataset.clicks) + 1;
+                tab.dataset.clicks = String(clicks);
+                if (clicks > 1) {
+                  fetch('https://scm.superboss.cc/wxsph/getCategoryProperties.json?categoryId=545735');
+                }
+              }
+            </script>
+            """
+        )
+
+        class Runtime:
+            pass
+
+        listing = WxsphFormListing(
+            self.page,
+            self.page.locator("body"),
+            None,
+            attribute_runtime=Runtime(),
+        )
+        listing.attribute_stable_seconds = 0.1
+        await listing.open()
+        items = await listing._attribute_items()
+        await listing._ensure_api_attribute_schema()
+        field, category_id = await listing._captured_api_field("裤长")
+
+        self.assertEqual(category_id, "545735")
+        self.assertEqual(field.source_id, "length")
+        self.assertEqual(
+            await self.page.locator("#wxsph-tab").get_attribute("data-clicks"),
+            "2",
+        )
+
+    async def test_empty_auxiliary_response_does_not_erase_captured_schema(self):
+        class Response:
+            status = 200
+
+            def __init__(self, body):
+                self.url = (
+                    "https://scm.superboss.cc/wxsph/"
+                    "getCategoryProperties.json?categoryId=545735"
+                )
+                self.body = body
+
+            async def json(self):
+                return self.body
+
+        listing = WxsphFormListing(self.page, self.page.locator("body"), None)
+        listing._api_observations = {}
+        listing._api_capture_tasks = []
+        path = "/wxsph/getCategoryProperties.json"
+        await listing._capture_api_response(
+            path,
+            Response(
+                {
+                    "attr": [
+                        {
+                            "id": "length",
+                            "name": "裤长",
+                            "inputType": "select",
+                            "values": [{"id": "long", "name": "长裤"}],
+                        }
+                    ]
+                }
+            ),
+        )
+        await listing._capture_api_response(path, Response({"attr": []}))
+
+        field, category_id = await listing._captured_api_field("裤长")
+
+        self.assertEqual(category_id, "545735")
+        self.assertEqual(field.source_id, "length")
+
+    async def test_open_preserves_schema_captured_before_drawer_was_rendered(self):
+        response_body = json.dumps(
+            {
+                "attr": [
+                    {
+                        "id": "length",
+                        "name": "裤长",
+                        "inputType": "select",
+                        "values": [{"id": "long", "name": "长裤"}],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        await self.page.route(
+            "**/wxsph/getCategoryProperties.json*",
+            lambda route: route.fulfill(
+                content_type="application/json",
+                body=response_body,
+            ),
+        )
+
+        listing = WxsphFormListing(
+            self.page,
+            self.page.locator("body"),
+            None,
+            attribute_runtime=object(),
+        )
+        async with self.page.expect_response(
+            lambda response: "getCategoryProperties.json" in response.url
+        ):
+            await self.page.set_content(
+                """
+            <button role="tab" aria-selected="true">
+              微信小店（视频号）资料
+            </button>
+            <div role="tabpanel" aria-label="微信小店（视频号）资料">
+              <h3>类目属性</h3>
+              <div class="el-form-item is-required">
+                <label class="el-form-item__label">裤长</label>
+                <div class="el-form-item__content"><input></div>
+              </div>
+              <h3>规格明细</h3>
+            </div>
+            <script>
+              fetch('https://scm.superboss.cc/wxsph/getCategoryProperties.json?categoryId=545735');
+            </script>
+                """
+            )
+        listing.drawer = self.page.locator("body")
+        await listing.open()
+        field, category_id = await listing._captured_api_field("裤长")
+
+        self.assertEqual(category_id, "545735")
+        self.assertEqual(field.source_id, "length")
+
+    async def test_new_presale_mode_reveals_batch_delivery(self):
+        listing = await self._listing()
+        await listing.panel.evaluate('''e => {
+          e.insertAdjacentHTML('afterbegin', '<label class="el-radio"><input type="radio" name="new-mode">按规格预售</label>');
+          const button = document.getElementById('delivery-batch');
+          button.style.display = 'none';
+          e.querySelector('input[name="new-mode"]').onchange = () => button.style.display = '';
+        }''')
+        result = await listing.apply_batch_delivery()
+        self.assertTrue(await listing.panel.get_by_role('radio', name='按规格预售', exact=True).is_checked())
+        self.assertEqual(result['days'], '15')
+
+    async def test_custom_delivery_modal_without_dialog_class_or_role(self):
+        listing = await self._listing()
+        await self.page.locator('#delivery-dialog').evaluate("e => {e.className='km-popup';e.removeAttribute('role');}")
+        result = await listing.apply_batch_delivery()
+        self.assertEqual(result['days'], '15')
+        self.assertEqual(result['row_count'], 2)
+
+    async def test_review_boundary_precedes_sku_and_delivery(self):
+        from attribute_runtime import ReviewBatchRequired, ReviewRequired
+        from tests.test_attribute_runtime import make_length_request
+        from types import SimpleNamespace
+        review = ReviewRequired('review', make_length_request(), 'uncertain', 'snapshot')
+        listing = await self._listing()
+        listing.attribute_runtime = SimpleNamespace(raise_deferred_reviews=lambda: (_ for _ in ()).throw(ReviewBatchRequired((review,))))
+        listing.fill_category_attributes = AsyncMock(return_value={'attributes': {}})
+        listing.fill_sku_batch = AsyncMock()
+        listing.apply_batch_delivery = AsyncMock()
+        with self.assertRaises(ReviewBatchRequired):
+            await listing.apply_excel_fields(SimpleNamespace(fields={}))
+        listing.fill_sku_batch.assert_not_awaited()
+        listing.apply_batch_delivery.assert_not_awaited()
+
+    async def test_season_uses_complete_first_plan_and_later_fallback(self):
+        listing = await self._listing()
+        await self.page.set_content('<div id="season"></div>')
+        select = self.page.locator('#season')
+        await select.evaluate("e => {e.__vue__={cachedOptions:['秋','冬','春秋'].map(v=>({value:v,label:v}))};}")
+        self.assertEqual(await listing._excel_groups_for_select(select, '适用季节', '秋季，冬季/春秋冬/春秋', multi=True), (('秋',), ('冬',)))
+        await select.evaluate("e => {e.__vue__.cachedOptions=[{value:'春秋',label:'春秋'}];}")
+        self.assertEqual(await listing._excel_groups_for_select(select, '适用季节', '秋季，冬季/春秋冬/春秋', multi=True), (('春秋',),))
+
+    async def test_registered_option_recovers_hidden_dropdown_and_readback(self):
+        listing = await self._listing()
+        select = self.page.locator('#fabric .el-select')
+        await select.evaluate("""e => {
+          e.__vue__.cachedOptions=[{value:'棉',currentLabel:'棉'}];
+          e.querySelector('input').value='';
+          e.__vue__.handleOptionSelect=o=>{e.querySelector('input').value=o.currentLabel;};
+        }""")
+        listing._visible_dom_options = AsyncMock(side_effect=TaobaoListingError('未找到可见选项'))
+        self.assertEqual(await listing._select_values(select, (('棉',),), label='里料材质', multi=False, allow_review=False), ('棉',))
+
     async def test_fills_attributes_batch_once_and_fixed_weight(self):
         listing = await self._listing()
         fields = parse_wxsph_fields(
@@ -247,15 +876,15 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
             ("95%及以上",),
         )
         self.assertEqual(
-            await self.page.locator("#fabric-percent input:not([readonly])").input_value(), "100"
+            await self.page.locator("#fabric-percent input:not([readonly])").input_value(), "95"
         )
         self.assertEqual(
-            await self.page.locator("#lining-percent input:not([readonly])").input_value(), ""
+            await self.page.locator("#lining-percent input:not([readonly])").input_value(), "95"
         )
         self.assertEqual(
             await self.page.locator("#material-content input").input_value(), "棉100%"
         )
-        self.assertIn(
+        self.assertNotIn(
             "里料材质成分含量",
             report["attributes"]["skipped_optional_percentages"],
         )
@@ -297,6 +926,226 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted["delivery"]["days"], "15")
         self.assertEqual(persisted["weight"], "1")
         self.assertEqual(await self.page.locator("#batch").get_attribute("data-clicks"), "1")
+
+    async def test_learning_uses_api_candidate_ids_and_dom_cross_check(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                match = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    match.value_id,
+                    match.label,
+                    "explicit_text",
+                    "snapshot-1",
+                )
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+        fields = parse_wxsph_fields(
+            {
+                "面料材质/水洗标/吊牌图/面料/面料俗称": "棉（100%）",
+                "里料材质/里料": "棉",
+                "里料材质成分含量/材质成分含量/面料材质成分含量": "95%及以上",
+                "材质成分/材质": "棉（100%）",
+                "适用场景": "日常",
+                "吊牌价/价格/基本售价/商品价格": "586",
+                "价格/京东价/市场价/售卖价/售价": "586",
+                "数量": "100",
+            }
+        )
+
+        await listing.apply_excel_fields(fields)
+
+        self.assertEqual(
+            [request.field_id for request in runtime.requests],
+            ["fabric", "lining", "content-band", "scene"],
+        )
+        self.assertTrue(
+            all(request.category_leaf_id == "545735" for request in runtime.requests)
+        )
+        self.assertEqual(
+            tuple(
+                (candidate.value_id, candidate.label)
+                for candidate in runtime.requests[0].candidates
+            ),
+            (("cotton", "棉"), ("polyester", "聚酯纤维")),
+        )
+
+    async def test_ordered_or_select_chooses_first_live_candidate(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                match = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    match.value_id,
+                    match.label,
+                    "explicit_text",
+                    "snapshot-1",
+                )
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+        # A persisted later OR alternative must not outrank the first live
+        # candidate from Excel on a subsequent run.
+        await self.page.locator("#waist input").evaluate(
+            "element => { element.value = '自然腰'; }"
+        )
+        fields = parse_wxsph_fields(
+            {
+                "面料材质/水洗标/吊牌图/面料/面料俗称": "棉（100%）",
+                "里料材质/里料": "棉",
+                "里料材质成分含量/材质成分含量/面料材质成分含量": "95%及以上",
+                "材质成分/材质": "棉（100%）",
+                "适用场景": "日常",
+                "腰型": "中腰/自然腰",
+                "吊牌价/价格/基本售价/商品价格": "586",
+                "价格/京东价/市场价/售卖价/售价": "586",
+                "数量": "100",
+            }
+        )
+
+        report = await listing.apply_excel_fields(fields)
+
+        self.assertEqual(report["attributes"]["attributes"]["腰型"], ("中腰",))
+        waist_request = next(
+            request for request in runtime.requests if request.field_id == "waist"
+        )
+        self.assertEqual(waist_request.excel_value, "中腰")
+
+    async def test_reviewed_single_fabric_is_not_replaced_by_excel_components(self):
+        class Runtime:
+            async def resolve(self, request):
+                candidate = request.candidates[0]
+                return ResolvedAttribute(candidate.value_id, candidate.label, 'human_override', 'approved')
+        listing = await self._listing(Runtime())
+        from unittest.mock import AsyncMock
+        listing._fill_fabric_attribute = AsyncMock(side_effect=AssertionError('must preserve reviewed value'))
+        fields = parse_wxsph_fields({'面料材质':'棉50%，聚酯纤维50%', '适用场景':'日常',
+                                    '材质成分/材质':'棉50%，聚酯纤维50%',
+                                    '里料材质成分含量/材质成分含量/面料材质成分含量':'95%及以上/95',
+                                    '吊牌价':'586','价格':'586','数量':'100'})
+        await listing.apply_excel_fields(fields)
+        listing._fill_fabric_attribute.assert_not_awaited()
+
+    async def test_material_slash_is_ordered_or_and_percentage_is_separate(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                match = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    match.value_id,
+                    match.label,
+                    "explicit_text",
+                    "snapshot-material-or",
+                )
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+        fields = parse_wxsph_fields(
+            {
+                "面料材质/水洗标/吊牌图/面料/面料俗称": "棉100%/棉/棉布",
+                "里料材质/里料": "棉/棉混纺布",
+                "里料材质成分含量/材质成分含量/面料材质成分含量": "95%及以上/95",
+                "材质成分/材质": "棉100%/棉",
+                "适用场景": "日常",
+                "吊牌价/价格/基本售价/商品价格": "586",
+                "价格/京东价/市场价/售卖价/售价": "586",
+                "数量": "100",
+            }
+        )
+
+        report = await listing.apply_excel_fields(fields)
+
+        self.assertEqual(report["attributes"]["attributes"]["面料材质"], ("棉",))
+        self.assertEqual(report["attributes"]["attributes"]["里料材质"], ("棉",))
+        material_request = next(
+            request for request in runtime.requests if request.field_id == "fabric"
+        )
+        lining_request = next(
+            request for request in runtime.requests if request.field_id == "lining"
+        )
+        self.assertEqual(material_request.excel_value, "棉")
+        self.assertEqual(lining_request.excel_value, "棉")
+        self.assertEqual(
+            await self.page.locator("#fabric-percent input:not([readonly])").input_value(),
+            "95",
+        )
+        self.assertEqual(
+            await self.page.locator("#lining-percent input:not([readonly])").input_value(),
+            "95",
+        )
+        self.assertEqual(
+            await self.page.locator("#material-content input").input_value(),
+            "棉100%",
+        )
+
+    async def test_material_ordered_or_uses_api_option_outside_dom_viewport(self):
+        class Runtime:
+            async def resolve(self, request):
+                match = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    match.value_id,
+                    match.label,
+                    "exact_excel",
+                    "snapshot-virtual-material",
+                )
+
+        listing = await self._listing(Runtime())
+        item = self.page.locator("#fabric")
+        await item.locator(".el-select").evaluate(
+            """element => {
+              element.querySelector('input').value = '棉布';
+              const options = Array.from(
+                element.querySelectorAll('.el-select-dropdown__item')
+              );
+              options.find(option => option.textContent.trim() === '棉').remove();
+              element.querySelector('ul').insertAdjacentHTML(
+                'beforeend',
+                '<li class="el-select-dropdown__item" onclick="chooseOption(this)">棉布</li>'
+              );
+            }"""
+        )
+        await listing._ensure_api_attribute_schema()
+
+        resolved = await listing._resolve_learning_select_groups(
+            "面料材质", item, (("棉", "棉布"),)
+        )
+        actual = await listing._fill_attribute(
+            "面料材质",
+            item,
+            "棉/棉布",
+            exact_values=resolved,
+            required=True,
+        )
+
+        self.assertEqual(resolved, ("棉",))
+        # DOM 中精确“棉”不可点击时，材质字段允许唯一模糊匹配“棉布”。
+        self.assertEqual(actual, ("棉布",))
 
     async def test_post_save_readback_rejects_lost_sku_value_without_rewriting(self):
         listing = await self._listing()

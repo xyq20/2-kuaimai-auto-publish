@@ -14,11 +14,13 @@ from typing import Any, Optional, Tuple
 
 from size_image_recognition import (
     RecognitionError,
+    recognize_clothing_recommendations,
     recognize_recommendations,
     recognize_size_lengths,
 )
 from tmall_data import IMAGE_SUFFIXES, TmallFields
 from tmall_rules import TmallRuleError, normalize_tmall_spec_values
+from shoe_size import recognize_shoe_measurements
 
 
 CATEGORY_PANTS = "pants"
@@ -258,7 +260,15 @@ def resolve_tmall_size_sources(
         except TmallRuleError as error:
             raise TmallSizeSourceError(str(error)) from error
 
-    if category_kind == CATEGORY_PANTS:
+    if category_kind == CATEGORY_FOOTWEAR and size_chart_image is not None:
+        try:
+            recognized = recognize_shoe_measurements(_required_size_chart(size_chart_image), sizes)
+        except RecognitionError as error:
+            raise TmallSizeSourceError(str(error)) from error
+        headers = ("尺码", "脚长(cm)")
+        rows = tuple({"尺码": item.size, "脚长(cm)": item.foot_length} for item in recognized)
+        evidence = ("excel:尺码", "ocr:尺码信息表")
+    elif category_kind == CATEGORY_PANTS:
         size_chart = _required_size_chart(size_chart_image)
         height_weight = discover_height_weight_image(product_dir)
         if height_weight is None:
@@ -301,21 +311,49 @@ def resolve_tmall_size_sources(
         )
     elif category_kind == CATEGORY_CLOTHING:
         size_chart = _required_size_chart(size_chart_image)
+        height_weight = discover_height_weight_image(product_dir)
+        if height_weight is None:
+            raise TmallSizeReviewRequired(
+                "服装天猫尺码需要身高体重推荐表，当前没有唯一可用图片",
+                reason_code="missing_height_weight_image",
+            )
         try:
-            recognized = recognize_size_lengths(size_chart, sizes, "clothing")
+            recognized = recognize_clothing_recommendations(
+                size_chart, height_weight, sizes
+            )
         except RecognitionError as error:
             raise TmallSizeReviewRequired(
-                "服装天猫衣长 OCR 无法安全解析：{0}".format(error),
+                "服装天猫尺码 OCR 无法安全解析：{0}".format(error),
                 reason_code="size_ocr_failed",
             ) from error
         recognized = tuple(recognized)
         _require_recognized_sizes(recognized, sizes)
-        headers = ("尺码", "衣长(cm)")
+        headers = (
+            "尺码",
+            "身高(cm)",
+            "体重(kg)",
+            "胸围(cm)",
+            "肩宽(cm)",
+            "袖长(cm)",
+            "衣长(cm)",
+        )
         rows = tuple(
-            {"尺码": item.size, "衣长(cm)": item.length}
+            {
+                "尺码": item.size,
+                "身高(cm)": (item.height_min, item.height_max),
+                "体重(kg)": (item.weight_min, item.weight_max),
+                "胸围(cm)": item.chest,
+                "肩宽(cm)": item.shoulder,
+                "袖长(cm)": item.sleeve,
+                "衣长(cm)": item.length,
+            }
             for item in recognized
         )
-        evidence = ("excel:尺码", "ocr:尺码信息表")
+        evidence = (
+            "excel:尺码",
+            "ocr:尺码信息表",
+            "ocr:身高体重推荐表",
+        )
     else:
         headers = ("尺码",)
         rows = tuple({"尺码": size} for size in sizes)

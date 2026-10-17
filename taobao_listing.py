@@ -2,16 +2,42 @@
 
 from __future__ import annotations
 
+import inspect
+
+from field_policies import (
+    heel_height_option_matches,
+    listing_date_text_value,
+    match_option_candidates,
+    match_style_option_candidates,
+    positional_listing_date_value,
+    season_option_aliases,
+    style_option_aliases,
+    without_color_attributes,
+)
+
 import asyncio
 import json
 import re
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
+from playwright.async_api import Error as PlaywrightError
 
+from attribute_runtime import AttributeRequest, excel_selection_plans, split_multi_choice
+from category_profile import category_profile, category_search_terms, choose_category_candidate
 from douyin_data import DouyinDataError, MaterialComponent, parse_materials
+from learning_models import CandidateValue, canonical_sha256
+from money_values import MoneyValueError, normalize_money_value
+from platform_candidate_source import (
+    select_supports_multiple,
+    select_multiple_limit,
+    CandidateSourceError,
+    validate_observed_selection,
+)
 from sync_validation import split_or_values
+from taobao_api_index import TaobaoApiJsonIndex
 
 
 class TaobaoListingError(RuntimeError):
@@ -19,6 +45,9 @@ class TaobaoListingError(RuntimeError):
 
 
 REMOTE_OPTION_SEARCH_SECONDS = 1.5
+# 选中材质名会让天猫/淘宝的材质组件重渲染当前行，含量列会短暂卸载再
+# 回挂。写入含量前给这段过渡留出轮询预算，避免把瞬时状态当成结构错误。
+MATERIAL_PERCENTAGE_WAIT_SECONDS = 2.0
 TAOBAO_CATEGORY_MODES = ("casual-pants", "recommended")
 TAOBAO_CASUAL_PANTS_PATH = ("男装", "休闲裤")
 SIZE_NAME_PATTERN = re.compile(
@@ -29,13 +58,23 @@ SIZE_NAME_PATTERN = re.compile(
 
 def normalize_option(value: object) -> str:
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
-    return re.sub(r"[\s，,;；、・·\-_（）()]", "", text).casefold()
+    normalized = re.sub(r"[\s，,;；、・·\-_（）()]", "", text).casefold()
+    return "其他" if normalized == "其它" else normalized
 
 
 def normalize_label(value: object) -> str:
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
     text = text.replace("重要", "")
     return re.sub(r"[\s*:：]+", "", text).casefold()
+
+
+def category_parts(value: object) -> Tuple[str, ...]:
+    """Return normalized, ordered segments from a marketplace category path."""
+    return tuple(
+        normalize_label(part)
+        for part in re.split(r"[>＞/／]", str(value or ""))
+        if normalize_label(part)
+    )
 
 
 def normalize_size_name(value: object) -> Optional[str]:
@@ -70,6 +109,16 @@ def excel_aliases(value: object) -> Tuple[str, ...]:
         }.get(normalized)
         if historical_alias:
             aliases.append(normalize_label(historical_alias))
+        if normalized in {
+            normalize_label("安全等级"),
+            normalize_label("安全级别"),
+            normalize_label("安全类别"),
+        }:
+            aliases.extend(
+                normalize_label(alias)
+                for alias in ("安全等级", "安全级别", "安全类别")
+                if normalize_label(alias) != normalized
+            )
     return tuple(dict.fromkeys(aliases))
 
 
@@ -85,9 +134,11 @@ TAOBAO_FIELD_ALIASES: Mapping[str, Tuple[str, ...]] = {
 TAOBAO_VALUE_ALIASES: Mapping[Tuple[str, str], Tuple[str, ...]] = {
     (normalize_label("风格"), normalize_option("休闲风")): ("休闲",),
     (normalize_label("产地"), normalize_option("中国大陆")): ("中国",),
-    (normalize_label("弹力"), normalize_option("无弹")): ("无弹力",),
-    (normalize_label("弹力"), normalize_option("无弹力")): ("无弹",),
+    (normalize_label("弹力"), normalize_option("无弹")): ("无弹力", "无弹性"),
+    (normalize_label("弹力"), normalize_option("无弹力")): ("无弹", "无弹性"),
+    (normalize_label("弹力"), normalize_option("无弹性")): ("无弹", "无弹力"),
     (normalize_label("版型"), normalize_option("直筒")): ("直筒型",),
+    (normalize_label("鞋制作工艺"), normalize_option("胶粘")): ("胶粘鞋",),
 }
 
 
@@ -113,7 +164,198 @@ def value_candidates(label: object, value: object) -> Tuple[str, ...]:
         for candidate in mapped:
             if candidate not in candidates:
                 candidates.append(candidate)
+        for candidate in style_option_aliases(label, source_candidate):
+            if candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in season_option_aliases(label, source_candidate):
+            if candidate not in candidates:
+                candidates.append(candidate)
+        if is_material_field_label(label):
+            for candidate in material_value_candidates(source_candidate)[1:]:
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        # Excel may use the statutory description while the dropdown only
+        # exposes the compact A类/B类/C类 labels.
+        normalized_label = normalize_label(label)
+        normalized_value = normalize_option(source_candidate)
+        level = normalized_value[:1].upper()
+        descriptor = normalized_value[1:]
+        if (
+            normalized_label in {
+                normalize_label("安全等级"),
+                normalize_label("安全级别"),
+                normalize_label("安全类别"),
+            }
+            and level in {"A", "B", "C"}
+            and (
+                descriptor in {"", "类"}
+                or any(
+                    marker in descriptor
+                    for marker in ("接触皮肤", "接触肌肤", "婴幼儿")
+                )
+            )
+        ):
+            compact_level = f"{level}类"
+            if compact_level not in candidates:
+                candidates.append(compact_level)
     return tuple(candidates)
+
+
+TAOBAO_MATERIAL_OPTION_ALIASES: Mapping[str, Tuple[str, ...]] = {
+    # 平台候选同时存在俗称、化学名和“俗称（化学名）”形式；顺序保留
+    # Excel 原名之后的首选平台写法，后续写法用于其他平台的兼容。
+    normalize_option("氨纶"): (
+        "聚氨酯弹性纤维(氨纶)",
+        "氨纶(聚氨酯弹性纤维)",
+    ),
+    normalize_option("锦纶"): (
+        "聚酰胺纤维(锦纶)",
+        "锦纶(聚酰胺纤维)",
+    ),
+    normalize_option("涤纶"): (
+        "聚对苯二甲酸乙二酯(涤纶)",
+        "涤纶（聚酯纤维）",
+    ),
+    normalize_option("腈纶"): (
+        "聚丙烯腈纤维(腈纶)",
+        "腈纶(聚丙烯腈纤维)",
+    ),
+    normalize_option("丙纶"): (
+        "聚丙烯纤维(丙纶)",
+        "丙纶(聚丙烯纤维)",
+    ),
+    normalize_option("粘纤"): (
+        "粘胶纤维(粘纤)",
+        "粘纤(粘胶纤维)",
+    ),
+    normalize_option("莱赛尔"): (
+        "莱赛尔纤维(莱赛尔)",
+        "莱赛尔(莱赛尔纤维)",
+    ),
+}
+
+
+def is_material_field_label(label: object) -> bool:
+    """Return whether the field is in the shared fabric/material scope."""
+    normalized = normalize_label(label)
+    return bool(
+        normalized
+        and "含量" not in normalized
+        and ("材质" in normalized or "面料" in normalized)
+    )
+
+
+def material_value_candidates(value: object) -> Tuple[str, ...]:
+    """Expand one Excel material name into known platform spellings."""
+    text = str(value).strip()
+    if not text:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            (text,)
+            + TAOBAO_MATERIAL_OPTION_ALIASES.get(normalize_option(text), ())
+        )
+    )
+
+
+def material_name_groups(value: object) -> Tuple[Tuple[str, ...], ...]:
+    """Parse material names: commas mean multiple values, slashes mean OR."""
+    groups: List[Tuple[str, ...]] = []
+    for raw_group in re.split(r"[,，、;；]", str(value or "")):
+        names: List[str] = []
+        normalized_names = set()
+        for raw_candidate in re.split(r"[/／]", raw_group):
+            candidate = raw_candidate.strip()
+            if not candidate or re.fullmatch(
+                r"\d+(?:\.\d+)?\s*[%％]", candidate
+            ):
+                continue
+            name = re.sub(
+                r"\s*[（(]?\s*\d+(?:\.\d+)?\s*[%％]\s*[）)]?\s*$",
+                "",
+                candidate,
+            ).strip()
+            normalized = normalize_option(name)
+            if name and normalized not in normalized_names:
+                normalized_names.add(normalized)
+                names.append(name)
+        if names:
+            groups.append(tuple(names))
+    return tuple(groups)
+
+
+def material_value_groups(
+    label: object, values: Sequence[object]
+) -> Tuple[Tuple[str, ...], ...]:
+    """Build one OR group per material while keeping multi-value semantics."""
+    if not is_material_field_label(label):
+        return tuple((str(value),) for value in values)
+    groups: List[Tuple[str, ...]] = []
+    for value in values:
+        for names in material_name_groups(value):
+            candidates: List[str] = []
+            for name in names:
+                for candidate in material_value_candidates(name):
+                    if candidate not in candidates:
+                        candidates.append(candidate)
+            if candidates:
+                groups.append(tuple(candidates))
+    return tuple(groups)
+
+
+def parse_material_components(value: str) -> Tuple[Tuple[str, Optional[str]], ...]:
+    """Parse ordered material rows shared by platform form adapters."""
+    rows: List[Tuple[str, Optional[str]]] = []
+    for raw_group in re.split(r"[,，、;；]", str(value)):
+        parsed = material_name_groups(raw_group)
+        if not parsed:
+            continue
+        names = parsed[0]
+        match = re.search(r"(\d+(?:\.\d+)?)\s*[%％]", raw_group)
+        rows.append(("/".join(names), match.group(1) if match else None))
+    return tuple(rows)
+
+
+def reviewed_selection_labels(label, candidates, *, multi):
+    """Split confirmed combinations only on an actual multi-select control."""
+    if multi and not any(v.label == label for v in candidates):
+        from attribute_runtime import split_multi_choice
+        return split_multi_choice(label)
+    return (label,)
+
+
+def preferred_exact_candidate_label(
+    candidate_labels: Sequence[str], aliases: Sequence[str]
+) -> Optional[str]:
+    """Pick the first Excel OR name, accepting identical duplicate labels."""
+    for alias in aliases:
+        matches = tuple(
+            label
+            for label in candidate_labels
+            if normalize_option(label) == normalize_option(alias)
+        )
+        if not matches:
+            continue
+        return matches[0] if len(set(matches)) == 1 else None
+    return None
+
+
+def existing_value_is_preferred_or_alias(
+    label: object, candidates: Sequence[str], existing: object
+) -> bool:
+    """Keep an existing first choice or a registered synonym, not a later OR."""
+    group = tuple(candidates)
+    if not group:
+        return False
+    preferred = group[0]
+    equivalents = (preferred,) + TAOBAO_VALUE_ALIASES.get(
+        (normalize_label(label), normalize_option(preferred)),
+        (),
+    )
+    return any(
+        normalize_option(existing) == normalize_option(value)
+        for value in equivalents
+    )
 
 
 def selection_value_groups(label: object, value: object) -> Tuple[Tuple[str, ...], ...]:
@@ -125,24 +367,61 @@ def selection_value_groups(label: object, value: object) -> Tuple[Tuple[str, ...
     )
 
 
+def selection_value_groups_for_control(
+    label: object,
+    value: object,
+    *,
+    multi: bool,
+) -> Tuple[Tuple[str, ...], ...]:
+    """Interpret commas only after the page proves the control is multi-select.
+
+    Platform option labels can themselves contain a Chinese comma, for example
+    ``防风，保暖``.  A single-select must first try that complete label;
+    slashes inside it keep their established ordered-OR meaning.
+    """
+
+    if multi:
+        return selection_value_groups(label, value)
+    candidates = tuple(dict.fromkeys(
+        candidate for plan in excel_selection_plans(value, multi=False)
+        for candidate in value_candidates(label, plan[0])
+    ))
+    return (candidates,) if candidates else ()
+
+
 def single_selection_candidates(label: object, value: object) -> Tuple[str, ...]:
     """单选字段也继承 Excel 分隔规则，但不允许逗号要求多选。"""
-    groups = selection_value_groups(label, value)
+    groups = selection_value_groups_for_control(label, value, multi=False)
     if not groups:
         raise TaobaoListingError(f"Excel 字段“{label}”没有可用值")
-    if len(groups) > 1:
-        rendered = "，".join("/".join(group) for group in groups)
-        raise TaobaoListingError(
-            f"淘宝字段“{label}”是单选，Excel 却提供了"
-            f"多个逗号分组：{rendered}"
-        )
     return groups[0]
+
+
+def sku_batch_excel_value(
+    label: object, value: object, *, category_hints: Sequence[str] = ()
+) -> str:
+    """Return the value accepted by a 淘宝 SKU batch input.
+
+    ``鞋跟高度（cm）`` is a numeric SKU column.  Excel may also carry the
+    qualitative shoe-height mapping after a slash (for example
+    ``5cm/中跟（3.1-5.5cm）``); that suffix belongs to the category selector,
+    not this input, so only the first numeric alternative is written.
+    """
+    text = str(value or "").strip()
+    if (
+        category_profile(category_hints).garment_kind == "footwear"
+        and "鞋跟高度" in normalize_label(label)
+    ):
+        return re.split(r"[/／]", text, maxsplit=1)[0].strip()
+    return text
 
 
 def _single_source(
     fields: Mapping[str, str],
     aliases: Sequence[str],
     label: str,
+    *,
+    money: bool = False,
 ) -> Optional[Tuple[str, str]]:
     wanted = {normalize_label(alias) for alias in aliases}
     matches = [
@@ -150,6 +429,13 @@ def _single_source(
         for key, value in fields.items()
         if wanted.intersection(excel_aliases(key))
     ]
+    if money:
+        try:
+            matches = [
+                (key, normalize_money_value(value)) for key, value in matches
+            ]
+        except MoneyValueError as exc:
+            raise TaobaoListingError(f"淘宝{label}{exc}") from exc
     if len(matches) > 1:
         distinct_values = {str(value).strip() for _key, value in matches}
         if len(distinct_values) == 1:
@@ -163,8 +449,10 @@ def _required_excel_value(
     fields: Mapping[str, str],
     aliases: Sequence[str],
     label: str,
+    *,
+    money: bool = False,
 ) -> str:
-    source = _single_source(fields, aliases, label)
+    source = _single_source(fields, aliases, label, money=money)
     if source is None:
         raise TaobaoListingError(
             f"Excel 中缺少淘宝{label}字段（可识别：{'/'.join(aliases)}）"
@@ -205,14 +493,37 @@ def parse_taobao_fabrics(fields: Mapping[str, str]) -> Tuple[MaterialComponent, 
 class TaobaoListing:
     """处理淘宝推荐类目、类目属性和基础销售资料。"""
 
-    def __init__(self, page: Any, drawer: Any, logger: Any) -> None:
+    attribute_platform_id = "tb"
+
+    def __init__(
+        self,
+        page: Any,
+        drawer: Any,
+        logger: Any,
+        *,
+        attribute_runtime: Optional[Any] = None,
+        category_hints: Sequence[str] = (),
+    ) -> None:
+        # 子类改 attribute_platform_id 后，异常与日志文案随之切换平台名。
         self.page = page
         self.drawer = drawer
         self.logger = logger
+        self.attribute_runtime = attribute_runtime
+        self.category_hints = tuple(
+            str(value).strip() for value in category_hints if str(value).strip()
+        )
+        self.api_index: Any = TaobaoApiJsonIndex(page, logger)
         self.panel: Optional[Any] = None
         self.category_clicked = False
         self.material_validation: Mapping[str, Any] = {}
         self.specification_state: Mapping[str, Any] = {}
+
+    @property
+    def _platform_display_name(self) -> str:
+        """本适配器所属平台的中文名，供日志与异常文案复用。"""
+        return {"tb": "淘宝", "tm": "天猫", "jd": "京东", "pdd": "拼多多",
+                "wxsph": "微信小店", "xhs": "小红书", "yz": "有赞"}.get(
+                    self.attribute_platform_id, self.attribute_platform_id)
 
     async def _wait_for_loading_masks(self, timeout_seconds: float = 30) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -226,6 +537,9 @@ class TaobaoListing:
         raise TaobaoListingError("淘宝资料加载遮罩在 30 秒内未消失")
 
     async def open(self) -> "TaobaoListing":
+        # 必须在切换页签前监听，才能取得本次打开页面产生的最新 schema。
+        if isinstance(self.api_index, TaobaoApiJsonIndex):
+            self.api_index.install()
         tab = self.drawer.get_by_role("tab", name="淘宝资料", exact=True)
         try:
             if self.logger is not None:
@@ -272,6 +586,543 @@ class TaobaoListing:
     @staticmethod
     def _normalize_category_path(value: object) -> str:
         return re.sub(r"[\s>]", "", str(value)).casefold()
+
+    @staticmethod
+    def _category_gender_roots(category_hints: Sequence[str]) -> Tuple[str, ...]:
+        text = " ".join(str(value) for value in category_hints)
+        if any(marker in text for marker in ("男士", "男装", "男性")):
+            return (normalize_label("男装"),)
+        if any(marker in text for marker in ("女士", "女装", "女性")):
+            return (normalize_label("女装"),)
+        return ()
+
+    @classmethod
+    def _choose_category_hint_text(
+        cls,
+        result_texts: Sequence[str],
+        category_hints: Sequence[str],
+    ) -> Tuple[str, str]:
+        """Choose one marketplace path from supplier category hints."""
+        chosen, strategy = choose_category_candidate(result_texts, category_hints)
+        if strategy.startswith("ambiguous"):
+            raise TaobaoListingError(
+                f"淘宝类目提示词匹配结果不唯一：{strategy}"
+            )
+        return chosen, strategy
+
+    async def _visible_category_result_nodes(self) -> Tuple[Tuple[str, Any], ...]:
+        """Read leaf rows from the page-level Element category result portal."""
+        nodes = self.page.locator(
+            ".el-autocomplete-suggestion:visible *:visible, "
+            ".el-popper:visible *:visible"
+        )
+        try:
+            snapshots = await nodes.evaluate_all(
+                """elements => elements.map((element, index) => {
+                  const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                  const text = clean(element.innerText || element.textContent);
+                  const sameChild = text && Array.from(element.querySelectorAll('*'))
+                    .some(child => clean(child.innerText || child.textContent) === text);
+                  const containsPathRow = Array.from(element.querySelectorAll('*'))
+                    .some(child => {
+                      const part = clean(child.innerText || child.textContent);
+                      return part && part !== text && /[>＞]/.test(part);
+                    });
+                  return {index, text, sameChild, containsPathRow};
+                })"""
+            )
+        except Exception:
+            return ()
+        result: List[Tuple[str, Any]] = []
+        seen = set()
+        for snapshot in snapshots:
+            text = str(snapshot.get("text") or "")
+            normalized = self._normalize_category_path(text)
+            if not text or not normalized or snapshot.get("sameChild") or snapshot.get("containsPathRow") or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append((text, nodes.nth(int(snapshot["index"]))))
+        return tuple(result)
+
+    async def _prediction_candidates(self, panel: Optional[Any] = None) -> Tuple[Tuple[Any, str], ...]:
+        """Return every visible one-click category prediction in DOM order."""
+        scope = panel or self.panel
+        if scope is None:
+            return ()
+        buttons = scope.get_by_role("button", name="点击使用", exact=True)
+        predictions: List[Tuple[Any, str]] = []
+        for index in range(await buttons.count()):
+            button = buttons.nth(index)
+            if not await button.is_visible():
+                continue
+            row = button.locator("xpath=..")
+            if not await row.count() or not (await row.inner_text()).strip():
+                row = button.locator(
+                    "xpath=ancestor::*[contains(@class, 'prediction-item')][1]"
+                )
+            row_text = re.sub(r"\s+", " ", (await row.inner_text()).strip())
+            expected = re.sub(r"^\s*推荐\s*", "", row_text)
+            expected = re.sub(r"\s*点击使用\s*$", "", expected).strip()
+            if expected:
+                predictions.append((button, expected))
+        return tuple(predictions)
+
+    async def _apply_category_prediction(
+        self, button: Any, expected: str, source: str
+    ) -> str:
+        await button.scroll_into_view_if_needed()
+        await button.click()
+        self.category_clicked = True
+        await self._wait_for_loading_masks()
+        await self._wait_for_category_applied()
+        actual = await self._category_text()
+        if self._normalize_category_path(actual) != self._normalize_category_path(expected):
+            raise TaobaoListingError(
+                f"{self._platform_display_name}类目应用后校验失败：期望 {expected!r}，页面为 {actual!r}"
+            )
+        if self.logger is not None:
+            self.logger.info("已应用%s%s类目：%s", self._platform_display_name, source, actual)
+        return actual
+
+    async def _wait_for_category_applied(self) -> None:
+        """Wait for the platform-specific category form after selection."""
+        try:
+            await self.panel.locator(
+                ".conf .complex-wrap > .complex-item, "
+                ".conf .complex-wrap > .complex-item_multi"
+            ).first.wait_for(state="visible", timeout=30_000)
+        except Exception as exc:
+            raise TaobaoListingError(f"{self._platform_display_name}类目应用后，类目属性未渲染") from exc
+
+    def _category_node_label(self, value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip()
+
+    async def _category_selection_state(self, dialog: Any, expected: str) -> Mapping[str, Any]:
+        """Read only: neither click nor expand menus while checking a selection."""
+        parts = [part.strip() for part in re.split(r"[>＞]", expected) if part.strip()]
+        lines = (await dialog.inner_text()).splitlines()
+        values = [re.split(r"[：:]", line.strip(), maxsplit=1)[-1].strip()
+                  for line in lines if re.match(r"^已选\s*[：:]", line.strip())]
+        actual = values[-1] if values else ""
+        menus = dialog.locator(".el-cascader-menu:visible")
+        terminal = False
+        matched_path = True
+        for depth, part in enumerate(parts):
+            if await menus.count() <= depth:
+                matched_path = False
+                break
+            nodes = menus.nth(depth).locator(".el-cascader-node:visible")
+            matches = []
+            for index in range(await nodes.count()):
+                node = nodes.nth(index)
+                label = node.locator(".el-cascader-node__label")
+                text = self._category_node_label(await (label.first if await label.count() else node).inner_text())
+                if normalize_label(text) == normalize_label(part):
+                    if (await node.get_attribute("aria-disabled") != "true"
+                            and "is-disabled" not in (await node.get_attribute("class") or "")):
+                        matches.append(node)
+            if len(matches) != 1:
+                matched_path = False
+                break
+            branch = (await matches[0].get_attribute("aria-haspopup") == "true"
+                      or bool(await matches[0].locator(".el-cascader-node__postfix").count()))
+            if depth < len(parts) - 1 and not branch:
+                matched_path = False
+                break
+            terminal = not branch
+        return {"actual": actual, "matched_path": matched_path and bool(parts),
+                "terminal": terminal and matched_path and bool(parts)}
+
+    async def _validate_category_leaf(self, dialog: Any, expected: str, *, timeout: float = 5) -> str:
+        """Shared confirmation gate. Validation must never change the selection."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        state: Mapping[str, Any] = {}
+        while True:
+            state = await self._category_selection_state(dialog, expected)
+            if (state["terminal"] and self._normalize_category_path(state["actual"])
+                    == self._normalize_category_path(expected)):
+                if self.logger is not None:
+                    self.logger.info("%s类目末级只读校验通过：%s", self._platform_display_name, state["actual"])
+                return str(state["actual"])
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TaobaoListingError(
+                    f"{self._platform_display_name}类目末级校验失败：目标={expected!r}，"
+                    f"实际={state.get('actual')!r}，路径匹配={state.get('matched_path')}，末级={state.get('terminal')}"
+                )
+            await asyncio.sleep(.1)
+
+    async def _complete_category_leaf(self, dialog: Any, expected: str) -> str:
+        """Follow the selected search branch to a proven terminal DOM node.
+
+        Search breadcrumbs are navigation results, not proof of leaf status.
+        Never confirm a parent, including when its label matches Excel exactly.
+        """
+        parts = [part.strip() for part in re.split(r"[>＞]", expected) if part.strip()]
+        selected: List[str] = []
+        state = await self._category_selection_state(dialog, expected)
+        if state["matched_path"] and self._normalize_category_path(state["actual"]) == self._normalize_category_path(expected):
+            if state["terminal"]:
+                return await self._validate_category_leaf(dialog, expected)
+            # Search already selected this parent. Continue only from its children.
+            # Reclicking ancestors can reset the footer while leaving a leaf checked.
+            selected = list(parts)
+            menus = dialog.locator(".el-cascader-menu:visible")
+            if await menus.count() <= len(parts):
+                nodes = menus.nth(len(parts) - 1).locator(".el-cascader-node:visible")
+                for index in range(await nodes.count()):
+                    node = nodes.nth(index)
+                    label = node.locator(".el-cascader-node__label")
+                    text = self._category_node_label(await (label.first if await label.count() else node).inner_text())
+                    if normalize_label(text) == normalize_label(parts[-1]):
+                        await node.click(timeout=10_000)
+                        break
+        for depth in range(len(selected), 12):
+            menus = dialog.locator(".el-cascader-menu:visible")
+            deadline = asyncio.get_running_loop().time() + 10
+            rows = []
+            while asyncio.get_running_loop().time() < deadline:
+                if await menus.count() > depth:
+                    nodes = menus.nth(depth).locator(".el-cascader-node:visible")
+                    rows = []
+                    for index in range(await nodes.count()):
+                        node = nodes.nth(index)
+                        if (await node.get_attribute("aria-disabled") == "true"
+                                or "is-disabled" in (await node.get_attribute("class") or "")):
+                            continue
+                        label_node = node.locator(".el-cascader-node__label")
+                        label = self._category_node_label(await (label_node.first if await label_node.count() else node).inner_text())
+                        branch = (await node.get_attribute("aria-haspopup") == "true"
+                                  or bool(await node.locator(".el-cascader-node__postfix").count()))
+                        if label:
+                            rows.append((" > ".join(selected + [label]), label, node, branch))
+                    if rows:
+                        break
+                await asyncio.sleep(.1)
+            if not rows:
+                raise TaobaoListingError(
+                    f"{self._platform_display_name}类目下级菜单未加载，无法验证末级：{' > '.join(selected) or expected}"
+                )
+            if depth < len(parts):
+                matches = [row for row in rows if normalize_label(row[1]) == normalize_label(parts[depth])]
+            else:
+                chosen, _ = choose_category_candidate(tuple(row[0] for row in rows), self.category_hints)
+                matches = [row for row in rows if row[0] == chosen]
+                if len(matches) != 1:
+                    chosen = await self._resolve_category_review(
+                        tuple(row[0] for row in rows), source="category_child_selection",
+                        evidence={"parent_path": list(selected), "terminal_required": True,
+                                  "branch_paths": [row[0] for row in rows if row[3]]},
+                    )
+                    matches = [row for row in rows if row[0] == chosen]
+            if len(matches) != 1:
+                raise TaobaoListingError(f"{self._platform_display_name}类目下级无法唯一确定，未确认父级：{' > '.join(selected)}")
+            path, label, node, branch = matches[0]
+            await node.scroll_into_view_if_needed()
+            await node.click(timeout=10_000)
+            selected.append(label)
+            if branch:
+                if self.logger is not None:
+                    self.logger.info("%s类目仅定位到父级，继续检查下级：%s", self._platform_display_name, path)
+                continue
+            if depth + 1 < len(parts):
+                raise TaobaoListingError(f"{self._platform_display_name}类目在目标路径之前提前到达末级：{path}")
+            return await self._validate_category_leaf(dialog, path)
+        raise TaobaoListingError(f"{self._platform_display_name}类目超过12级，未确认末级")
+
+    async def _resolve_category_review(
+        self,
+        labels: Sequence[str],
+        *,
+        source: str,
+        evidence: Optional[Mapping[str, Any]] = None,
+        excel_value: Optional[str] = None,
+    ) -> str:
+        """Resolve an uncertain category through the shared learning review.
+
+        Category values have no stable platform field id in the editor.  Use
+        the shared ``category_path``/``category`` review protocol so confirmed
+        choices can become learning evidence across products.
+        """
+        runtime = self.attribute_runtime
+        if runtime is None or not callable(getattr(runtime, "resolve", None)):
+            return ""
+        unique: List[str] = []
+        seen = set()
+        for label in labels:
+            text = re.sub(r"\s+", " ", str(label or "")).strip()
+            key = self._normalize_category_path(text)
+            if text and key and key not in seen:
+                seen.add(key)
+                unique.append(text)
+        if not unique:
+            return ""
+        candidates = tuple(
+            CandidateValue(
+                "path:" + canonical_sha256(self._normalize_category_path(label))[:24],
+                label,
+            )
+            for label in unique
+        )
+        platform_id = self.attribute_platform_id
+        schema_version = canonical_sha256({
+            "platform_id": platform_id,
+            "category_leaf_id": "category-path:hints:" + canonical_sha256(tuple(self.category_hints))[:20],
+            "field_id": "category_path",
+            "options": [
+                {"value_id": value.value_id, "label": value.label}
+                for value in candidates
+            ],
+        })
+        resolved = await runtime.resolve(AttributeRequest(
+            platform_id=platform_id,
+            category_leaf_id="category-path:hints:" + canonical_sha256(tuple(self.category_hints))[:20],
+            field_id="category_path",
+            field_label="商品类目",
+            candidates=candidates,
+            excel_value=excel_value if excel_value is not None else " / ".join(self.category_hints),
+            evidence={
+                "excel": True,
+                "live_dom": True,
+                "category_source": source,
+                "excel_category_hints": list(self.category_hints),
+                "candidate_paths": list(unique),
+                "category_required_before_attributes": True,
+                **dict(evidence or {}),
+            },
+            custom_allowed=False,
+            schema_version=schema_version,
+            control_type="category",
+        ))
+        if resolved is None:
+            # During a platform pass AttributeRuntime queues the review and
+            # defers the batch until the boundary. Stop before filling fields
+            # under an unconfirmed category.
+            raise_deferred = getattr(runtime, "raise_deferred_reviews", None)
+            if callable(raise_deferred):
+                raise_deferred()
+            return ""
+        if getattr(resolved, "is_no_fill", False):
+            return ""
+        value_id = str(getattr(resolved, "value_id", ""))
+        label = str(getattr(resolved, "label", ""))
+        matches = [
+            candidate.label
+            for candidate in candidates
+            if value_id == candidate.value_id
+            or self._normalize_category_path(label)
+            == self._normalize_category_path(candidate.label)
+        ]
+        if len(matches) != 1:
+            raise TaobaoListingError(
+                f"{self._platform_display_name}类目审核结果不在当前候选范围内"
+            )
+        return matches[0]
+
+    async def apply_excel_category(self) -> str:
+        """Apply the Taobao category using the Excel 商品分类 hints."""
+        if self.panel is None:
+            raise TaobaoListingError("请先调用 open() 打开淘宝资料")
+        hints = tuple(self.category_hints)
+        if not hints:
+            return await self.apply_recommended_category()
+
+        # The ERP can show several one-click predictions.  The first row may
+        # carry the red “推荐” badge while a later row is the Excel match.
+        # Inspect every visible prediction before opening the manual search.
+        predictions = list(await self._prediction_candidates())
+        if predictions:
+            recommended: List[Tuple[Any, str]] = []
+            for button, expected in predictions:
+                row = button.locator("xpath=..")
+                marker = row.get_by_text("推荐", exact=True)
+                if await marker.count() and await marker.first.is_visible():
+                    recommended.append((button, expected))
+            recommended_choice, recommended_strategy = choose_category_candidate(
+                tuple(expected for _button, expected in recommended), hints
+            )
+            if recommended_choice:
+                chosen, strategy = recommended_choice, recommended_strategy
+            else:
+                chosen, strategy = choose_category_candidate(
+                    tuple(expected for _button, expected in predictions), hints
+                )
+            if chosen:
+                matches = [
+                    (button, expected)
+                    for button, expected in predictions
+                    if self._normalize_category_path(expected)
+                    == self._normalize_category_path(chosen)
+                ]
+                if len(matches) != 1:
+                    raise TaobaoListingError(
+                        f"淘宝 Excel 类目推荐匹配结果不是唯一项：{len(matches)}"
+                    )
+                button, expected = matches[0]
+                if self.logger is not None:
+                    self.logger.info(
+                        f"{self._platform_display_name}推荐类目与 Excel 匹配，选择第 %s 个：%s（%s）",
+                        next(
+                            index + 1
+                            for index, item in enumerate(predictions)
+                            if item[0] == button
+                        ),
+                        expected,
+                        strategy,
+                    )
+                return await self._apply_category_prediction(button, expected, "Excel 推荐")
+            if self.logger is not None:
+                self.logger.info(
+                    f"{self._platform_display_name}页面推荐类目未通过 Excel 校验，转入 Excel 类目搜索：%s",
+                    "/".join(hints),
+                )
+
+        current = ""
+        try:
+            current = await self._category_text()
+        except TaobaoListingError:
+            pass
+        if current:
+            current_choice, _current_strategy = choose_category_candidate((current,), hints)
+            if current_choice:
+                if self.logger is not None:
+                    self.logger.info(f"{self._platform_display_name}商品分类已匹配 Excel，跳过修改：%s", current)
+                return current
+
+        modify = self.panel.get_by_role("button", name="修改类目", exact=True)
+        if await modify.count() != 1:
+            raise TaobaoListingError(f"{self._platform_display_name}页面找不到唯一的“修改类目”按钮")
+        await modify.click(timeout=30_000)
+        dialog = self.page.get_by_role("dialog", name="修改类目", exact=True)
+        try:
+            await dialog.wait_for(state="visible", timeout=10_000)
+        except Exception as exc:
+            raise TaobaoListingError(f"{self._platform_display_name}修改类目弹窗未出现") from exc
+        search = dialog.get_by_placeholder(
+            "请输入类目关键词，支持模糊查询", exact=True
+        )
+        if await search.count() != 1:
+            raise TaobaoListingError(f"{self._platform_display_name}修改类目弹窗缺少搜索框")
+
+        selected_text = ""
+        selected_node: Any = None
+        selected_hint = ""
+        observed_rows: Dict[str, Tuple[str, str]] = {}
+        search_terms = category_search_terms(hints)
+        for hint in search_terms:
+            await search.fill(hint, timeout=10_000)
+            if self.logger is not None:
+                self.logger.info(f"{self._platform_display_name}类目按 Excel 顺序搜索：%s", hint)
+            deadline = asyncio.get_running_loop().time() + 20
+            while asyncio.get_running_loop().time() < deadline:
+                rows = await self._visible_category_result_nodes()
+                for text, node in rows:
+                    observed_rows.setdefault(self._normalize_category_path(text), (text, hint))
+                chosen, strategy = choose_category_candidate(
+                    tuple(text for text, _node in rows), hints
+                )
+                if chosen:
+                    matches = [
+                        (text, node)
+                        for text, node in rows
+                        if self._normalize_category_path(text)
+                        == self._normalize_category_path(chosen)
+                    ]
+                    if len(matches) == 1:
+                        selected_text, selected_node = matches[0]
+                        selected_hint = f"{hint} ({strategy})"
+                        break
+                await asyncio.sleep(0.1)
+            if selected_node is not None:
+                break
+        if selected_node is None:
+            reviewed = await self._resolve_category_review(
+                tuple(dict.fromkeys(
+                    [expected for _button, expected in predictions]
+                    + [text for text, _hint in observed_rows.values()]
+                )),
+                source="excel_search_ambiguous",
+            )
+            if reviewed:
+                selected = observed_rows.get(self._normalize_category_path(reviewed))
+                if selected is not None:
+                    selected_text, origin_hint = selected
+                    await search.fill(origin_hint, timeout=10_000)
+                    deadline = asyncio.get_running_loop().time() + 20
+                    while asyncio.get_running_loop().time() < deadline:
+                        matches = [
+                            (text, node)
+                            for text, node in await self._visible_category_result_nodes()
+                            if self._normalize_category_path(text)
+                            == self._normalize_category_path(selected_text)
+                        ]
+                        if len(matches) == 1:
+                            selected_text, selected_node = matches[0]
+                            break
+                        await asyncio.sleep(0.1)
+                    selected_hint = "审核确认"
+                else:
+                    prediction = next(
+                        (
+                            (button, expected)
+                            for button, expected in predictions
+                            if self._normalize_category_path(expected)
+                            == self._normalize_category_path(reviewed)
+                        ),
+                        None,
+                    )
+                    if prediction is not None:
+                        cancel = dialog.get_by_role("button", name=re.compile(r"取\s*消"))
+                        if await cancel.count() == 1:
+                            await cancel.click(timeout=10_000)
+                            await dialog.wait_for(state="hidden", timeout=30_000)
+                        return await self._apply_category_prediction(
+                            prediction[0], prediction[1], "审核确认"
+                        )
+        if selected_node is None:
+            raise TaobaoListingError(
+                f"{self._platform_display_name}类目搜索结果中没有 Excel 的唯一精确分类提示："
+                + "/".join(hints)
+            )
+
+        await selected_node.scroll_into_view_if_needed()
+        await selected_node.click(timeout=10_000)
+        if self.logger is not None:
+            self.logger.info(
+                f"{self._platform_display_name}类目搜索定位到：%s；搜索词：%s；待验证末级",
+                selected_text,
+                selected_hint,
+            )
+        selected_text = await self._complete_category_leaf(dialog, selected_text)
+        selected_path = ""
+        deadline = asyncio.get_running_loop().time() + 10
+        while asyncio.get_running_loop().time() < deadline:
+            lines = [line.strip() for line in (await dialog.inner_text()).splitlines()]
+            selected_lines = [line for line in lines if line.startswith("已选")]
+            if selected_lines:
+                selected_path = selected_lines[-1].split("：", 1)[-1].strip()
+                if self._normalize_category_path(selected_path) == self._normalize_category_path(selected_text):
+                    break
+            await asyncio.sleep(0.05)
+        if self._normalize_category_path(selected_path) != self._normalize_category_path(selected_text):
+            raise TaobaoListingError(
+                f"淘宝类目确认前路径不一致：期望 {selected_text!r}，页面为 {selected_path!r}"
+            )
+        confirm = dialog.get_by_role("button", name=re.compile(r"确\s*定"))
+        if await confirm.count() != 1:
+            raise TaobaoListingError(f"{self._platform_display_name}修改类目弹窗找不到唯一“确定”按钮")
+        await confirm.click(timeout=10_000)
+        await dialog.wait_for(state="hidden", timeout=30_000)
+        self.category_clicked = True
+        await self._wait_for_loading_masks()
+        await self._wait_for_category_applied()
+        actual = await self._category_text()
+        if self._normalize_category_path(actual) != self._normalize_category_path(selected_text):
+            raise TaobaoListingError(
+                f"淘宝类目应用后校验失败：期望 {selected_text!r}，页面为 {actual!r}"
+            )
+        if self.logger is not None:
+            self.logger.info("已应用淘宝 Excel 类目：%s", actual)
+        return actual
 
     async def apply_recommended_category(self) -> str:
         """点击当前页面唯一带“推荐”标记的类目，不依赖固定路径。"""
@@ -484,6 +1335,8 @@ class TaobaoListing:
                 "淘宝类目搜索后未出现“男装 > 休闲裤”精确结果"
             )
 
+        expected = await self._complete_category_leaf(dialog, expected)
+
         # 搜索结果点击后，以弹窗底部“已选：...”作为提交前的
         # 最终路径确认依据。
         selected_path = ""
@@ -535,6 +1388,8 @@ class TaobaoListing:
         if mode == "casual-pants":
             return await self.apply_casual_pants_category()
         if mode == "recommended":
+            if self.category_hints:
+                return await self.apply_excel_category()
             return await self.apply_recommended_category()
         raise TaobaoListingError(f"不支持的淘宝类目模式：{mode!r}")
 
@@ -622,14 +1477,30 @@ class TaobaoListing:
         return tuple(result)
 
     async def _open_select(self, select: Any, *, multi: bool) -> None:
+        # Element's filter input click toggles an already open multi-select.
+        # Reuse its visible popper when filling the next choice.
+        already_open = await select.evaluate("element => Boolean(element.__vue__ && element.__vue__.visible)")
+        if already_open and await self._active_select_dropdown(select) is not None:
+            return
         if multi:
             search = select.locator(".el-select__tags input.el-select__input").first
-            if await search.count():
+            if await search.count() and await search.is_visible():
                 await search.click(timeout=4000)
                 return
         input_box = select.locator("input.el-input__inner").first
         if not await input_box.count():
             raise TaobaoListingError("淘宝属性下拉框中找不到可点击输入框")
+
+        # Element UI 的多选框收起后，已选标签会整块盖住 readonly
+        # input，普通指针点击会被同一 select 内的标签拦截。这里只在
+        # 确认是该折叠标签结构时触发同一输入框的 DOM click，后续仍由
+        # 可见候选项检查和选中值回读负责校验。
+        collapsed_tags = select.locator(
+            ".el-select__tags.el-select-collapsed__tags:visible"
+        )
+        if multi and await collapsed_tags.count():
+            await input_box.evaluate("element => element.click()")
+            return
         await input_box.click(timeout=4000)
 
     async def _dismiss_select_dropdown(self, select: Any) -> None:
@@ -654,6 +1525,33 @@ class TaobaoListing:
             return local.first
         if await local.count() > 1:
             raise TaobaoListingError("当前淘宝属性内部出现多个可见下拉框")
+
+        # The production Element Select teleports its popper outside the field.
+        # Other fields can briefly leave a second visible popper behind, so a
+        # page-wide count cannot identify the dropdown that belongs to this
+        # select.  Element's Vue instance keeps the authoritative popper node.
+        marked = await select.evaluate(
+            """element => {
+              document.querySelectorAll('[data-kuaimai-active-select-popper]')
+                .forEach(node => node.removeAttribute('data-kuaimai-active-select-popper'));
+              const vm = element.__vue__;
+              const popper = vm && (vm.popperElm
+                || (vm.$refs && vm.$refs.popper && vm.$refs.popper.$el));
+              if (!popper || !popper.isConnected) return false;
+              popper.setAttribute('data-kuaimai-active-select-popper', 'true');
+              return true;
+            }"""
+        )
+        if marked:
+            owned = self.page.locator(
+                '[data-kuaimai-active-select-popper="true"]:visible'
+            )
+            owned_count = await owned.count()
+            if owned_count == 1:
+                return owned.first
+            if owned_count > 1:
+                raise TaobaoListingError("当前淘宝属性关联了多个可见下拉框")
+
         global_dropdowns = self.page.locator(".el-select-dropdown:visible")
         count = await global_dropdowns.count()
         if count == 0:
@@ -668,7 +1566,26 @@ class TaobaoListing:
         timeout_seconds: float = 5,
     ) -> Tuple[Any, List[Mapping[str, Any]]]:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
+        recovery_at = asyncio.get_running_loop().time() + min(0.75, timeout_seconds / 2)
+        recovered = False
         while asyncio.get_running_loop().time() < deadline:
+            if not recovered and asyncio.get_running_loop().time() >= recovery_at:
+                hidden_open = await select.evaluate("""element => {
+                  const vm = element.__vue__;
+                  const popper = vm && (vm.popperElm
+                    || (vm.$refs && vm.$refs.popper && vm.$refs.popper.$el));
+                  return Boolean(vm && vm.visible && vm.options && vm.options.length
+                    && popper && popper.isConnected
+                    && (!popper.getClientRects().length || getComputedStyle(popper).display === 'none'));
+                }""")
+                if hidden_open:
+                    recovered = True
+                    if self.logger is not None:
+                        self.logger.info("属性候选已加载但下拉层隐藏，收起并重新展开当前控件")
+                    await self._dismiss_select_dropdown(select)
+                    multi = await select_supports_multiple(select)
+                    await self._open_select(select, multi=multi)
+                    deadline = asyncio.get_running_loop().time() + timeout_seconds
             dropdown = await self._active_select_dropdown(select)
             if dropdown is None:
                 await asyncio.sleep(0.05)
@@ -704,7 +1621,10 @@ class TaobaoListing:
             before = await close_buttons.count()
             if before == 0:
                 return
-            await close_buttons.first.click()
+            # Element UI 的折叠多选会保留不可见的关闭图标，普通
+            # Playwright click 会等可见性直到超时。DOM click 仍会走
+            # 组件绑定的删除处理，并由下面的数量变化做最终校验。
+            await close_buttons.first.evaluate("element => element.click()")
             deadline = asyncio.get_running_loop().time() + 2
             while asyncio.get_running_loop().time() < deadline:
                 if await close_buttons.count() < before:
@@ -749,6 +1669,14 @@ class TaobaoListing:
                     if (typeof component.handleQueryChange === 'function') {
                       component.handleQueryChange(value);
                     }
+                    // Closing a searchable select can clear query while
+                    // leaving every option's last filter result hidden.
+                    // Re-run Element's own option filtering when clearing.
+                    if (value === '' && !component.remote
+                        && typeof component.broadcast === 'function') {
+                      component.filteredOptionsCount = component.optionsCount;
+                      component.broadcast('ElOption', 'queryChange', '');
+                    }
                     if (typeof component.$nextTick === 'function') {
                       await new Promise(resolve => component.$nextTick(resolve));
                     }
@@ -756,6 +1684,176 @@ class TaobaoListing:
                   return true;
                 }""",
                 expected,
+            )
+        )
+
+    async def _scroll_select_for_candidate(
+        self,
+        select: Any,
+        expected: str,
+        *,
+        custom_allowed: bool,
+        created_exact_click_allowed: bool,
+    ) -> Tuple[Any, List[Mapping[str, Any]]]:
+        """Scan a non-filterable virtual dropdown from top to bottom.
+
+        Element opens long lists around the persisted value.  Resetting and
+        scrolling the real dropdown is necessary to preserve Excel OR order;
+        otherwise a later visible value can incorrectly outrank an earlier
+        live value that is merely outside the virtual viewport.
+        """
+
+        dropdown = await self._active_select_dropdown(select)
+        if dropdown is None:
+            return select, []
+        state = await dropdown.evaluate(
+            """element => {
+              const nodes = [element, ...element.querySelectorAll('*')];
+              const scrollables = nodes.filter(node =>
+                node.clientHeight > 0 && node.scrollHeight > node.clientHeight + 1
+              ).sort((a, b) =>
+                (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight)
+              );
+              const target = scrollables[0];
+              if (!target) return {scrollable: false, atEnd: true};
+              target.scrollTop = 0;
+              target.dispatchEvent(new Event('scroll', {bubbles: true}));
+              return {scrollable: true, atEnd: target.scrollHeight <= target.clientHeight + 1};
+            }"""
+        )
+        if not state.get("scrollable"):
+            return dropdown, []
+
+        deadline = asyncio.get_running_loop().time() + 2.5
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.04)
+            try:
+                dropdown, options = await self._visible_dom_options(
+                    select, timeout_seconds=0.4
+                )
+            except TaobaoListingError:
+                options = []
+            matches = [
+                match
+                for match in self._matching_options(expected, options)
+                if not match.get("created")
+                or custom_allowed
+                or created_exact_click_allowed
+            ]
+            if matches:
+                return dropdown, matches
+            state = await dropdown.evaluate(
+                """element => {
+                  const nodes = [element, ...element.querySelectorAll('*')];
+                  const scrollables = nodes.filter(node =>
+                    node.clientHeight > 0 && node.scrollHeight > node.clientHeight + 1
+                  ).sort((a, b) =>
+                    (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight)
+                  );
+                  const target = scrollables[0];
+                  if (!target) return {moved: false, atEnd: true};
+                  const maxTop = Math.max(0, target.scrollHeight - target.clientHeight);
+                  const before = target.scrollTop;
+                  if (before >= maxTop - 1) return {moved: false, atEnd: true};
+                  target.scrollTop = Math.min(
+                    maxTop,
+                    before + Math.max(40, Math.floor(target.clientHeight * 0.8))
+                  );
+                  target.dispatchEvent(new Event('scroll', {bubbles: true}));
+                  return {moved: target.scrollTop !== before, atEnd: target.scrollTop >= maxTop - 1};
+                }"""
+            )
+            if not state.get("moved"):
+                break
+        return dropdown, []
+
+    async def _registered_vue_options(
+        self,
+        select: Any,
+    ) -> List[Mapping[str, Any]]:
+        """Read Element Select's complete option registry when available.
+
+        Long Element dropdowns may only mount the slice around the saved value.
+        The select component still keeps the complete option components in
+        ``cachedOptions``/``options``; reading that registry lets ordered Excel
+        alternatives keep their priority without depending on the viewport.
+        """
+
+        return list(
+            await select.evaluate(
+                """element => {
+                  const component = element.__vue__;
+                  if (!component) return [];
+                  const sourceName = Array.isArray(component.cachedOptions)
+                    && component.cachedOptions.length
+                    ? 'cachedOptions'
+                    : (Array.isArray(component.options) ? 'options' : '');
+                  if (!sourceName) return [];
+                  return component[sourceName].map((option, index) => {
+                    const rawValue = option && option.value;
+                    const label = option && (
+                      option.currentLabel ?? option.label ?? option.displayName
+                    );
+                    const name = label === undefined || label === null || label === ''
+                      ? (typeof rawValue === 'string' || typeof rawValue === 'number'
+                        ? String(rawValue) : '')
+                      : String(label);
+                    let value = '';
+                    if (rawValue !== undefined && rawValue !== null) {
+                      if (typeof rawValue !== 'object') value = String(rawValue);
+                      else {
+                        try { value = JSON.stringify(rawValue); }
+                        catch (_error) { value = '[object]'; }
+                      }
+                    }
+                    return {
+                      name: name.trim(),
+                      value,
+                      index: String(index),
+                      source: sourceName,
+                      created: Boolean(option && option.created),
+                      disabled: Boolean(option && option.disabled),
+                      visible: true
+                    };
+                  }).filter(item => item.name && !item.disabled);
+                }"""
+            )
+        )
+
+    async def _apply_registered_vue_option(
+        self,
+        select: Any,
+        option: Mapping[str, Any],
+    ) -> bool:
+        return bool(
+            await select.evaluate(
+                """async (element, choice) => {
+                  const component = element.__vue__;
+                  if (!component || typeof component.handleOptionSelect !== 'function') {
+                    return false;
+                  }
+                  const source = component[choice.source];
+                  const matches = (Array.isArray(source) ? source : []).filter(option => {
+                    if (!option || option.disabled) return false;
+                    const label = String(option.currentLabel ?? option.label ?? option.displayName ?? '').trim();
+                    const value = typeof option.value === 'object'
+                      ? JSON.stringify(option.value) : String(option.value ?? '');
+                    return label === choice.name && value === choice.value;
+                  });
+                  if (matches.length !== 1) return false;
+                  const option = matches[0];
+                  component.handleOptionSelect(option, true);
+                  if (typeof component.$nextTick === 'function') {
+                    await new Promise(resolve => component.$nextTick(resolve));
+                  }
+                  return true;
+                }""",
+                {
+                    "source": str(option.get("source", "")),
+                    "index": str(option.get("index", "")),
+                    "name": str(option.get("name", "")),
+                    "value": str(option.get("value", "")),
+                },
             )
         )
 
@@ -783,6 +1881,50 @@ class TaobaoListing:
             return None
         return matches[0] if matches else None
 
+    async def _review_unmatched_page_option(
+        self,
+        *,
+        label: str,
+        candidates: Sequence[str],
+        options: Sequence[Mapping[str, Any]],
+        multi: bool,
+    ) -> Optional[str]:
+        review = getattr(
+            self.attribute_runtime, "resolve_unmatched_page_options", None
+        )
+        if not callable(review):
+            return None
+        category_id = next((
+            str(value).strip() for value in (
+                getattr(self.api_index, "active_category_id", ""),
+                getattr(self, "_xhs_api_category_id", ""),
+                getattr(self, "_youzan_api_category_id", ""),
+            ) if value
+        ), "")
+        if not category_id:
+            category_id = "dom:" + canonical_sha256(
+                await self._category_text()
+            )[:20]
+        review_options = tuple(
+            option for option in options
+            if not option.get("created")
+            or getattr(self, "allow_created_exact_dom_option", False)
+        )
+        try:
+            resolved = await review(
+                platform_id=self.attribute_platform_id,
+                category_leaf_id=category_id,
+                field_label=label,
+                excel_value="/".join(candidates),
+                options=review_options,
+                multi=multi,
+            )
+        except ValueError as exc:
+            raise TaobaoListingError(str(exc)) from exc
+        if resolved is None or resolved.is_no_fill:
+            return None
+        return resolved.label
+
     async def _choose_one_option(
         self,
         select: Any,
@@ -790,9 +1932,24 @@ class TaobaoListing:
         *,
         label: str,
         multi: bool,
+        review_attempted: bool = False,
     ) -> Optional[str]:
+        # A previous filter can hide every option despite a complete live
+        # component registry. Reset the query before inspecting this field.
+        await self._search_select(select, '')
         await self._open_select(select, multi=multi)
-        dropdown, options = await self._visible_dom_options(select)
+        try:
+            dropdown, options = await self._visible_dom_options(select)
+        except TaobaoListingError:
+            # Use only a uniquely registered, enabled option, through the
+            # component's normal selection handler. The writer verifies the
+            # selected values afterwards, including each multi-select member.
+            registered = await self._registered_vue_options(select)
+            for candidate in candidates:
+                matches = self._matching_options(candidate, registered)
+                if len(matches) == 1 and await self._apply_registered_vue_option(select, matches[0]):
+                    return str(matches[0]['name'])
+            raise
         initial_option_names = tuple(
             dict.fromkeys(
                 str(option.get("name", "")).strip()
@@ -800,6 +1957,7 @@ class TaobaoListing:
                 if str(option.get("name", "")).strip()
             )
         )
+        initial_options = tuple(options)
         custom_allowed = (
             (await select.get_attribute("caninputcustom") or "").casefold() == "true"
         )
@@ -808,8 +1966,13 @@ class TaobaoListing:
         )
         chosen = None
         chosen_text = ""
-        ambiguous_initial = set()
+        chosen_via_component = False
         observed_matches: Dict[str, List[Mapping[str, Any]]] = {}
+        # Evaluate one OR alternative completely before moving to the next.
+        # A virtualized dropdown may initially show a later alternative (often
+        # the persisted value) while the preferred one only appears after
+        # search.  Scanning every initial option first would silently reverse
+        # Excel's ordered-OR semantics.
         for candidate in candidates:
             matches = [
                 match
@@ -819,24 +1982,128 @@ class TaobaoListing:
                 or created_exact_click_allowed
             ]
             observed_matches[candidate] = list(matches)
-            if len(matches) > 1:
-                ambiguous_initial.add(normalize_option(candidate))
+            if len(matches) > 1 and len({m['name'].strip() for m in matches}) > 1:
+                # A later unique OR match is safer than arbitrarily choosing
+                # one of several platform IDs with the same visible label.
                 continue
-            chosen = matches[0] if matches else None
-            if (
-                chosen is not None
-                and chosen.get("created")
-                and not custom_allowed
-                and not created_exact_click_allowed
-            ):
-                chosen = None
-            if chosen is not None:
+            elif matches:
+                chosen = matches[0]
                 chosen_text = candidate
                 break
+            else:
+                if is_material_field_label(label):
+                    fuzzy_matches = match_option_candidates(
+                        (candidate,), initial_option_names, allow_component=False
+                    )
+                    if len(fuzzy_matches) == 1:
+                        chosen = initial_options[fuzzy_matches[0]]
+                        platform_label = str(chosen.get("name", "")).strip()
+                        chosen_text = platform_label
+                        observed_matches[platform_label] = [chosen]
+                        if self.logger is not None:
+                            self.logger.info(
+                                "淘宝属性“%s”：材质/面料模糊匹配 Excel 值 %s 到平台候选 %s",
+                                label,
+                                candidate,
+                                chosen.get("name", ""),
+                            )
+                        break
+                if await self._search_select(select, candidate):
+                    search_deadline = (
+                        asyncio.get_running_loop().time() + REMOTE_OPTION_SEARCH_SECONDS
+                    )
+                    while asyncio.get_running_loop().time() < search_deadline:
+                        await asyncio.sleep(0.1)
+                        try:
+                            dropdown, options = await self._visible_dom_options(
+                                select,
+                                timeout_seconds=0.35,
+                            )
+                        except TaobaoListingError:
+                            continue
+                        searched_matches = [
+                            match
+                            for match in self._matching_options(candidate, options)
+                            if not match.get("created")
+                            or custom_allowed
+                            or created_exact_click_allowed
+                        ]
+                        observed_matches[candidate] = searched_matches
+                        if searched_matches and len({m['name'].strip() for m in searched_matches}) == 1:
+                            chosen = searched_matches[0]
+                        if chosen is not None:
+                            chosen_text = candidate
+                            break
+                if chosen is None:
+                    registered_options = await self._registered_vue_options(select)
+                    registered_matches = [
+                        match
+                        for match in self._matching_options(candidate, registered_options)
+                        if not match.get("created")
+                        or custom_allowed
+                        or created_exact_click_allowed
+                    ]
+                    if registered_matches:
+                        observed_matches[candidate] = registered_matches
+                    if registered_matches and len({m['name'].strip() for m in registered_matches}) == 1:
+                        if await self._apply_registered_vue_option(
+                            select, registered_matches[0]
+                        ):
+                            chosen = registered_matches[0]
+                            chosen_text = candidate
+                            chosen_via_component = True
+                if chosen is None:
+                    dropdown, scrolled_matches = await self._scroll_select_for_candidate(
+                        select,
+                        candidate,
+                        custom_allowed=custom_allowed,
+                        created_exact_click_allowed=created_exact_click_allowed,
+                    )
+                    observed_matches[candidate] = scrolled_matches
+                    if scrolled_matches and len({m['name'].strip() for m in scrolled_matches}) == 1:
+                        chosen = scrolled_matches[0]
+                        chosen_text = candidate
+                if chosen is not None:
+                    break
 
-        # OR 值允许任一候选。若没有唯一项，但某个候选存在多个同名的
-        # 平台真实选项，则按 Excel 优先级和平台展示顺序选第一个。
-        # 单值字段仍保留重名拒绝策略，避免把这一例外扩散到普通属性。
+        # Material/fabric fields use a shared, conservative fuzzy tier after
+        # exact and registered alias matching.  A match is accepted only when
+        # one platform option remains; ambiguous values continue to the
+        # existing review/fallback path.
+        if chosen is None and is_material_field_label(label):
+            fuzzy_options: List[Mapping[str, Any]] = []
+            seen_option_keys = set()
+            for option in (*initial_options, *tuple(options)):
+                name = str(option.get("name", "")).strip()
+                key = (name, str(option.get("value", "")))
+                if not name or key in seen_option_keys:
+                    continue
+                if option.get("created") and not (
+                    custom_allowed or created_exact_click_allowed
+                ):
+                    continue
+                seen_option_keys.add(key)
+                fuzzy_options.append(option)
+            option_names = tuple(str(option.get("name", "")) for option in fuzzy_options)
+            for candidate in candidates:
+                matches = match_option_candidates((candidate,), option_names, allow_component=False)
+                if len(matches) != 1:
+                    continue
+                chosen = fuzzy_options[matches[0]]
+                platform_label = str(chosen.get("name", "")).strip()
+                chosen_text = platform_label
+                observed_matches[platform_label] = [chosen]
+                if self.logger is not None:
+                    self.logger.info(
+                        "淘宝属性“%s”：材质/面料模糊匹配 Excel 值 %s 到平台候选 %s",
+                        label,
+                        candidate,
+                        chosen.get("name", ""),
+                    )
+                break
+
+        # Only when no OR alternative is unique do we retain the established
+        # fallback of taking the first same-label platform entry.
         if chosen is None and len(candidates) > 1:
             for candidate in candidates:
                 matches = observed_matches.get(candidate, [])
@@ -847,48 +2114,13 @@ class TaobaoListing:
                 if self.logger is not None:
                     self.logger.info(
                         "淘宝属性“%s”：OR 候选 %s 有 %s 个同名平台项，"
-                        "按平台顺序选择第一个[%s]",
+                        "没有其他唯一候选，按平台顺序选择第一个[%s]",
                         label,
                         candidate,
                         len(matches),
                         chosen.get("value", ""),
                     )
                 break
-
-        if chosen is None:
-            for candidate in candidates:
-                # 当前候选列表中已确认重名的值不会因为重复搜索而变唯一；
-                # 直接尝试下一个 OR 候选，避免口袋/多口袋之间反复切换。
-                if normalize_option(candidate) in ambiguous_initial:
-                    continue
-                if not await self._search_select(select, candidate):
-                    continue
-                search_deadline = (
-                    asyncio.get_running_loop().time() + REMOTE_OPTION_SEARCH_SECONDS
-                )
-                while asyncio.get_running_loop().time() < search_deadline:
-                    await asyncio.sleep(0.1)
-                    try:
-                        dropdown, options = await self._visible_dom_options(
-                            select,
-                            timeout_seconds=0.35,
-                        )
-                    except TaobaoListingError:
-                        continue
-                    chosen = self._matching_option(candidate, options)
-                    observed_matches[candidate] = self._matching_options(candidate, options)
-                    if (
-                        chosen is not None
-                        and chosen.get("created")
-                        and not custom_allowed
-                        and not created_exact_click_allowed
-                    ):
-                        chosen = None
-                    if chosen is not None:
-                        chosen_text = candidate
-                        break
-                if chosen is not None:
-                    break
 
         if chosen is None:
             has_platform_match = any(observed_matches.values())
@@ -953,6 +2185,16 @@ class TaobaoListing:
                         " / ".join(initial_option_names) or "无",
                     )
                 await self._dismiss_select_dropdown(select)
+                if not review_attempted:
+                    reviewed = await self._review_unmatched_page_option(
+                        label=label, candidates=candidates,
+                        options=tuple((*initial_options, *options)), multi=multi,
+                    )
+                    if reviewed is not None:
+                        return await self._choose_one_option(
+                            select, (reviewed,), label=label, multi=multi,
+                            review_attempted=True,
+                        )
                 return None
 
             if self.logger is not None:
@@ -970,26 +2212,47 @@ class TaobaoListing:
                     "；".join(details),
                 )
             await self._dismiss_select_dropdown(select)
+            if not review_attempted:
+                reviewed = await self._review_unmatched_page_option(
+                    label=label, candidates=candidates,
+                    options=tuple((*initial_options, *options)), multi=multi,
+                )
+                if reviewed is not None:
+                    return await self._choose_one_option(
+                        select, (reviewed,), label=label, multi=multi,
+                        review_attempted=True,
+                    )
             return None
 
         if len(candidates) > 1 and self.logger is not None:
             self.logger.info(
-                "淘宝属性“%s”：候选优先使用平台已有值 %s",
+                "%s属性“%s”：候选优先使用平台已有值 %s",
+                self._platform_display_name,
                 label,
                 chosen_text,
             )
 
+        if chosen_via_component:
+            return chosen_text
+
         clicked = await dropdown.evaluate(
-            """(element, index) => {
-                const option = element.querySelectorAll(
+            """(element, choice) => {
+                const matches = Array.from(element.querySelectorAll(
                   '.el-select-dropdown__item'
-                )[index];
-                if (!option || option.classList.contains('is-disabled')) return false;
+                )).filter(option => {
+                  if (option.classList.contains('is-disabled')) return false;
+                  const raw = option.__vue__ && option.__vue__.value;
+                  const value = raw == null ? '' : typeof raw === 'object' ? JSON.stringify(raw) : String(raw);
+                  return (option.innerText || '').trim() === choice.name && value === choice.value;
+                });
+                if (!matches.length || (matches.length !== 1 && !choice.allow_duplicate)) return false;
+                const option = matches[0];
                 option.scrollIntoView({block: 'nearest'});
                 option.click();
                 return true;
             }""",
-            int(chosen["index"]),
+            {"name": str(chosen["name"]), "value": str(chosen.get("value", "")),
+             "allow_duplicate": len(observed_matches.get(chosen_text, [])) > 1},
         )
         if not clicked:
             raise TaobaoListingError(f"淘宝属性“{label}”的精确候选节点已失效")
@@ -1002,22 +2265,153 @@ class TaobaoListing:
         *,
         label: str,
         multi: bool,
+        allow_review: bool = True,
+        excel_value: Optional[str] = None,
+    ) -> Optional[Tuple[str, ...]]:
+        cached = getattr(self, '_excel_select_plans', {}).get(normalize_label(label), ())
+        alternatives = cached if cached and tuple(map(tuple, expected_groups)) == cached[0] else (expected_groups,)
+        failure = None
+        for plan in alternatives:
+            try:
+                actual = await self._write_select_values_once(
+                    select, plan, label=label, multi=multi,
+                    allow_review=allow_review and len(alternatives) == 1)
+                if actual is not None:
+                    return actual
+            except (TaobaoListingError, PlaywrightError) as exc:
+                failure = exc
+            if multi and len(alternatives) > 1:
+                await self._clear_multi_select(select)
+        if not allow_review:
+            if failure is not None:
+                raise failure
+            return None
+        runtime = self.attribute_runtime
+        recover = getattr(runtime, 'recover_failed_write', None)
+        if not callable(recover):
+            if failure is not None:
+                raise failure
+            return None
+        try:
+            resolved = await recover(platform_id=self.attribute_platform_id,
+                field_label=label, error=str(failure or '选择后未取得已填写的值'))
+        except ValueError:
+            options = await self._registered_vue_options(select)
+            if not options:
+                await self._search_select(select, '')
+                await self._open_select(select, multi=multi)
+                _dropdown, options = await self._visible_dom_options(select)
+            await self._dismiss_select_dropdown(select)
+            resolved = await runtime.resolve_unmatched_page_options(
+                platform_id=self.attribute_platform_id,
+                category_leaf_id=str(getattr(self.api_index, 'active_category_id', '') or ''),
+                field_label=label, excel_value=excel_value if excel_value is not None else (','.join('/'.join(group) for group in expected_groups)
+                                               if multi else '/'.join(expected_groups[0])),
+                options=tuple(options), multi=multi,
+                write_error=str(failure or '选择后未取得已填写的值'))
+        if resolved is None or resolved.is_no_fill:
+            return None
+        values = split_multi_choice(resolved.label) if multi else (resolved.label,)
+        try:
+            await self._search_select(select, '')
+            await self._dismiss_select_dropdown(select)
+            actual = await self._write_select_values_once(
+                select, tuple((value,) for value in values),
+                label=label, multi=multi, allow_review=False)
+            if actual is not None:
+                return actual
+            failure = TaobaoListingError('模型选择重试后未取得已填写的值')
+        except (TaobaoListingError, PlaywrightError) as exc:
+            failure = exc
+        await recover(platform_id=self.attribute_platform_id, field_label=label,
+                      error=str(failure), force_review=True)
+        return None
+
+    async def _excel_groups_for_select(self, select: Any, label: str, value: str, *, multi: bool) -> Tuple[Tuple[str, ...], ...]:
+        """Choose a complete ordered plan against this control's live registry."""
+        if not hasattr(self, '_excel_select_plans'):
+            self._excel_select_plans = {}
+        self._excel_select_plans.pop(normalize_label(label), None)
+        plans = tuple(tuple(value_candidates(label, member) for member in plan)
+                      for plan in excel_selection_plans(value, multi=multi))
+        options = await self._registered_vue_options(select)
+        if not options:
+            if not multi or all(len(plan) == 1 for plan in plans):
+                return (tuple(dict.fromkeys(
+                    name for plan in plans for member in plan for name in member
+                )),) if plans else ()
+            if len(plans) == 1:
+                return plans[0]
+            await self._search_select(select, '')
+            await self._open_select(select, multi=multi)
+            try:
+                _dropdown, options = await self._visible_dom_options(select)
+            except TaobaoListingError:
+                options = []
+            await self._dismiss_select_dropdown(select)
+        runtime = getattr(self, 'attribute_runtime', None)
+        if inspect.iscoroutinefunction(getattr(runtime, 'resolve_unmatched_page_options', None)) and options:
+            approved = await runtime.resolve_unmatched_page_options(
+                platform_id=self.attribute_platform_id,
+                category_leaf_id=str(getattr(self.api_index, 'active_category_id', '') or ''),
+                field_label=label, excel_value=value, options=tuple(options), multi=multi,
+                confirmed_only=True)
+            if approved is not None:
+                return () if approved.is_no_fill else tuple((name,) for name in (
+                    split_multi_choice(approved.label) if multi else (approved.label,)
+                ))
+        limit = await select_multiple_limit(select) if multi else 1
+        available_plans = []
+        for plan in plans:
+            if limit and len(plan) > limit:
+                continue
+            chosen = []
+            for member in plan:
+                match = next((matches[0] for candidate in member
+                              for matches in [self._matching_options(candidate, options)]
+                              if matches and len({m['name'] for m in matches}) == 1), None)
+                if match is None:
+                    for candidate in member:
+                        matches = heel_height_option_matches(
+                            label, candidate, tuple(option['name'] for option in options)
+                        )
+                        if len(matches) == 1:
+                            match = options[matches[0]]
+                            break
+                if match is None or match['name'] in chosen:
+                    break
+                chosen.append(match['name'])
+            if len(chosen) == len(plan):
+                available_plans.append(tuple((name,) for name in chosen))
+        if available_plans:
+            self._excel_select_plans[normalize_label(label)] = tuple(dict.fromkeys(available_plans))
+            return available_plans[0]
+        if not multi:
+            return (tuple(dict.fromkeys(
+                name for plan in plans for member in plan for name in member
+            )),) if plans else ()
+        return plans[0] if plans else ()
+
+    async def _write_select_values_once(
+        self,
+        select: Any,
+        expected_groups: Sequence[Sequence[str]],
+        *,
+        label: str,
+        multi: bool,
+        allow_review: bool = True,
     ) -> Optional[Tuple[str, ...]]:
         current = await self._read_select_values(select, multi=multi)
-        if len(expected_groups) == 1 and any(
-            normalize_option(current_value) == normalize_option(candidate)
-            for current_value in current
-            for candidate in expected_groups[0]
-        ):
-            return current
-
         if multi:
+            remaining = [
+                value for value in current if normalize_option(value)
+            ]
             expected_existing = []
             for group in expected_groups:
-                match = next(
+                match_index = next(
                     (
-                        current_value
-                        for current_value in current
+                        index
+                        for index, current_value in enumerate(remaining)
                         if any(
                             normalize_option(current_value) == normalize_option(candidate)
                             for candidate in group
@@ -1025,11 +2419,20 @@ class TaobaoListing:
                     ),
                     None,
                 )
-                if match is not None:
-                    expected_existing.append(match)
-            if len(expected_existing) == len(expected_groups):
+                if match_index is None:
+                    break
+                expected_existing.append(remaining.pop(match_index))
+            if len(expected_existing) == len(expected_groups) and not remaining:
                 return tuple(expected_existing)
             await self._clear_multi_select(select)
+        elif (
+            len(expected_groups) == 1
+            and len(current) == 1
+            and existing_value_is_preferred_or_alias(
+                label, expected_groups[0], current[0]
+            )
+        ):
+            return current
 
         chosen_values = []
         for group in expected_groups:
@@ -1038,6 +2441,7 @@ class TaobaoListing:
                 group,
                 label=label,
                 multi=multi,
+                review_attempted=not allow_review,
             )
             if chosen is None:
                 if multi:
@@ -1049,6 +2453,21 @@ class TaobaoListing:
         expected_counter = Counter(normalize_option(value) for value in chosen_values)
         actual_counter = Counter(normalize_option(value) for value in actual)
         if actual_counter != expected_counter:
+            if self.logger is not None:
+                diagnostics = await select.evaluate("""(element, names) => {
+                  const c = element.__vue__;
+                  if (!c) return {component: false};
+                  const brief = o => ({value: o && o.value,
+                    label: o && (o.currentLabel ?? o.label ?? o.displayName)});
+                  return {value: c.value, selected: Array.isArray(c.selected)
+                    ? c.selected.map(brief) : brief(c.selected),
+                    options: ['options', 'cachedOptions'].flatMap(source =>
+                      (Array.isArray(c[source]) ? c[source] : []).filter(o =>
+                        names.includes(String(o.currentLabel ?? o.label ?? o.displayName ?? '').trim())
+                        || (Array.isArray(c.value) ? c.value : [c.value]).includes(o.value)
+                      ).map(o => ({source, ...brief(o)})))};
+                }""", list(chosen_values) + list(actual))
+                self.logger.warning("属性“%s”回读不一致组件证据：%s", label, diagnostics)
             raise TaobaoListingError(
                 f"淘宝属性“{label}”选择后校验失败："
                 f"期望 {chosen_values!r}，页面为 {list(actual)!r}"
@@ -1058,6 +2477,232 @@ class TaobaoListing:
         # 会与上一个残留层同时可见。
         await self._dismiss_select_dropdown(select)
         return actual
+
+    async def _excel_before_review(self, select, candidates, group, *, label, preflight_request=None):
+        """Try the existing DOM input/readback path before requesting review.
+
+        The base writer avoids recursively entering adapter learning resolvers.
+        Only readback-verified values augment the request; API IDs stay intact.
+        """
+        values = tuple(CandidateValue(value.value_id, value.label) for value in candidates)
+        reuse = getattr(getattr(self, 'attribute_runtime', None), 'reusable_choice', None)
+        if preflight_request is not None and callable(reuse):
+            choice = reuse(preflight_request)
+            if choice is not None:
+                if self.logger:
+                    self.logger.info('属性“%s”：优先复用 %s（%s），不试填 Excel 原值', label, choice.label, choice.source)
+                # Keep the original request so runtime records the genuine
+                # history/approval source, not a fabricated Excel match.
+                return values, '/'.join(group)
+        labels = tuple(value.label for value in values)
+        for alias in group:
+            exact = preferred_exact_candidate_label(labels, (alias,))
+            if exact is not None:
+                return values, exact
+            height_matches = heel_height_option_matches(label, alias, labels)
+            if len(height_matches) == 1:
+                return values, labels[height_matches[0]]
+            style_matches = match_style_option_candidates(label, alias, labels)
+            if len(style_matches) == 1:
+                return values, labels[style_matches[0]]
+        actual = None
+        try:
+            multi = await select_supports_multiple(select)
+            actual = await TaobaoListing._select_values(
+                self, select, (tuple(group),), label=label, multi=multi,
+                allow_review=False,
+            )
+        except TaobaoListingError:
+            actual = None
+        finally:
+            if actual is None:
+                await self._search_select(select, '')
+                try:
+                    await self._dismiss_select_dropdown(select)
+                except TaobaoListingError:
+                    if self.logger:
+                        self.logger.warning('属性“%s”试填后下拉层尚未关闭，候选筛选已清空', label)
+        material_matches = (
+            match_option_candidates(group, labels, allow_component=False)
+            if is_material_field_label(label) else ()
+        )
+        matched_material = (
+            bool(actual) and len(actual) == 1 and len(material_matches) == 1
+            and labels[material_matches[0]] == actual[0]
+        )
+        if actual and len(actual) == 1 and (
+            matched_material or any(
+                normalize_option(actual[0]) == normalize_option(alias)
+                for alias in group
+            )
+        ):
+            value = actual[0]
+            if value in labels:
+                return values, value
+            return values + (CandidateValue(value, value),), value
+        return values, '/'.join(group)
+
+    async def _resolve_learning_select_groups(
+        self,
+        page_label: str,
+        select: Any,
+        groups: Sequence[Sequence[str]],
+        *,
+        observed_values: Sequence[str] = (),
+    ) -> Optional[Tuple[str, ...]]:
+        runtime = self.attribute_runtime
+        if runtime is None:
+            raise TaobaoListingError("淘宝属性学习运行器未启用")
+        if not isinstance(self.api_index, TaobaoApiJsonIndex):
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝属性“%s”：接口 JSON 索引不可用，改用当前 DOM 匹配与回读",
+                    page_label,
+                )
+            return None
+
+        # The initial category schema is already captured before attribute
+        # filling.  If that settled schema contains no such field (the SKU
+        # batch selectors are the common case), waiting three seconds after
+        # every click cannot produce a match because option responses only
+        # enrich known schema fields.  Fall back to the live DOM immediately.
+        await self.api_index.settle(timeout_seconds=0.25)
+        if not self.api_index.fields_for_label(page_label):
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝属性“%s”：当前类目 JSON 无此字段，"
+                    "立即改用 DOM 候选与回读",
+                    page_label,
+                )
+            return None
+
+        custom_allowed = (
+            (await select.get_attribute("caninputcustom") or "").casefold()
+            == "true"
+        )
+        dom_options: Sequence[Mapping[str, Any]] = ()
+        if observed_values:
+            fields = self.api_index.candidate_fields(page_label)
+        else:
+            multi = await select_supports_multiple(select)
+            await self._open_select(select, multi=multi)
+            try:
+                _dropdown, dom_options = await self._visible_dom_options(select)
+                fields = await self.api_index.wait_for_candidate_field(
+                    page_label,
+                    timeout_seconds=3.0,
+                )
+            finally:
+                try:
+                    await self._dismiss_select_dropdown(select)
+                except Exception:
+                    pass
+        if len(fields) != 1:
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝属性“%s”：接口字段未唯一定位，"
+                    "回退页面匹配/直接输入逻辑",
+                    page_label,
+                )
+            return None
+        field = fields[0]
+        field_id = str(field.source_id or "").strip()
+        category_id = str(field.category_leaf_id or "").strip()
+        if not field_id or not category_id:
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝属性“%s”：接口字段 ID 或类目 ID 不完整，"
+                    "改用当前 DOM 匹配与回读",
+                    page_label,
+                )
+            return None
+        candidates = tuple(field.option_values)
+        if observed_values:
+            try:
+                candidates = validate_observed_selection(candidates, observed_values)
+            except CandidateSourceError as exc:
+                if self.logger is not None:
+                    self.logger.info(
+                        "淘宝属性“%s”已保存值无法与当前接口 JSON "
+                        "唯一关联，仅保留 DOM 回读，本次不重复入库：%s",
+                        page_label,
+                        exc.reason_code,
+                    )
+                return None
+        candidate_ids = tuple(value.value_id.strip() for value in candidates)
+        candidate_labels = tuple(value.label.strip() for value in candidates)
+        if (
+            not candidates
+            or any(not value for value in candidate_ids)
+            or any(not value for value in candidate_labels)
+            or len(candidate_ids) != len(set(candidate_ids))
+        ):
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝属性“%s”：接口候选不完整，改用当前 DOM 匹配与回读",
+                    page_label,
+                )
+            return None
+        if not observed_values:
+            api_labels = {normalize_option(value) for value in candidate_labels}
+            dom_labels = {
+                normalize_option(option.get("name", ""))
+                for option in dom_options
+                if not option.get("disabled")
+            }
+            if not api_labels.intersection(dom_labels):
+                if self.logger is not None:
+                    self.logger.info(
+                        "淘宝属性“%s”：接口候选与当前 DOM 暂无交集，"
+                        "改用页面搜索/直接输入与回读",
+                        page_label,
+                    )
+                return None
+
+        multi = await select_supports_multiple(select)
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "tb",
+                "category_leaf_id": category_id,
+                "field_id": field_id,
+                "control_type": "multi_select" if multi else "select",
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved_values = []
+        for group in groups:
+            request_candidates, excel_value = await self._excel_before_review(
+                select, candidates, group, label=page_label,
+                preflight_request=AttributeRequest(
+                    platform_id="tb", category_leaf_id=category_id,
+                    field_id=field_id, field_label=page_label,
+                    candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
+                    excel_value="/".join(group), evidence={},
+                    custom_allowed=custom_allowed, schema_version=schema_version,
+                    control_type="multi_select" if multi else "select",
+                ),
+            )
+            resolved = await runtime.resolve(
+                AttributeRequest(
+                    platform_id="tb",
+                    category_leaf_id=category_id,
+                    field_id=field_id,
+                    field_label=page_label,
+                    candidates=request_candidates,
+                    excel_value=excel_value,
+                    evidence={"excel": bool(excel_value.strip())},
+                    custom_allowed=custom_allowed,
+                    schema_version=schema_version,
+                    control_type="multi_select" if multi else "select",
+                )
+            )
+            if resolved is None or getattr(resolved, "is_no_fill", False):
+                return ()
+            resolved_values.extend(reviewed_selection_labels(resolved.label, candidates, multi=multi))
+        return tuple(resolved_values)
 
     async def fill_attribute(
         self,
@@ -1097,9 +2742,10 @@ class TaobaoListing:
         if normalize_label(page_label) == normalize_label("吊牌价"):
             if len(visible_inputs) != 1:
                 raise TaobaoListingError("淘宝吊牌价找不到唯一数值输入框")
-            number = str(expected).strip()
-            if not re.fullmatch(r"\d+(?:\.\d+)?", number):
-                raise TaobaoListingError(f"淘宝吊牌价不是有效数字：{expected!r}")
+            try:
+                number = normalize_money_value(expected)
+            except MoneyValueError as exc:
+                raise TaobaoListingError(f"淘宝吊牌价{exc}") from exc
             input_box = visible_inputs[0]
             if (await input_box.input_value()).strip() != number:
                 await input_box.fill(number)
@@ -1111,35 +2757,140 @@ class TaobaoListing:
                 )
             return (actual,)
 
+        if (
+            normalize_label(page_label) == normalize_label("鞋跟高度")
+            and len(visible_inputs) == 1
+            and await selects.count() == 1
+        ):
+            # 靴子类目使用数值输入框加单位下拉，cm 不是鞋跟高度候选。
+            first = re.split(r"[/／]", str(expected), maxsplit=1)[0].strip()
+            number = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:cm|厘米)?", first, re.I)
+            if number is None:
+                raise TaobaoListingError("淘宝鞋跟高度没有可填写的首个厘米数值")
+            unit = await self._select_values(
+                selects.first, (("cm",),), label="鞋跟高度单位", multi=False, allow_review=False
+            )
+            if unit != ("cm",):
+                raise TaobaoListingError("淘宝鞋跟高度单位回读失败")
+            input_box = visible_inputs[0]
+            await input_box.fill(number.group(1))
+            await input_box.press("Tab")
+            actual = (await input_box.input_value()).strip()
+            if normalize_money_value(actual) != normalize_money_value(number.group(1)):
+                raise TaobaoListingError(f"淘宝鞋跟高度数值回读失败：{actual!r}")
+            return (actual,)
+
         if await selects.count():
             if await selects.count() != 1:
                 raise TaobaoListingError(f"淘宝属性“{page_label}”下拉框不唯一")
             select = selects.first
-            multi = await select.locator(".el-select__tags").count() > 0
+            multi = await select_supports_multiple(select)
             if exact_values is not None:
-                groups = tuple((str(value),) for value in exact_values)
+                groups = material_value_groups(page_label, exact_values)
             else:
-                groups = selection_value_groups(page_label, expected)
+                groups = await self._excel_groups_for_select(
+                    select, page_label, str(expected), multi=multi
+                )
                 if not groups:
                     raise TaobaoListingError(f"淘宝属性“{page_label}”期望值为空")
-            if not multi and len(groups) > 1:
-                rendered = "，".join("/".join(group) for group in groups)
-                raise TaobaoListingError(
-                    f"淘宝属性“{page_label}”是单选，Excel 却提供了"
-                    f"多个逗号分组：{rendered}"
-                )
-            return await self._select_values(
-                select,
-                groups,
-                label=page_label,
-                multi=multi,
+            current = tuple(
+                value
+                for value in await self._read_select_values(select, multi=multi)
+                if normalize_option(value)
             )
+            remaining = list(current)
+            current_matches = []
+            for group in groups:
+                match_index = next(
+                    (
+                        index
+                        for index, current_value in enumerate(remaining)
+                        if any(
+                            normalize_option(current_value)
+                            == normalize_option(candidate)
+                            for candidate in group
+                        )
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    break
+                current_matches.append(remaining.pop(match_index))
+            if (
+                len(current_matches) == len(groups)
+                and not remaining
+                and all(
+                    existing_value_is_preferred_or_alias(
+                        page_label, group, current_value
+                    )
+                    for group, current_value in zip(groups, current_matches)
+                )
+            ):
+                learning_recorded = False
+                if (
+                    self.attribute_runtime is not None
+                    and self.attribute_platform_id == "tb"
+                ):
+                    learning_recorded = (
+                        await self._resolve_learning_select_groups(
+                        page_label,
+                        select,
+                        tuple((str(value),) for value in current_matches),
+                        observed_values=tuple(str(value) for value in current_matches),
+                        )
+                        is not None
+                    )
+                if self.logger is not None:
+                    self.logger.info(
+                        "淘宝属性“%s”已匹配，%s",
+                        page_label,
+                        (
+                            "完成轻量学习后跳过选择"
+                            if learning_recorded
+                            else "跳过重复选择"
+                        ),
+                    )
+                return tuple(str(value) for value in current_matches)
+            if (
+                self.attribute_runtime is not None
+                and self.attribute_platform_id == "tb"
+            ):
+                resolved_values = await self._resolve_learning_select_groups(
+                    page_label,
+                    select,
+                    groups,
+                )
+                if resolved_values == ():
+                    if self.logger is not None:
+                        self.logger.info(
+                            "淘宝属性“%s”已加入本平台待审核汇总，继续填写后续字段",
+                            page_label,
+                        )
+                    return None
+                if resolved_values is not None:
+                    groups = tuple((value,) for value in resolved_values)
+            actual = await self._select_values(select, groups, label=page_label, multi=multi)
+            runtime = self.attribute_runtime
+            pending = getattr(runtime, 'review_pending_or_omitted', None)
+            if actual is None and callable(getattr(runtime, "resolve_unmatched_page_options", None)) and not (callable(pending) and pending(self.attribute_platform_id, page_label)):
+                await self._open_select(select, multi=multi)
+                _dropdown, options = await self._visible_dom_options(select)
+                await self._dismiss_select_dropdown(select)
+                await runtime.resolve_unmatched_page_options(
+                    platform_id=self.attribute_platform_id,
+                    category_leaf_id=str(getattr(self.api_index, "active_category_id", "") or ""),
+                    field_label=page_label, excel_value=str(expected), options=tuple(options),
+                    multi=multi, force_review=True,
+                )
+                if self.logger:
+                    self.logger.warning("属性“%s”审核值未能写入，已重新提交人工审核", page_label)
+            return actual
 
         if len(visible_inputs) != 1:
             raise TaobaoListingError(
                 f"淘宝属性“{page_label}”不是唯一的下拉或文本输入控件"
             )
-        expected_text = str(expected).strip()
+        expected_text = listing_date_text_value(page_label, expected)
         input_box = visible_inputs[0]
         if (await input_box.input_value()).strip() != expected_text:
             await input_box.fill(expected_text)
@@ -1152,14 +2903,97 @@ class TaobaoListing:
             )
         return (actual,)
 
-    async def _material_rows(self, item: Any) -> List[Any]:
-        rows = item.locator(".multi-complex-items > div")
-        material_rows = []
-        for index in range(await rows.count()):
-            row = rows.nth(index)
-            select_input = row.locator(".el-select input.el-input__inner").first
-            inputs = row.locator("input")
+    async def _fill_fabric_attribute(
+        self,
+        page_label: str,
+        fabric_names: Sequence[str],
+        *,
+        item: Any,
+        writer: Optional[Any] = None,
+        raw_value: Optional[str] = None,
+    ) -> Optional[Tuple[str, ...]]:
+        """填写面料：多选 -> Excel 原值 -> 其他。"""
+        expected = tuple(
+            str(name).strip() for name in fabric_names if str(name).strip()
+        )
+        if writer is None:
+            async def writer(value: str, values: Sequence[str]) -> Optional[Tuple[str, ...]]:
+                return await self.fill_attribute(
+                    page_label,
+                    value,
+                    exact_values=tuple(values),
+                    item=item,
+                )
+        def pending_review():
+            checker = getattr(getattr(self, "attribute_runtime", None), "review_pending_or_omitted", None)
+            return callable(checker) and checker(self.attribute_platform_id, page_label)
+
+        try:
+            result = await writer("/".join(expected), expected)
+            if result is not None:
+                return result
+            if pending_review():
+                return None
+            raise TaobaoListingError(
+                f"淘宝属性“{page_label}”没有同时匹配到全部面料候选"
+            )
+        except Exception as exc:
+            if pending_review():
+                return None
+            if self.logger is not None:
+                self.logger.warning(
+                    "淘宝属性“%s”无法同时选择面料 %s，回退选择“其他”：%s",
+                    page_label,
+                    list(expected),
+                    exc,
+                )
+            last_error: Optional[Exception] = None
+            # 平台没有对应的结构化选项时，先尝试把 Excel 原始组合
+            # 写入可自定义输入控件，再使用“其他/其它”兜底。
+            direct_value = str(raw_value or "").strip()
+            if direct_value and direct_value not in {"/".join(expected), *expected}:
+                try:
+                    direct = await writer(direct_value, (direct_value,))
+                except Exception as direct_exc:
+                    last_error = direct_exc
+                else:
+                    if direct is not None:
+                        return direct
+            if len(expected) < 2 and not direct_value:
+                raise
+            for fallback_label in ("其他", "其它"):
+                try:
+                    fallback = await writer(fallback_label, (fallback_label,))
+                except Exception as fallback_exc:
+                    last_error = fallback_exc
+                    continue
+                if fallback is not None:
+                    return fallback
+                if pending_review():
+                    return None
+            if last_error is not None:
+                raise last_error
+            raise TaobaoListingError(
+                f"淘宝属性“{page_label}”多面料无法同时选择，"
+                "且没有可用的“其他/其它”候选"
+            )
+
+    @staticmethod
+    async def _material_percentage_input(
+        row: Any,
+        *,
+        wait_seconds: float = 0.0,
+    ) -> Any:
+        """返回行内唯一的“含量”输入框；组件重渲染期间轮询等待。
+
+        材质名选中会让组件重新渲染当前行，含量列会短暂卸载再回挂。
+        只统计一次会把这个瞬时状态误判成“找不到唯一含量输入框”，
+        因此在有等待预算时轮询到出现为止。
+        """
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        while True:
             percentage_inputs = []
+            inputs = row.locator("input")
             for input_index in range(await inputs.count()):
                 candidate = inputs.nth(input_index)
                 if not await candidate.is_visible():
@@ -1169,7 +3003,21 @@ class TaobaoListing:
                 ):
                     continue
                 percentage_inputs.append(candidate)
-            if not await select_input.count() or len(percentage_inputs) != 1:
+            if len(percentage_inputs) == 1:
+                return percentage_inputs[0]
+            if asyncio.get_running_loop().time() >= deadline:
+                return None
+            await asyncio.sleep(0.05)
+
+    async def _material_rows(self, item: Any) -> List[Any]:
+        rows = item.locator(".multi-complex-items > div")
+        material_rows = []
+        for index in range(await rows.count()):
+            row = rows.nth(index)
+            select_input = row.locator(".el-select input.el-input__inner").first
+            if not await select_input.count():
+                continue
+            if await self._material_percentage_input(row) is None:
                 continue
             material_rows.append(row)
         return material_rows
@@ -1178,18 +3026,7 @@ class TaobaoListing:
         actual = []
         for index, row in enumerate(await self._material_rows(item)):
             select_input = row.locator(".el-select input.el-input__inner").first
-            percentage_box = None
-            inputs = row.locator("input")
-            for input_index in range(await inputs.count()):
-                candidate = inputs.nth(input_index)
-                if not await candidate.is_visible():
-                    continue
-                if await candidate.evaluate(
-                    "element => Boolean(element.closest('.el-select'))"
-                ):
-                    continue
-                percentage_box = candidate
-                break
+            percentage_box = await self._material_percentage_input(row)
             if percentage_box is None:
                 continue
             name = (await select_input.input_value()).strip()
@@ -1337,16 +3174,21 @@ class TaobaoListing:
         if record is None:
             raise TaobaoListingError("当前淘宝类目中找不到属性“材质成分”")
         _label, item = record
-        expected = tuple((material.name, material.percentage) for material in materials)
-        if not expected:
-            raise TaobaoListingError("Excel 中没有可用于淘宝材质成分的内容")
-        if sum(percentage for _name, percentage in expected) != 100:
-            raise TaobaoListingError("淘宝材质成分含量合计必须为 100")
+        expected = self._expected_material_rows(materials)
+        component_expected = tuple(
+            (
+                TAOBAO_MATERIAL_OPTION_ALIASES.get(
+                    normalize_option(name), (name,)
+                )[0],
+                percentage,
+            )
+            for name, percentage in expected
+        )
 
         async def sync_and_validate_component() -> None:
             if self.logger is not None:
                 self.logger.info("淘宝材质成分：开始同步页面内部组件")
-            component_state = await self._sync_material_component(item, expected)
+            component_state = await self._sync_material_component(item, component_expected)
             if component_state.get("error"):
                 raise TaobaoListingError(
                     "淘宝材质成分组件同步失败："
@@ -1416,18 +3258,53 @@ class TaobaoListing:
             if self.logger is not None:
                 self.logger.info("淘宝材质成分：父表单校验完成")
 
-        if await self._read_materials(item) == expected:
+        if self._material_rows_match(await self._read_materials(item), expected):
             await sync_and_validate_component()
             return expected
 
         await item.scroll_into_view_if_needed()
         while await self._material_rows(item):
             rows = await self._material_rows(item)
-            remove = rows[-1].get_by_text("移除", exact=True)
-            if await remove.count() != 1:
+            # 淘宝的“移除”按钮属于材质成分外层容器，视觉上贴在
+            # 最后一行右下角，但并不是该行的子节点。限定在 row 内
+            # 会得到 0 个；直接在属性容器内取可见按钮，兼容单行和多行。
+            visible_removes = []
+            # 页面版本不同：按钮有时在 .el-form-item 内，有时被提升到
+            # 外层卡片。逐层扩大范围，但每层只接收可见的精确文本节点。
+            scope = item
+            for _ in range(4):
+                remove_candidates = scope.get_by_text("移除", exact=True)
+                for remove_index in range(await remove_candidates.count()):
+                    candidate = remove_candidates.nth(remove_index)
+                    if await candidate.is_visible():
+                        visible_removes.append(candidate)
+                if visible_removes:
+                    break
+                scope = scope.locator("xpath=..").first
+            if not visible_removes:
+                # 某些版本把复杂属性卡片挂到表单项外，祖先链仍不包含
+                # 控件本身；当前页面精确文本“移除”只用于材质成分。
+                global_removes = self.page.get_by_text("移除", exact=True)
+                for remove_index in range(await global_removes.count()):
+                    candidate = global_removes.nth(remove_index)
+                    if await candidate.is_visible():
+                        visible_removes.append(candidate)
+            if not visible_removes:
+                existing = await self._read_materials(item)
+                if existing and sum(percentage for _name, percentage in existing) == 100:
+                    # 新版页面可能把移除控件做成非文本/伪元素，但已有
+                    # 材质行已完整且合计 100%，直接复用并继续校验即可。
+                    # 清理失败不应把一个可保存页面误报成流程错误。
+                    component_expected = tuple(existing)
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "淘宝材质成分旧行已完整（合计 100%），页面未暴露可定位的移除控件；保留现值继续校验"
+                        )
+                    await sync_and_validate_component()
+                    return existing
                 raise TaobaoListingError("淘宝材质成分已有内容，但找不到唯一“移除”按钮")
             before = len(rows)
-            await remove.click()
+            await visible_removes[-1].click()
             deadline = asyncio.get_running_loop().time() + 3
             while asyncio.get_running_loop().time() < deadline:
                 if len(await self._material_rows(item)) < before:
@@ -1440,6 +3317,7 @@ class TaobaoListing:
         if await add_button.count() != 1:
             raise TaobaoListingError("淘宝材质成分找不到唯一“添加”按钮")
 
+        effective_expected = []
         for index, (name, percentage) in enumerate(expected):
             before = len(await self._material_rows(item))
             await add_button.click()
@@ -1459,7 +3337,9 @@ class TaobaoListing:
                 )
             actual_name = await self._select_values(
                 selects.first,
-                ((name,),),
+                ((name,) + TAOBAO_MATERIAL_OPTION_ALIASES.get(
+                    normalize_option(name), ()
+                ),),
                 label=f"材质成分第 {index + 1} 行材质",
                 multi=False,
             )
@@ -1467,35 +3347,81 @@ class TaobaoListing:
                 raise TaobaoListingError(
                     f"淘宝材质成分第 {index + 1} 行没有 Excel 材质“{name}”的精确候选"
                 )
+            # The platform may not expose the Excel spelling (for example,
+            # “羊皮” is represented by the learned “其他材质” option).  The
+            # value returned by the selector is the value that the page can
+            # actually persist, so subsequent validation must use it rather
+            # than comparing against the unavailable Excel spelling.
+            effective_expected.append((actual_name[0], percentage))
 
-            percentage_inputs = []
-            inputs = row.locator("input")
-            for input_index in range(await inputs.count()):
-                candidate = inputs.nth(input_index)
-                if not await candidate.is_visible():
-                    continue
-                if await candidate.evaluate(
-                    "element => Boolean(element.closest('.el-select'))"
-                ):
-                    continue
-                percentage_inputs.append(candidate)
-            if len(percentage_inputs) != 1:
+            row = rows[-1]
+            percentage_input = await self._material_percentage_input(
+                row, wait_seconds=MATERIAL_PERCENTAGE_WAIT_SECONDS
+            )
+            if percentage_input is None:
                 raise TaobaoListingError(
                     f"淘宝材质成分第 {index + 1} 行找不到唯一含量输入框"
                 )
-            await percentage_inputs[0].fill(str(percentage))
-            await percentage_inputs[0].press("Tab")
+            await percentage_input.fill(str(percentage))
+            await percentage_input.press("Tab")
 
+        # Keep the internal Vue component in sync with the same effective
+        # platform labels used by the DOM verification above.  A learned
+        # fallback such as “其他材质” must not be re-matched against the
+        # unavailable Excel spelling “羊皮”.
+        component_expected = tuple(
+            (
+                TAOBAO_MATERIAL_OPTION_ALIASES.get(
+                    normalize_option(name), (name,)
+                )[0],
+                percentage,
+            )
+            for name, percentage in effective_expected
+        )
         deadline = asyncio.get_running_loop().time() + 5
         while asyncio.get_running_loop().time() < deadline:
             actual = await self._read_materials(item)
-            if actual == expected:
+            if self._material_rows_match(actual, effective_expected):
                 await sync_and_validate_component()
                 return actual
             await asyncio.sleep(0.05)
         raise TaobaoListingError(
-            f"淘宝材质成分填写后校验失败：期望 {expected!r}，页面为 {actual!r}"
+            f"淘宝材质成分填写后校验失败：期望 {tuple(effective_expected)!r}，页面为 {actual!r}"
         )
+
+    @staticmethod
+    def _material_rows_match(
+        actual: Sequence[Tuple[str, int]],
+        expected: Sequence[Tuple[str, int]],
+    ) -> bool:
+        reverse_aliases = {
+            normalize_option(alias): normalize_option(name)
+            for name, aliases in TAOBAO_MATERIAL_OPTION_ALIASES.items()
+            for alias in aliases
+        }
+        def canonical(rows: Sequence[Tuple[str, int]]) -> Tuple[Tuple[str, int], ...]:
+            return tuple(
+                (reverse_aliases.get(normalize_option(name), normalize_option(name)), int(percentage))
+                for name, percentage in rows
+            )
+        return canonical(actual) == canonical(expected)
+
+    @staticmethod
+    def _expected_material_rows(
+        materials: Sequence[MaterialComponent],
+    ) -> Tuple[Tuple[str, int], ...]:
+        """Normalize and validate the shared material composition contract."""
+        expected = tuple(
+            (str(material.name).strip(), int(material.percentage))
+            for material in materials
+        )
+        if not expected:
+            raise TaobaoListingError("Excel 中没有可用于材质成分的内容")
+        if any(not name for name, _percentage in expected):
+            raise TaobaoListingError("材质成分名称不能为空")
+        if sum(percentage for _name, percentage in expected) != 100:
+            raise TaobaoListingError("材质成分含量合计必须为 100")
+        return expected
 
     @staticmethod
     def _material_validation_is_confirmed(
@@ -1544,12 +3470,32 @@ class TaobaoListing:
                 return False
         return True
 
+    @classmethod
+    def _material_dom_errors_are_stale(
+        cls,
+        page_label: str,
+        error_texts: Sequence[str],
+        validation: Mapping[str, Any],
+    ) -> bool:
+        stale_messages = {
+            "材质成分子项请勿留空",
+            "材质成分必填一份数据",
+        }
+        errors = {str(value).strip() for value in error_texts if str(value).strip()}
+        return (
+            normalize_label(page_label) == normalize_label("材质成分")
+            and bool(errors)
+            and errors <= stale_messages
+            and cls._material_validation_is_confirmed(validation)
+        )
+
     async def _build_assignments(
         self,
         fields: Mapping[str, str],
         page_items: Mapping[str, Tuple[str, Any]],
     ) -> Dict[str, Tuple[str, str]]:
         target_sources: Dict[str, List[Tuple[str, str]]] = {}
+        page_items = without_color_attributes(page_items)
         special = {
             normalize_label("面料"),
             normalize_label("材质成分"),
@@ -1577,7 +3523,11 @@ class TaobaoListing:
                     f"淘宝属性“{page_label}”匹配到多个 Excel 字段：{keys}"
                 )
             if sources:
-                assignments[normalized_page] = (page_label, sources[0][1])
+                source_key, source_value = sources[0]
+                paired = positional_listing_date_value(page_label, source_key, source_value)
+                assignments[normalized_page] = (
+                    page_label, paired if paired is not None else source_value
+                )
         return assignments
 
     async def apply_excel_attributes(
@@ -1588,11 +3538,14 @@ class TaobaoListing:
     ) -> Mapping[str, Any]:
         """按所选类目模式应用类目，并匹配填写 Excel。"""
         category = await self.apply_category(category_mode)
-        page_items = await self._attribute_items()
+        page_items = without_color_attributes(await self._attribute_items())
         source_fields = fields.fields
         assignments = await self._build_assignments(source_fields, page_items)
-        materials = parse_taobao_materials(source_fields)
-        fabrics = parse_taobao_fabrics(source_fields)
+        page_labels = {label.split("#", 1)[0] for label in page_items}
+        materials = (parse_taobao_materials(source_fields)
+                     if normalize_label("材质成分") in page_labels else ())
+        fabrics = (parse_taobao_fabrics(source_fields)
+                   if normalize_label("面料") in page_labels else ())
 
         applied: Dict[str, Tuple[str, ...]] = {}
         skipped_values: Dict[str, str] = {}
@@ -1612,11 +3565,8 @@ class TaobaoListing:
                     skipped_values[report_label] = "Excel 未提供可解析的面料字段"
                     continue
                 fabric_names = tuple(material.name for material in fabrics)
-                actual = await self.fill_attribute(
-                    page_label,
-                    "/".join(fabric_names),
-                    exact_values=fabric_names,
-                    item=_item,
+                actual = await self._fill_fabric_attribute(
+                    page_label, fabric_names, item=_item
                 )
                 if actual is None:
                     skipped_values[report_label] = "/".join(fabric_names)
@@ -1637,6 +3587,39 @@ class TaobaoListing:
             if assignment is None:
                 continue
             _assigned_label, value = assignment
+            if normalize_label(page_label) == normalize_label("上市时间"):
+                inputs = _item.locator(
+                    ":scope > .el-form-item > .el-form-item__content "
+                    "input:not([readonly]):visible"
+                )
+                if await inputs.count() == 2:
+                    today = date.today()
+                    actual_date = (str(today.year), str(today.month))
+                    for index, expected_date_part in enumerate(actual_date):
+                        box = inputs.nth(index)
+                        if (await box.input_value()).strip() != expected_date_part:
+                            await box.fill(expected_date_part)
+                            await box.press("Tab")
+                    actual_date_values = []
+                    for index in range(2):
+                        actual_date_values.append(
+                            (await inputs.nth(index).input_value()).strip()
+                        )
+                    actual_date = tuple(actual_date_values)
+                    if actual_date != (str(today.year), str(today.month)):
+                        raise TaobaoListingError(
+                            f"淘宝属性“{page_label}”日期填写后回读失败："
+                            f"期望 {today.year}-{today.month}，页面为 {actual_date!r}"
+                        )
+                    applied[report_label] = actual_date
+                    if self.logger is not None:
+                        self.logger.info(
+                            "淘宝属性“%s”已按当前真实日期填写：%s-%s",
+                            page_label,
+                            actual_date[0],
+                            actual_date[1],
+                        )
+                    continue
             if self.logger is not None:
                 self.logger.info("正在填写淘宝属性：%s", page_label)
             actual = await self.fill_attribute(page_label, value, item=_item)
@@ -1655,10 +3638,10 @@ class TaobaoListing:
             self.logger.info("淘宝属性填写完成，正在复核当前必填状态")
         required_errors = []
         for page_label, error_texts in await self._required_attribute_errors():
-            stale_material_error = (
-                normalize_label(page_label) == materials_label
-                and set(error_texts) == {"材质成分子项请勿留空"}
-                and self._material_validation_is_confirmed(self.material_validation)
+            stale_material_error = self._material_dom_errors_are_stale(
+                page_label,
+                error_texts,
+                self.material_validation,
             )
             if stale_material_error:
                 self.material_validation["ignored_dom_errors"] = error_texts
@@ -1672,7 +3655,15 @@ class TaobaoListing:
             required_errors.append(page_label)
         if self.logger is not None:
             self.logger.info("淘宝当前必填状态复核完成")
-        if required_errors:
+        if (
+            required_errors
+            and not (
+                self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+            )
+        ):
             if self.logger is not None and normalize_label("材质成分") in {
                 normalize_label(label) for label in required_errors
             }:
@@ -1715,21 +3706,31 @@ class TaobaoListing:
         self,
         lengths: Sequence[Any],
         garment_kind: str,
+        recommendations: Sequence[Any] = (),
     ) -> Mapping[str, Any]:
-        """按尺码文本填写淘宝尺码表中的衣长或裤长。"""
-        if garment_kind not in {"pants", "clothing"}:
+        """按尺码填写衣长、裤长或脚长；区间值分别写入上下限。"""
+        if garment_kind not in {"pants", "clothing", "footwear"}:
             raise TaobaoListingError(f"不支持的淘宝尺码类型：{garment_kind!r}")
-        field_label = "裤长（cm）" if garment_kind == "pants" else "衣长（cm）"
+        field_label = {"pants": "裤长（cm）", "clothing": "衣长（cm）", "footwear": "脚长（cm）"}[garment_kind]
+        def normalize_chart_size(value):
+            if garment_kind == "footwear":
+                from shoe_size import shoe_size
+                from size_image_recognition import RecognitionError
+                try:
+                    return shoe_size(value)
+                except RecognitionError:
+                    return None
+            return normalize_size_name(value)
         by_size: Dict[str, str] = {}
         for item in lengths:
-            size = normalize_size_name(getattr(item, "size", None))
+            size = normalize_chart_size(getattr(item, "size", None))
             if size is None:
                 raise TaobaoListingError(
                     f"淘宝尺码表识别结果包含无效尺码：{getattr(item, 'size', None)!r}"
                 )
             if size in by_size:
                 raise TaobaoListingError(f"淘宝尺码表识别结果包含重复尺码：{size}")
-            by_size[size] = form_number(getattr(item, "length", None))
+            by_size[size] = form_number(getattr(item, "foot_length" if garment_kind == "footwear" else "length", None))
         if not by_size:
             raise TaobaoListingError("淘宝尺码表识别结果为空")
 
@@ -1839,7 +3840,7 @@ class TaobaoListing:
                     if await cells.count() <= column_index:
                         valid = False
                         break
-                    value = normalize_size_name(
+                    value = normalize_chart_size(
                         await cells.nth(column_index).inner_text()
                     )
                     if value is None:
@@ -1874,7 +3875,7 @@ class TaobaoListing:
                         if await cells.count() <= column_index:
                             valid = False
                             break
-                        value = normalize_size_name(
+                        value = normalize_chart_size(
                             await cells.nth(column_index).inner_text()
                         )
                         if value is None:
@@ -1908,7 +3909,7 @@ class TaobaoListing:
             if fixed_row_sizes:
                 size = fixed_row_sizes[index]
             else:
-                size = normalize_size_name(
+                size = normalize_chart_size(
                     await cells.nth(size_indexes[0]).inner_text()
                 )
             if size is None:
@@ -1923,32 +3924,345 @@ class TaobaoListing:
                 f"淘宝尺码表尺码不一致：缺少 {missing!r}，多出 {extra!r}"
             )
 
+        bounds_by_size = {}
+        if garment_kind == "footwear":
+            for size, expected in by_size.items():
+                match = re.fullmatch(r"(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)", expected)
+                if match:
+                    bounds_by_size[size] = match.groups()
+            if bounds_by_size:
+                first_inputs = next(iter(page_rows.values())).locator(
+                    ":scope > td"
+                ).nth(value_indexes[0]).locator('input:not([readonly]):not([disabled])')
+                if await first_inputs.count() == 1:
+                    toggles = headers.nth(value_indexes[0]).get_by_text("区间", exact=False)
+                    visible = [toggles.nth(i) for i in range(await toggles.count())
+                               if await toggles.nth(i).is_visible()]
+                    if len(visible) != 1:
+                        raise TaobaoListingError(f"淘宝“{field_label}”无法切换区间模式，不能填写脚长上下限")
+                    await visible[0].click(timeout=10_000)
+                    deadline = asyncio.get_running_loop().time() + 3
+                    while await first_inputs.count() != 2 and asyncio.get_running_loop().time() < deadline:
+                        await asyncio.sleep(0.05)
+                # Validate every row before writing either bound.
+                for size, row in page_rows.items():
+                    inputs = row.locator(":scope > td").nth(value_indexes[0]).locator(
+                        'input:not([readonly]):not([disabled])'
+                    )
+                    if await inputs.count() != 2:
+                        raise TaobaoListingError(f"淘宝尺码 {size} 的“{field_label}”区间输入框未就绪")
+                self.logger.info("淘宝尺码表“%s”已确认区间模式，分别填写上下限", field_label)
+
         actual: Dict[str, str] = {}
         for size, row in page_rows.items():
             cells = row.locator(":scope > td")
             inputs = cells.nth(value_indexes[0]).locator(
                 'input:not([readonly]):not([disabled])'
             )
-            if await inputs.count() != 1:
+            expected = by_size[size]
+            parts = bounds_by_size.get(size, (expected, expected)) if bounds_by_size else (expected,)
+            if await inputs.count() != len(parts):
                 raise TaobaoListingError(
                     f"淘宝尺码 {size} 的“{field_label}”输入框不唯一"
                 )
-            control = inputs.first
-            expected = by_size[size]
-            if (await control.input_value()).strip() != expected:
-                await control.fill(expected)
-                await control.press("Tab")
-            value = (await control.input_value()).strip()
-            if value != expected:
+            for input_index, part in enumerate(parts):
+                control = inputs.nth(input_index)
+                if (await control.input_value()).strip() != part:
+                    await control.fill(part)
+                    await control.press("Tab")
+            values = [(await inputs.nth(i).input_value()).strip() for i in range(len(parts))]
+            if tuple(values) != tuple(parts):
                 raise TaobaoListingError(
-                    f"淘宝尺码 {size} 的“{field_label}”回读失败：{value!r}"
+                    f"淘宝尺码 {size} 的“{field_label}”回读失败：期望 {parts!r}，实际 {values!r}"
                 )
-            actual[size] = value
+            actual[size] = expected
+        unresolved_required = await self._review_empty_required_size_cells(
+            table,
+            header_texts,
+            page_rows,
+            size_indexes[0] if size_indexes else None,
+            fixed_row_sizes,
+            recommendations,
+            filled_header=field_label,
+        )
         return {
             "field": field_label,
             "garment_kind": garment_kind,
             "rows": actual,
+            "unresolved_required": unresolved_required,
         }
+
+    @staticmethod
+    def _size_chart_header_name(value: object) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip().lstrip("* ")
+        return re.sub(r"(?:↔\s*)?区间\s*$", "", text).strip()
+
+    @staticmethod
+    def _size_chart_attributes(header: str) -> Tuple[str, ...]:
+        """Map a live size-table header to structured OCR fields.
+
+        This deliberately keys off the rendered header instead of a category
+        name, so new categories can reuse every measurement they actually
+        expose without inheriting a hard-coded pants or outerwear layout.
+        """
+
+        normalized = normalize_label(header)
+        if "身高" in normalized:
+            return ("height_min", "height_max")
+        if "体重" in normalized:
+            return ("weight_min", "weight_max")
+        if "胸围" in normalized:
+            return ("chest",)
+        if "肩宽" in normalized:
+            return ("shoulder",)
+        if "袖长" in normalized:
+            return ("sleeve",)
+        if "衣长" in normalized or "裤长" in normalized:
+            return ("length",)
+        if "腰围" in normalized:
+            return ("waist",)
+        if "臀围" in normalized:
+            return ("hip",)
+        return ()
+
+    @classmethod
+    def _size_chart_suggestion(
+        cls,
+        recommendation: Any,
+        header: str,
+        input_count: int,
+        input_index: int,
+    ) -> str:
+        attributes = cls._size_chart_attributes(header)
+        if not attributes:
+            return ""
+        # Do not collapse a verified range into one guessed representative
+        # value.  It is only a suggestion when the page exposes both bounds.
+        if len(attributes) != input_count or input_index >= len(attributes):
+            return ""
+        value = getattr(recommendation, attributes[input_index], None)
+        return form_number(value) if value is not None else ""
+
+    async def _enable_size_chart_range_inputs(
+        self,
+        table: Any,
+        header_texts: Sequence[str],
+        page_rows: Mapping[str, Any],
+        recommendations: Sequence[Any],
+        *,
+        filled_header: str,
+    ) -> None:
+        """Switch range-backed measurements to the page's interval mode.
+
+        Height and weight images yield two verified bounds.  Taobao initially
+        renders one input and exposes an ``区间`` toggle in the column header;
+        using that live control preserves both image values instead of guessing
+        a midpoint.  If a category does not expose the toggle, the cell remains
+        unresolved and follows the normal batch-review path.
+        """
+
+        if not page_rows or not recommendations:
+            return
+        recommendation_by_size = {
+            normalize_size_name(getattr(item, "size", None)): item
+            for item in recommendations
+            if normalize_size_name(getattr(item, "size", None)) is not None
+        }
+        first_size, first_row = next(iter(page_rows.items()))
+        first_recommendation = recommendation_by_size.get(first_size)
+        if first_recommendation is None:
+            return
+        headers = table.locator(":scope > .el-table__header-wrapper thead th")
+        for column_index, raw_header in enumerate(header_texts):
+            header = self._size_chart_header_name(raw_header)
+            if normalize_label(header) == normalize_label(filled_header):
+                continue
+            attributes = self._size_chart_attributes(header)
+            if len(attributes) != 2 or any(
+                getattr(first_recommendation, attribute, None) is None
+                for attribute in attributes
+            ):
+                continue
+            cells = first_row.locator(":scope > td")
+            if await cells.count() <= column_index:
+                continue
+            inputs = cells.nth(column_index).locator(
+                'input:not([readonly]):not([disabled]):not([type="checkbox"]):not([type="radio"])'
+            )
+            if await inputs.count() == 2:
+                continue
+            if await inputs.count() != 1 or await headers.count() <= column_index:
+                continue
+            toggles = headers.nth(column_index).get_by_text("区间", exact=False)
+            visible_toggles = []
+            for toggle_index in range(await toggles.count()):
+                toggle = toggles.nth(toggle_index)
+                if await toggle.is_visible():
+                    visible_toggles.append(toggle)
+            if len(visible_toggles) != 1:
+                continue
+            await visible_toggles[0].click(timeout=10_000, force=True)
+            deadline = asyncio.get_running_loop().time() + 3
+            while asyncio.get_running_loop().time() < deadline:
+                if await inputs.count() == 2:
+                    break
+                await asyncio.sleep(0.05)
+            if await inputs.count() == 2 and self.logger is not None:
+                self.logger.info("淘宝尺码表“%s”已切换为区间填写", header)
+
+    async def _review_empty_required_size_cells(
+        self,
+        table: Any,
+        header_texts: Sequence[str],
+        page_rows: Mapping[str, Any],
+        size_index: Optional[int],
+        fixed_row_sizes: Sequence[str],
+        recommendations: Sequence[Any],
+        *,
+        filled_header: str,
+    ) -> Tuple[str, ...]:
+        """Collect every still-empty required Taobao size-table cell.
+
+        The page decides which columns exist for the current category.  Values
+        are never invented: structurally verified OCR values are shown only as
+        review candidates, and fields without compatible evidence remain
+        free-form operator inputs.
+        """
+
+        required_columns = [
+            (index, self._size_chart_header_name(text))
+            for index, text in enumerate(header_texts)
+            if str(text).lstrip().startswith("*")
+            and normalize_label(self._size_chart_header_name(text))
+            != normalize_label(filled_header)
+        ]
+        if not required_columns:
+            return ()
+        runtime = getattr(self, 'attribute_runtime', None)
+        if runtime is None or self.attribute_platform_id != "tb":
+            labels = "、".join(label for _index, label in required_columns)
+            raise TaobaoListingError(
+                f"淘宝尺码表必填项为空且未启用 AI 审核：{labels}"
+            )
+        category_id = (
+            self.api_index.active_category_id
+            if isinstance(self.api_index, TaobaoApiJsonIndex)
+            else ""
+        )
+        if not category_id:
+            category_id = normalize_label(await self._category_text()) or "unknown"
+        recommendation_by_size = {
+            normalize_size_name(getattr(item, "size", None)): item
+            for item in recommendations
+            if normalize_size_name(getattr(item, "size", None)) is not None
+        }
+        await self._enable_size_chart_range_inputs(
+            table,
+            header_texts,
+            page_rows,
+            recommendations,
+            filled_header=filled_header,
+        )
+        unresolved: List[str] = []
+        for row_number, (size, row) in enumerate(page_rows.items()):
+            cells = row.locator(":scope > td")
+            for column_index, header in required_columns:
+                if await cells.count() <= column_index:
+                    raise TaobaoListingError(
+                        f"淘宝尺码 {size} 的必填列“{header}”缺少单元格"
+                    )
+                inputs = cells.nth(column_index).locator(
+                    'input:not([readonly]):not([disabled]):not([type="checkbox"]):not([type="radio"])'
+                )
+                input_count = await inputs.count()
+                if not input_count:
+                    raise TaobaoListingError(
+                        f"淘宝尺码 {size} 的必填列“{header}”没有可填写控件"
+                    )
+                for input_index in range(input_count):
+                    control = inputs.nth(input_index)
+                    if (await control.input_value()).strip():
+                        continue
+                    part = (
+                        "下限" if input_count == 2 and input_index == 0
+                        else "上限" if input_count == 2
+                        else ""
+                    )
+                    field_label = f"尺码表 {size} {header}{part}"
+                    suggestion = ""
+                    recommendation = recommendation_by_size.get(size)
+                    if recommendation is not None:
+                        suggestion = self._size_chart_suggestion(
+                            recommendation,
+                            header,
+                            input_count,
+                            input_index,
+                        )
+                    # Structured OCR has already passed size-set, monotonicity,
+                    # positive-number and row/column checks.  This is extracted
+                    # product data, not a guessed reusable rule, so write it
+                    # directly and reserve operator review for missing or
+                    # structurally incompatible evidence.
+                    if suggestion:
+                        await control.fill(suggestion)
+                        await control.press("Tab")
+                        if (await control.input_value()).strip() == suggestion:
+                            continue
+                    candidates = (
+                        (CandidateValue("ocr:0", suggestion),)
+                        if suggestion
+                        else ()
+                    )
+                    field_id = "dom-size-chart:" + canonical_sha256(
+                        {
+                            "size": size,
+                            "header": normalize_label(header),
+                            "part": part,
+                        }
+                    )[:20]
+                    schema_version = canonical_sha256(
+                        {
+                            "platform_id": "tb",
+                            "category_leaf_id": category_id,
+                            "field_id": field_id,
+                            "input_count": input_count,
+                            "suggestion": suggestion,
+                        }
+                    )
+                    resolved = await runtime.resolve(
+                        AttributeRequest(
+                            platform_id="tb",
+                            category_leaf_id=category_id,
+                            field_id=field_id,
+                            field_label=field_label,
+                            candidates=candidates,
+                            excel_value="",
+                            evidence={
+                                "live_dom": True,
+                                "image_ocr": bool(suggestion),
+                            },
+                            custom_allowed=True,
+                            schema_version=schema_version,
+                            control_type="input",
+                        )
+                    )
+                    if resolved is None or getattr(resolved, "is_no_fill", False):
+                        unresolved.append(field_label)
+                        continue
+                    await control.fill(resolved.label)
+                    await control.press("Tab")
+                    actual_value = (await control.input_value()).strip()
+                    if actual_value != resolved.label:
+                        raise TaobaoListingError(
+                            f"淘宝“{field_label}”审核值回填失败：{actual_value!r}"
+                        )
+        if unresolved and self.logger is not None:
+            self.logger.info(
+                "淘宝尺码表 %s 个空白必填单元格已加入本平台待审核汇总，"
+                "继续填写后续项",
+                len(unresolved),
+            )
+        return tuple(unresolved)
 
     async def _form_item(self, label: str) -> Any:
         if self.panel is None:
@@ -2025,10 +4339,12 @@ class TaobaoListing:
         )
         if component_values:
             return tuple(str(value).strip() for value in component_values if str(value).strip())
-        tags = cascader.locator(".el-cascader__tags .el-tag")
+        tags = await cascader.locator(".el-cascader__tags .el-tag").evaluate_all(
+            "nodes => nodes.map(node => (node.innerText || '').trim())"
+        )
         values = []
-        for index in range(await tags.count()):
-            text = re.sub(r"\s+", " ", (await tags.nth(index).inner_text()).strip())
+        for raw in tags:
+            text = re.sub(r"\s+", " ", raw.strip())
             # Element Cascader 的 collapse-tags 会显示“+ 1”，它只是
             # 隐藏的已选数量，不是店铺分类。
             if text and not re.fullmatch(r"\+\s*\d+", text):
@@ -2047,16 +4363,26 @@ class TaobaoListing:
         if not await dropdown.count():
             return []
         nodes = dropdown.locator(".el-cascader-node:visible")
-        result = []
-        for index in range(await nodes.count()):
-            node = nodes.nth(index)
-            label = node.locator(":scope > .el-cascader-node__label")
-            if not await label.count():
-                label = node.locator(".el-cascader-node__label").first
-            text = (await label.inner_text()).strip() if await label.count() else ""
-            if text and "is-disabled" not in (await node.get_attribute("class") or ""):
-                result.append((text, node))
-        return result
+        # A selection can rebuild/hide the cascader while we enumerate it.
+        # Capture text atomically, then resolve by exact label, never by an old
+        # nth index (which used to wait the full 300-second page timeout).
+        labels = await dropdown.evaluate("""root => {
+            const result = [];
+            for (const node of root.querySelectorAll('.el-cascader-node')) {
+                if (!node.isConnected || !node.getClientRects().length
+                    || node.classList.contains('is-disabled')) continue;
+                const style = getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                const label = node.querySelector(':scope > .el-cascader-node__label')
+                    || node.querySelector('.el-cascader-node__label');
+                const text = (label?.innerText || '').trim();
+                if (text && node.isConnected) result.push(text);
+            }
+            return result;
+        }""", timeout=2000)
+        return [(text, nodes.filter(has=self.page.locator(
+            '.el-cascader-node__label', has_text=re.compile(r'^\s*' + re.escape(text) + r'\s*$')
+        ))) for text in labels]
 
     async def fill_store_categories(
         self,
@@ -2141,7 +4467,7 @@ class TaobaoListing:
             # Element Cascader 的多选框可能是零尺寸包装节点，
             # Playwright 的坐标点击会长时间等待“可见”。直接触发
             # 页面已绑定的 click 事件，随后仍以 DOM 标签回读为准。
-            await click_target.evaluate("element => element.click()")
+            await click_target.evaluate("element => element.click()", timeout=2000)
             deadline = asyncio.get_running_loop().time() + 3
             while asyncio.get_running_loop().time() < deadline:
                 actual = await self._read_cascader_values(cascader)
@@ -2413,22 +4739,35 @@ class TaobaoListing:
             raise TaobaoListingError(f"淘宝 SKU 批量设置行不唯一：{len(matches)}")
         return matches[0]
 
-    async def _sku_batch_item(self, row: Any, label: str) -> Any:
+    async def _sku_batch_item(
+        self, row: Any, label: str, *, control: Optional[str] = None
+    ) -> Any:
         items = row.locator(":scope > .sku-batch-item")
         matches = []
         for index in range(await items.count()):
             item = items.nth(index)
             item_label = item.locator(":scope > .sku-batch-item_label")
-            if await item_label.count() and normalize_label(
+            if not await item_label.count() or normalize_label(
                 await item_label.inner_text()
-            ) == normalize_label(label):
+            ) != normalize_label(label):
+                continue
+            if control == "select" and await item.locator(".el-select").count() != 1:
+                continue
+            if control == "text" and await item.locator(".el-select").count() != 0:
+                continue
+            if control not in {None, "select", "text"}:
+                raise TaobaoListingError(f"淘宝 SKU 批量字段控件类型无效：{control}")
+            if await item_label.count():
                 matches.append(item)
         if len(matches) != 1:
             raise TaobaoListingError(f"淘宝 SKU 批量字段“{label}”不唯一：{len(matches)}")
         return matches[0]
 
     async def _fill_batch_text(self, row: Any, label: str, expected: str) -> str:
-        item = await self._sku_batch_item(row, label)
+        expected = sku_batch_excel_value(
+            label, expected, category_hints=self.category_hints
+        )
+        item = await self._sku_batch_item(row, label, control="text")
         inputs = item.locator("input.el-input__inner:not([readonly])")
         if await inputs.count() != 1:
             raise TaobaoListingError(f"淘宝 SKU 批量字段“{label}”输入框不唯一")
@@ -2448,27 +4787,320 @@ class TaobaoListing:
         row: Any,
         label: str,
         candidates: Sequence[str],
-    ) -> str:
-        item = await self._sku_batch_item(row, label)
+    ) -> Optional[str]:
+        # 同一页面可能同时有一个左侧下拉框和一个右侧文本框，
+        # 两者标签都叫“裤型”。按控件类型定位，避免把右侧同名输入误报为重复。
+        item = await self._sku_batch_item(row, label, control="select")
         selects = item.locator(".el-select")
         if await selects.count() != 1:
             raise TaobaoListingError(f"淘宝 SKU 批量字段“{label}”下拉框不唯一")
-        actual = await self._select_values(
-            selects.first,
-            (tuple(candidates),),
-            label=f"SKU批量{label}",
-            multi=False,
+        expected_groups: Tuple[Tuple[str, ...], ...] = (tuple(candidates),)
+        # 学习运行器对同一字段只会记录一次待审核结论，这里记住它是否已经
+        # 挂起，避免无候选时重复提交同一字段。
+        already_deferred = False
+        if self.attribute_runtime is not None:
+            try:
+                resolved_values = await self._resolve_learning_select_groups(
+                    label,
+                    selects.first,
+                    expected_groups,
+                )
+                if resolved_values == ():
+                    already_deferred = True
+                    if self.logger is not None:
+                        self.logger.info(
+                            "%s SKU 批量字段“%s”已加入本平台待审核汇总，"
+                            "继续填写后续字段",
+                            self._platform_display_name,
+                            label,
+                        )
+                elif resolved_values is not None:
+                    expected_groups = tuple((value,) for value in resolved_values)
+            except TaobaoListingError as exc:
+                if "接口候选字段匹配数为 0" not in str(exc):
+                    raise
+                if self.logger is not None:
+                    self.logger.info(
+                        "%s SKU 属性“%s”未出现在类目接口 JSON，"
+                        "改用当前下拉唯一精确候选并回读",
+                        self._platform_display_name,
+                        label,
+                    )
+        actual = (
+            None
+            if already_deferred
+            else await self._select_values(
+                selects.first,
+                expected_groups,
+                label=f"SKU批量{label}",
+                multi=False,
+            )
         )
-        if actual is None:
-            # 保留失败字段的候选列表，便于自动错误截图直接呈现现场。
+        if actual is not None:
+            return actual[0]
+        if self.attribute_runtime is None:
+            # 没有审核运行器时保留现场候选，便于自动错误截图直接呈现现场。
             try:
                 await self._open_select(selects.first, multi=False)
                 await self._visible_dom_options(selects.first, timeout_seconds=2)
             except Exception:
                 pass
             raise TaobaoListingError(
-                f"淘宝 SKU 批量字段“{label}”没有可用候选："
-                f"{'/'.join(candidates)}"
+                f"{self._platform_display_name} SKU 批量字段“{label}”"
+                f"没有可用候选：{'/'.join(candidates)}"
+            )
+        if not already_deferred:
+            # 下拉里没有可用的平台候选。把现场候选挂起，交给平台边界统一
+            # 提交审核，并继续填写后续字段。
+            await self._suspend_batch_select_for_review(
+                selects.first,
+                label,
+                candidates,
+            )
+        return None
+
+    async def _suspend_batch_select_for_review(
+        self,
+        select: Any,
+        label: str,
+        candidates: Sequence[str],
+    ) -> None:
+        """把没有平台候选的 SKU 批量下拉挂起到待审核汇总。
+
+        类目接口 JSON 里查不到该字段时退回当前下拉选项，避免因为接口缺失
+        而跳过审核。
+        """
+
+        runtime = self.attribute_runtime
+        if runtime is None:
+            return
+        try:
+            multi = await select_supports_multiple(select)
+            await self._open_select(select, multi=multi)
+            _dropdown, dom_options = await self._visible_dom_options(select)
+        except Exception:
+            _dropdown, dom_options = (), ()
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        options = tuple(
+            CandidateValue(
+                str(option.get("value") or option.get("name") or "").strip(),
+                str(option.get("name") or option.get("value") or "").strip(),
+            )
+            for option in dom_options
+            if not bool(option.get("disabled"))
+            and str(option.get("value") or option.get("name") or "").strip()
+            and str(option.get("name") or option.get("value") or "").strip()
+        )
+        # SKU 批量控件不一定出现在类目属性 JSON 的字段列表里，但审核
+        # 事件仍必须带非空且稳定的身份。优先使用接口/DOM 的真实 ID，
+        # 缺失时使用稳定合成 ID，不能再把空字符串发给审核服务。
+        category_id = ""
+        api_index = getattr(self, "api_index", None)
+        category_reader = getattr(api_index, "category_leaf_ids", None)
+        if callable(category_reader):
+            category_ids = tuple(
+                dict.fromkeys(
+                    str(value).strip() for value in category_reader() if str(value).strip()
+                )
+            )
+            if len(category_ids) == 1:
+                category_id = category_ids[0]
+        if not category_id:
+            category_id = f"{self.attribute_platform_id}-sku-batch-category"
+
+        field_id = ""
+        dom_source_reader = getattr(self, "_dom_select_source_id", None)
+        if callable(dom_source_reader):
+            field_id = await dom_source_reader(select)
+        if not field_id:
+            source_reader = getattr(api_index, "source_ids", None)
+            if callable(source_reader):
+                source_ids = tuple(
+                    dict.fromkeys(
+                        str(value).strip() for value in source_reader(label)
+                        if str(value).strip()
+                    )
+                )
+                if len(source_ids) == 1:
+                    field_id = source_ids[0]
+        if not field_id:
+            field_id = "sku-batch-" + canonical_sha256(
+                {"platform": self.attribute_platform_id, "label": normalize_label(label)}
+            )[:20]
+        # 某些天猫接口把 SKU 批量字段挂在普通属性描述下；按 DOM
+        # 字段 ID/去掉“SKU批量”前缀的标签反查其真实类目 ID。
+        fields_reader = getattr(api_index, "fields_for_label", None)
+        if callable(fields_reader):
+            base_label = re.sub(r"^SKU批量", "", str(label)).strip()
+            related = []
+            for lookup in (label, base_label):
+                for field in fields_reader(lookup):
+                    source = str(getattr(field, "source_id", "") or "").strip()
+                    category = str(getattr(field, "category_leaf_id", "") or "").strip()
+                    if category and (source == field_id or lookup == base_label):
+                        related.append(category)
+            related_ids = tuple(dict.fromkeys(related))
+            if len(related_ids) == 1:
+                category_id = related_ids[0]
+        await runtime.resolve(
+            AttributeRequest(
+                platform_id=self.attribute_platform_id,
+                category_leaf_id=category_id,
+                field_id=field_id,
+                field_label=label,
+                candidates=options,
+                excel_value="/".join(candidates),
+                evidence={"excel": True, "dom": bool(options)},
+                custom_allowed=False,
+                schema_version="sku_batch_dom_v1",
+                control_type="select",
+            )
+        )
+        if self.logger is not None:
+            self.logger.info(
+                "%s SKU 批量字段“%s”没有平台候选，且该下拉不支持自定义值；"
+                "已提交审核并继续填写后续字段（类目=%s，字段=%s）",
+                self._platform_display_name,
+                label,
+                category_id,
+                field_id,
+            )
+
+    async def _resolve_unprovided_batch_select(
+        self,
+        row: Any,
+        label: str,
+    ) -> Optional[str]:
+        """Resolve a visible SKU selector that has no matching Excel field.
+
+        SKU batch controls differ by category.  Missing outerwear fields must
+        therefore be learned/reviewed from the live control instead of being
+        rejected by a pants-specific required-field list.
+        """
+
+        item = await self._sku_batch_item(row, label)
+        selects = item.locator(".el-select")
+        if await selects.count() != 1:
+            raise TaobaoListingError(f"淘宝 SKU 批量字段“{label}”下拉框不唯一")
+        select = selects.first
+        current = tuple(
+            value for value in await self._read_select_values(select, multi=False)
+            if value.strip()
+        )
+        if current:
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝 SKU 批量字段“%s”无 Excel 字段，"
+                    "保留页面已回显值 %s",
+                    label,
+                    current[0],
+                )
+            return current[0]
+
+        runtime = self.attribute_runtime
+        if runtime is None or self.attribute_platform_id != "tb":
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝 SKU 批量字段“%s”无 Excel 值，"
+                    "当前未启用 AI 审核，保持空值",
+                    label,
+                )
+            return ""
+
+        await self._open_select(select, multi=False)
+        try:
+            _dropdown, dom_options = await self._visible_dom_options(
+                select, timeout_seconds=2
+            )
+            if isinstance(self.api_index, TaobaoApiJsonIndex):
+                await self.api_index.settle(timeout_seconds=0.25)
+                api_fields = self.api_index.candidate_fields(label)
+            else:
+                api_fields = ()
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+
+        custom_allowed = (
+            (await select.get_attribute("caninputcustom") or "").casefold()
+            == "true"
+        )
+        if len(api_fields) == 1:
+            field = api_fields[0]
+            category_id = str(field.category_leaf_id or "").strip()
+            field_id = str(field.source_id or "").strip()
+            candidates = tuple(
+                CandidateValue(value.value_id.strip(), value.label.strip())
+                for value in field.option_values
+                if value.value_id.strip() and value.label.strip()
+            )
+        else:
+            category_id = (
+                self.api_index.active_category_id
+                if isinstance(self.api_index, TaobaoApiJsonIndex)
+                else ""
+            )
+            if not category_id:
+                category_id = normalize_label(await self._category_text()) or "unknown"
+            field_id = "dom-sku:" + normalize_label(label)
+            candidates = tuple(
+                CandidateValue(f"dom:{index}", name)
+                for index, option in enumerate(dom_options)
+                if (name := str(option.get("name") or "").strip())
+            )
+        if not candidates:
+            raise TaobaoListingError(
+                f"淘宝 SKU 批量字段“{label}”无 Excel 值，页面也无可审核候选"
+            )
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "tb",
+                "category_leaf_id": category_id,
+                "field_id": field_id,
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved = await runtime.resolve(
+            AttributeRequest(
+                platform_id="tb",
+                category_leaf_id=category_id,
+                field_id=field_id,
+                field_label=label,
+                candidates=candidates,
+                excel_value="",
+                evidence={"live_dom": True},
+                custom_allowed=custom_allowed,
+                schema_version=schema_version,
+                control_type="select",
+            )
+        )
+        if resolved is None or getattr(resolved, "is_no_fill", False):
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝 SKU 批量字段“%s”已加入本平台待审核汇总，"
+                    "继续检查后续字段",
+                    label,
+                )
+            return None
+        actual = await self._select_values(
+            select,
+            ((resolved.label,),),
+            label=f"SKU批量{label}",
+            multi=False,
+        )
+        if actual is None:
+            raise TaobaoListingError(
+                f"淘宝 SKU 批量字段“{label}”审核值无法回填："
+                f"{resolved.label}"
             )
         return actual[0]
 
@@ -2494,18 +5126,69 @@ class TaobaoListing:
         )
 
     @staticmethod
-    def _sku_column_index(headers: Sequence[str], label: str) -> int:
+    def _sku_column_index(
+        headers: Sequence[str], label: str, *, prefer_last_duplicate: bool = False
+    ) -> int:
         wanted = normalize_label(label)
         matches = [
             index
             for index, header in enumerate(headers)
             if normalize_label(header) == wanted or normalize_label(header).startswith(wanted)
         ]
+        if (
+            prefer_last_duplicate
+            and normalize_label(label) == normalize_label("裤型")
+            and len(matches) > 1
+        ):
+            # 部分类目把同名字段同时输出为普通展示列和下拉字段列。
+            # 批量区已经优先选择下拉框，表格对应列通常是同名列中的最后一列；
+            # 使用该列完成回读，避免把展示列误判成重复字段。
+            return matches[-1]
         if len(matches) != 1:
             raise TaobaoListingError(
                 f"淘宝 SKU 表格列“{label}”不是唯一项：{matches}"
             )
         return matches[0]
+
+    @classmethod
+    def _sku_column_index_for_snapshot(
+        cls,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        label: str,
+        expected: str,
+    ) -> int:
+        """Choose a duplicate pants column from the values actually rendered.
+
+        淘宝裤装 SKU 表格会同时输出同名的展示列和下拉列。列顺序并不
+        固定，单纯取最后一列会在某些类目读到空的兼容列。
+        """
+        wanted = normalize_label(label)
+        matches = [
+            index
+            for index, header in enumerate(headers)
+            if normalize_label(header) == wanted
+            or normalize_label(header).startswith(wanted)
+        ]
+        if wanted != normalize_label("裤型") or len(matches) <= 1:
+            return cls._sku_column_index(headers, label, prefer_last_duplicate=True)
+
+        expected_value = normalize_option(expected)
+        scores = []
+        for index in matches:
+            score = sum(
+                1
+                for row in rows
+                if index < len(row)
+                and normalize_option(row[index]) == expected_value
+            )
+            scores.append((score, index))
+        best_score = max(score for score, _index in scores)
+        if best_score > 0:
+            best = [index for score, index in scores if score == best_score]
+            return best[0]
+        # 保持原有错误路径，确保所有候选都为空时仍能报告真实回读失败。
+        return matches[-1]
 
     @staticmethod
     def _numeric_equal(actual: str, expected: str) -> bool:
@@ -2524,7 +5207,14 @@ class TaobaoListing:
         if not raw_rows:
             raise TaobaoListingError("淘宝 SKU 表格没有可校验的明细行")
         indices = {
-            label: self._sku_column_index(headers, label) for label in expected
+            label: (
+                self._sku_column_index_for_snapshot(
+                    headers, raw_rows, label, expected[label]
+                )
+                if normalize_label(label) == normalize_label("裤型")
+                else self._sku_column_index(headers, label)
+            )
+            for label in expected
         }
         result = []
         errors = []
@@ -2552,23 +5242,11 @@ class TaobaoListing:
             fields,
             ("价格", "京东价", "市场价", "售卖价", "售价", "吊牌价", "基本售价"),
             "SKU 价格",
+            money=True,
         )
         quantity = _required_excel_value(fields, ("数量",), "SKU 数量")
-        if not re.fullmatch(r"\d+(?:\.\d+)?", price):
-            raise TaobaoListingError(f"Excel SKU 价格不是有效数字：{price!r}")
         if not quantity.isdigit():
             raise TaobaoListingError(f"Excel SKU 数量不是整数：{quantity!r}")
-        fleece_source = _required_excel_value(fields, ("是否加绒",), "SKU 是否加绒")
-        # 严格使用 Excel 原值；不把“否”改写成“不加绒”，也不补充程序候选。
-        # Excel 自身用斜杠给出的 OR 值仍按原顺序逐个匹配。
-        fleece_candidates = list(
-            single_selection_candidates("是否加绒", fleece_source)
-        )
-        if not fleece_candidates:
-            raise TaobaoListingError(f"Excel SKU 是否加绒值无法识别：{fleece_source!r}")
-        sku_category = _required_excel_value(fields, ("SKU分类",), "SKU 分类")
-        body_type = _required_excel_value(fields, ("适用体型",), "SKU 适用体型")
-
         product_details = await self._wrap_item("商品明细")
         row = await self._sku_batch_row(product_details)
         before = await self._sku_table_snapshot(product_details)
@@ -2579,48 +5257,87 @@ class TaobaoListing:
 
         await self._fill_batch_text(row, "价格", price)
         await self._fill_batch_text(row, "数量", quantity)
-        actual_fleece = await self._fill_batch_select(
-            row, "是否加绒", tuple(fleece_candidates)
-        )
-        actual_sku_category = await self._fill_batch_select(
-            row, "SKU分类", single_selection_candidates("SKU分类", sku_category)
-        )
-        actual_body_type = await self._fill_batch_select(
-            row, "适用体型", single_selection_candidates("适用体型", body_type)
-        )
         dynamic_values: Dict[str, str] = {}
+        deferred_fields: List[str] = []
         batch_items = row.locator(":scope > .sku-batch-item")
-        fixed_labels = {"价格", "数量", "平台规格编码", "是否加绒", "SKU分类", "适用体型"}
+        fixed_labels = {normalize_label(value) for value in ("价格", "数量", "平台规格编码")}
+        # 淘宝裤装类目会把“裤型”渲染两次：一个是真正的下拉框，
+        # 另一个是兼容残留的普通输入框。该兼容规则只针对裤型，
+        # 其他同名字段继续严格报错，避免误选。
+        select_labels = set()
+        for item_index in range(await batch_items.count()):
+            candidate = batch_items.nth(item_index)
+            label_node = candidate.locator(":scope > .sku-batch-item_label")
+            if not await label_node.count():
+                continue
+            candidate_label = (await label_node.inner_text()).strip().rstrip("：:").strip()
+            if (
+                normalize_label(candidate_label) == normalize_label("裤型")
+                and await candidate.locator(".el-select").count() == 1
+            ):
+                select_labels.add(normalize_label(candidate_label))
         for item_index in range(await batch_items.count()):
             item = batch_items.nth(item_index)
             label_node = item.locator(":scope > .sku-batch-item_label")
             if not await label_node.count():
                 continue
             label = (await label_node.inner_text()).strip().rstrip("：:").strip()
-            if not label or label in fixed_labels:
+            if not label or normalize_label(label) in fixed_labels:
                 continue
             source = _single_source(fields, (label,), f"SKU {label}")
-            if source is None:
+            select_count = await item.locator(".el-select").count()
+            if select_count == 0:
+                if normalize_label(label) in select_labels:
+                    if self.logger is not None:
+                        self.logger.info(
+                            "%s SKU 批量字段“%s”存在下拉控件，跳过同名文本框",
+                            self._platform_display_name,
+                            label,
+                        )
+                    continue
+                if source is not None:
+                    _source_key, source_value = source
+                    dynamic_values[label] = await self._fill_batch_text(
+                        row, label, source_value
+                    )
                 continue
-            _source_key, source_value = source
-            if await item.locator(".el-select").count() != 1:
+            if select_count != 1:
                 raise TaobaoListingError(
                     f"淘宝 SKU 动态字段“{label}”不是唯一的下拉框"
                 )
-            dynamic_values[label] = await self._fill_batch_select(
-                row,
-                label,
-                single_selection_candidates(label, source_value),
-            )
+            if source is None:
+                dynamic_value = await self._resolve_unprovided_batch_select(
+                    row, label
+                )
+            else:
+                _source_key, source_value = source
+                dynamic_value = await self._fill_batch_select(
+                    row,
+                    label,
+                    single_selection_candidates(label, source_value),
+                )
+            if dynamic_value is None:
+                deferred_fields.append(label)
+            else:
+                dynamic_values[label] = dynamic_value
+        if deferred_fields:
+            return {
+                "batch_clicked": False,
+                "deferred_fields": tuple(dict.fromkeys(deferred_fields)),
+                "values": {
+                    "价格": price,
+                    "数量": quantity,
+                    **dynamic_values,
+                },
+                "platform_codes_preserved": True,
+                "platform_codes": platform_codes_before,
+            }
         button = row.get_by_role("button", name="批量设置", exact=True)
         await button.click()
 
         expected = {
             "价格": price,
             "数量": quantity,
-            "是否加绒": actual_fleece,
-            "SKU分类": actual_sku_category,
-            "适用体型": actual_body_type,
             **dynamic_values,
         }
         deadline = asyncio.get_running_loop().time() + 8
@@ -2680,12 +5397,12 @@ class TaobaoListing:
         return actual
 
     async def fill_sales_fields(self, fields: Mapping[str, str]) -> Mapping[str, str]:
-        price = _required_excel_value(fields, ("一口价",), "一口价")
+        price = _required_excel_value(
+            fields, ("一口价",), "一口价", money=True
+        )
         outer_id = _required_excel_value(
             fields, ("商家编码", "货号", "商家外部编码"), "商家编码"
         )
-        if not re.fullmatch(r"\d+(?:\.\d+)?", price):
-            raise TaobaoListingError(f"Excel 一口价不是有效数字：{price!r}")
         return {
             "一口价": await self._fill_named_input("price", "一口价", price),
             "商家编码": await self._fill_named_input(
@@ -2727,6 +5444,89 @@ class TaobaoListing:
                 f"淘宝“{form_label}”选项“{option_text}”勾选失败"
             )
         return option_text
+
+    async def _resolve_unprovided_radio(self, form_label: str) -> Optional[str]:
+        """Preserve a checked radio or defer one live candidate set for review."""
+
+        form_item = await self._form_item(form_label)
+        options = form_item.locator("label.el-radio")
+        candidate_labels: List[str] = []
+        checked_labels: List[str] = []
+        for index in range(await options.count()):
+            option = options.nth(index)
+            if not await option.is_visible():
+                continue
+            label_node = option.locator(".el-radio__label").first
+            if not await label_node.count():
+                continue
+            label = (await label_node.inner_text()).strip()
+            if not label:
+                continue
+            candidate_labels.append(label)
+            radio = option.locator("input[type=radio]").first
+            if await radio.count() and await radio.is_checked():
+                checked_labels.append(label)
+        if len(checked_labels) == 1:
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝“%s”无 Excel 字段，保留页面已回显值 %s",
+                    form_label,
+                    checked_labels[0],
+                )
+            return checked_labels[0]
+        if not candidate_labels:
+            raise TaobaoListingError(f"淘宝“{form_label}”没有可审核的选项")
+        runtime = self.attribute_runtime
+        if runtime is None or self.attribute_platform_id != "tb":
+            raise TaobaoListingError(
+                f"淘宝“{form_label}”无 Excel 值，且未启用 AI 审核"
+            )
+        category_id = (
+            self.api_index.active_category_id
+            if isinstance(self.api_index, TaobaoApiJsonIndex)
+            else ""
+        )
+        if not category_id:
+            category_id = normalize_label(await self._category_text()) or "unknown"
+        field_id = "dom-radio:" + normalize_label(form_label)
+        candidates = tuple(
+            CandidateValue(f"dom:{index}", label)
+            for index, label in enumerate(dict.fromkeys(candidate_labels))
+        )
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "tb",
+                "category_leaf_id": category_id,
+                "field_id": field_id,
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved = await runtime.resolve(
+            AttributeRequest(
+                platform_id="tb",
+                category_leaf_id=category_id,
+                field_id=field_id,
+                field_label=form_label,
+                candidates=candidates,
+                excel_value="",
+                evidence={"live_dom": True},
+                custom_allowed=False,
+                schema_version=schema_version,
+                control_type="radio",
+            )
+        )
+        if resolved is None or getattr(resolved, "is_no_fill", False):
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝“%s”已加入本平台待审核汇总，"
+                    "继续填写后续项",
+                    form_label,
+                )
+            return None
+        return await self._ensure_radio(form_label, resolved.label)
 
     async def _ensure_checkbox(self, form_label: str, option_text: str) -> bool:
         form_item = await self._form_item(form_label)
@@ -2803,34 +5603,9 @@ class TaobaoListing:
         )
 
     async def apply_payment_and_service(self, fields: Mapping[str, str]) -> Mapping[str, Any]:
-        stock_source = _required_excel_value(
-            fields, ("拍下减库存", "库存扣减方式"), "库存扣减方式"
-        )
-        stock_options = []
-        for candidate in single_selection_candidates("库存扣减方式", stock_source):
-            normalized = normalize_option(candidate)
-            if normalized in {
-                normalize_option(value) for value in ("否", "付款减库存", "0")
-            }:
-                stock_options.append("付款减库存")
-            elif normalized in {
-                normalize_option(value) for value in ("是", "拍下减库存", "1")
-            }:
-                stock_options.append("拍下减库存")
-        stock_options = list(dict.fromkeys(stock_options))
-        if not stock_options:
-            raise TaobaoListingError(f"Excel 库存扣减方式无法识别：{stock_source!r}")
-        # 用户要求按页面顺序操作：库存扣减 -> 保修服务 -> 七天退货承诺。
-        stock = ""
-        last_error: Optional[Exception] = None
-        for stock_option in stock_options:
-            try:
-                stock = await self._ensure_radio("库存扣减方式", stock_option)
-                break
-            except TaobaoListingError as exc:
-                last_error = exc
-        if not stock:
-            raise TaobaoListingError(str(last_error or "库存扣减方式无可用候选"))
+        # 淘宝库存扣减方式是运营固定配置，不读取 Excel，也不提交 AI
+        # 审核。页面没有默认值时直接勾选“付款减库存”。
+        stock = await self._ensure_radio("库存扣减方式", "付款减库存")
         warranty = await self._ensure_checkbox("售后服务", "保修服务")
         seven_day_return = await self._ensure_checkbox_contains(
             "售后服务", "七天退货"
@@ -2846,7 +5621,7 @@ class TaobaoListing:
         fields: Mapping[str, str],
         *,
         shop_name: str = "钊叔制",
-    ) -> str:
+    ) -> Optional[str]:
         freight = _required_excel_value(
             fields, ("运费设置", "运费模板"), "运费模板"
         )
@@ -2871,24 +5646,128 @@ class TaobaoListing:
             multi=False,
         )
         if actual is None:
+            resolved = await self._resolve_unmatched_freight_select(
+                selects.first,
+                shop_name=shop_name,
+                excel_value=freight,
+            )
+            return resolved
+        return actual[0]
+
+    async def _resolve_unmatched_freight_select(
+        self,
+        select: Any,
+        *,
+        shop_name: str,
+        excel_value: str,
+    ) -> Optional[str]:
+        """Collect a live freight mismatch for the platform review batch."""
+
+        runtime = self.attribute_runtime
+        if runtime is None or self.attribute_platform_id != "tb":
             raise TaobaoListingError(
-                f"店铺“{shop_name}”没有 Excel 运费模板的精确候选：{freight}"
+                f"店铺“{shop_name}”没有 Excel 运费模板的精确候选："
+                f"{excel_value}"
+            )
+        await self._open_select(select, multi=False)
+        try:
+            _dropdown, dom_options = await self._visible_dom_options(
+                select, timeout_seconds=2
+            )
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        option_labels = tuple(
+            dict.fromkeys(
+                str(option.get("name") or "").strip()
+                for option in dom_options
+                if str(option.get("name") or "").strip()
+            )
+        )
+        if not option_labels:
+            raise TaobaoListingError(
+                f"店铺“{shop_name}”的运费模板无可审核候选"
+            )
+        category_id = (
+            self.api_index.active_category_id
+            if isinstance(self.api_index, TaobaoApiJsonIndex)
+            else ""
+        )
+        if not category_id:
+            category_id = normalize_label(await self._category_text()) or "unknown"
+        field_id = "dom-freight:" + canonical_sha256(shop_name)[:16]
+        candidates = tuple(
+            CandidateValue(f"dom:{index}", label)
+            for index, label in enumerate(option_labels)
+        )
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "tb",
+                "category_leaf_id": category_id,
+                "field_id": field_id,
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved = await runtime.resolve(
+            AttributeRequest(
+                platform_id="tb",
+                category_leaf_id=category_id,
+                field_id=field_id,
+                field_label="运费模板",
+                candidates=candidates,
+                excel_value=excel_value,
+                evidence={"excel": True, "live_dom": True},
+                custom_allowed=False,
+                schema_version=schema_version,
+                control_type="select",
+            )
+        )
+        if resolved is None or getattr(resolved, "is_no_fill", False):
+            if self.logger is not None:
+                self.logger.info(
+                    "淘宝店铺“%s”运费模板已加入本平台"
+                    "待审核汇总，继续检查后续项",
+                    shop_name,
+                )
+            return None
+        actual = await self._select_values(
+            select,
+            ((resolved.label,),),
+            label=f"{shop_name}运费模板审核回填",
+            multi=False,
+        )
+        if actual is None:
+            raise TaobaoListingError(
+                f"店铺“{shop_name}”运费模板审核值无法回填："
+                f"{resolved.label}"
             )
         return actual[0]
 
     async def _visible_validation_errors(self) -> Tuple[str, ...]:
         if self.panel is None:
             return ()
-        errors = self.panel.locator(".el-form-item__error:visible")
-        result = []
-        for index in range(await errors.count()):
-            error = errors.nth(index)
-            form_item = error.locator("xpath=ancestor::*[contains(@class, 'el-form-item')][1]")
-            label = form_item.locator(":scope > .el-form-item__label")
-            label_text = (await label.inner_text()).strip() if await label.count() else "未命名字段"
-            error_text = (await error.inner_text()).strip()
-            result.append(f"{label_text}：{error_text}")
-        return tuple(dict.fromkeys(result))
+        # Validation nodes disappear asynchronously after uploads/field edits.
+        # Capture labels and messages in one read, never wait for an old nth
+        # locator to become visible again (the global timeout can be 5 minutes).
+        return tuple(await self.panel.evaluate("""root => {
+          const result = [];
+          for (const error of root.querySelectorAll('.el-form-item__error')) {
+            const style = getComputedStyle(error);
+            if (!error.isConnected || !error.getClientRects().length
+                || style.display === 'none' || style.visibility === 'hidden') continue;
+            const item = error.closest('.el-form-item');
+            const label = item?.querySelector(':scope > .el-form-item__label');
+            const labelText = label ? label.innerText.trim() : '未命名字段';
+            const message = error.innerText.trim();
+            if (message) result.push(labelText + '：' + message);
+          }
+          return [...new Set(result)];
+        }"""))
 
     async def _revalidate_form_property(self, property_name: str) -> Mapping[str, Any]:
         """用 Element Form 自身规则重新校验，不直接隐藏错误。"""
@@ -3079,6 +5958,7 @@ class TaobaoListing:
         *,
         size_lengths: Sequence[Any] = (),
         garment_kind: Optional[str] = None,
+        size_recommendations: Sequence[Any] = (),
     ) -> Mapping[str, Any]:
         """按用户指定顺序填写淘宝后半段基础资料。"""
         source_fields = fields.fields
@@ -3098,11 +5978,15 @@ class TaobaoListing:
             if self.logger is not None:
                 self.logger.info(
                     "正在按尺码填写淘宝尺码表：%s",
-                    "裤长" if garment_kind == "pants" else "衣长",
+                    {"pants": "裤长", "clothing": "衣长", "footwear": "脚长"}[garment_kind],
                 )
             size_chart = {
                 "filled": True,
-                **await self.fill_size_chart_lengths(size_lengths, garment_kind),
+                **await self.fill_size_chart_lengths(
+                    size_lengths,
+                    garment_kind,
+                    recommendations=size_recommendations,
+                ),
             }
         if self.logger is not None:
             self.logger.info("正在填写淘宝一口价和商家编码")
@@ -3110,25 +5994,29 @@ class TaobaoListing:
         if self.logger is not None:
             self.logger.info("正在按顺序勾选淘宝库存扣减和保修服务")
         payment_service = await self.apply_payment_and_service(source_fields)
-        listing_source = _required_excel_value(
+        listing_match = _single_source(
             source_fields, ("商品状态", "上架时间"), "上架时间"
         )
-        listing_aliases = {
-            normalize_option("立即上架"): "立刻上架",
-            normalize_option("立刻上架"): "立刻上架",
-            normalize_option("放入仓库"): "放入仓库",
-        }
-        listing_options = tuple(
-            dict.fromkeys(
-                listing_aliases[normalize_option(candidate)]
-                for candidate in single_selection_candidates("上架时间", listing_source)
-                if normalize_option(candidate) in listing_aliases
+        if listing_match is None:
+            listing = await self._resolve_unprovided_radio("上架时间")
+        else:
+            _listing_key, listing_source = listing_match
+            listing_aliases = {
+                normalize_option("立即上架"): "立刻上架",
+                normalize_option("立刻上架"): "立刻上架",
+                normalize_option("放入仓库"): "放入仓库",
+            }
+            listing_options = tuple(
+                dict.fromkeys(
+                    listing_aliases[normalize_option(candidate)]
+                    for candidate in single_selection_candidates("上架时间", listing_source)
+                    if normalize_option(candidate) in listing_aliases
+                )
             )
-        )
-        listing_option = listing_options[0] if listing_options else None
-        if listing_option is None:
-            raise TaobaoListingError(f"Excel 上架时间无法识别：{listing_source!r}")
-        listing = await self._ensure_radio("上架时间", listing_option)
+            listing_option = listing_options[0] if listing_options else None
+            if listing_option is None:
+                raise TaobaoListingError(f"Excel 上架时间无法识别：{listing_source!r}")
+            listing = await self._ensure_radio("上架时间", listing_option)
         freight = await self.fill_freight_template(source_fields)
         specification_validation = await self._revalidate_specifications()
         duplicate_color_unchecked = (

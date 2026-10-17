@@ -1,7 +1,12 @@
+import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+from attribute_runtime import ResolvedAttribute
 from pdd_data import PddFields
-from pdd_form_listing import PddFormListing
+from pdd_form_listing import PddFormListing, PddFormListingError
+from pdd_listing import parse_pdd_attribute_fields
 
 
 class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
@@ -18,12 +23,40 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.playwright.stop()
 
-    async def _listing(self):
+    async def _listing(self, attribute_runtime=None):
+        await self.page.route(
+            "**/pdd/getCategoryProperties.json*",
+            lambda route: route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "data": {
+                            "goodsPropertiesRule": {
+                                "properties": [
+                                    {
+                                        "refPid": "fit",
+                                        "name": "版型",
+                                        "required": True,
+                                        "propertyValueType": "select",
+                                        "values": [
+                                            {"vid": "slim", "value": "修身"},
+                                            {"vid": "loose", "value": "宽松"},
+                                        ],
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
         await self.page.set_content(
             """
             <button role="tab" aria-selected="false" onclick="
               this.setAttribute('aria-selected', 'true');
-              document.querySelector('[role=tabpanel]').style.display='block';">
+              document.querySelector('[role=tabpanel]').style.display='block';
+              fetch('https://scm.superboss.cc/pdd/getCategoryProperties.json?leafCategoryId=7307');">
               拼多多资料
             </button>
             <div role="tabpanel" aria-label="拼多多资料" style="display:none">
@@ -96,9 +129,225 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
             </script>
             """
         )
-        listing = PddFormListing(self.page, self.page.locator("body"), None)
+        listing = PddFormListing(
+            self.page,
+            self.page.locator("body"),
+            None,
+            attribute_runtime=attribute_runtime,
+        )
         await listing.open()
         return listing
+
+    async def test_parser_keeps_strict_pdd_field_and_option_ids(self):
+        fields = parse_pdd_attribute_fields(
+            {
+                "result": True,
+                "data": json.dumps(
+                    {
+                        "goodsPropertiesRule": {
+                            "properties": [
+                                {
+                                    "refPid": "fit",
+                                    "name": "版型",
+                                    "values": [
+                                        {"vid": "loose", "value": "宽松"}
+                                    ],
+                                }
+                            ]
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].source_id, "fit")
+        self.assertEqual(fields[0].option_values[0].value_id, "loose")
+        self.assertEqual(fields[0].option_values[0].label, "宽松")
+
+    async def test_learning_uses_pdd_api_ids_and_dom_cross_check(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-pdd-1",
+                )
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+
+        report = await listing.fill_category_attributes(
+            PddFields(fields={"版型": "宽松"})
+        )
+
+        self.assertEqual(report["attributes"]["版型"], ("宽松",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "pdd")
+        self.assertEqual(request.category_leaf_id, "7307")
+        self.assertEqual(request.field_id, "fit")
+        self.assertEqual(
+            tuple((value.value_id, value.label) for value in request.candidates),
+            (("slim", "修身"), ("loose", "宽松")),
+        )
+
+    async def test_existing_multi_select_value_learns_without_dropdown_open(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-pdd-existing",
+                )
+
+        runtime = Runtime()
+        listing = await self._listing(runtime)
+        async def fail_open(*_args, **_kwargs):
+            raise AssertionError("当前值已匹配时不应再打开候选下拉框")
+        listing._open_select = fail_open
+        select = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('版型')) .el-select"
+        )
+        await select.evaluate(
+            """element => {
+              element.style.position = 'relative';
+              const tags = document.createElement('div');
+              tags.className = 'el-select__tags el-select-collapsed__tags';
+              tags.style.cssText = 'position:absolute;inset:0;z-index:2;background:white';
+              tags.innerHTML = '<span class="el-tag">宽松</span>';
+              element.prepend(tags);
+            }"""
+        )
+
+        actual = await listing.fill_attribute("版型", "宽松")
+
+        self.assertEqual(actual, ("宽松",))
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(runtime.requests[0].excel_value, "宽松")
+
+    async def test_collapsed_multi_select_opens_when_tag_covers_readonly_input(self):
+        listing = await self._listing()
+        select = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('版型')) .el-select"
+        )
+        await select.evaluate(
+            """element => {
+              element.style.position = 'relative';
+              const tags = document.createElement('div');
+              tags.className = 'el-select__tags el-select-collapsed__tags';
+              tags.style.cssText = 'position:absolute;inset:0;z-index:2;background:white';
+              tags.innerHTML = '<span class="el-select__tags-text">日常</span>';
+              element.prepend(tags);
+            }"""
+        )
+
+        await listing._open_select(select, multi=True)
+
+        self.assertTrue(
+            await select.locator(".el-select-dropdown").is_visible()
+        )
+
+    async def test_dom_approval_precedes_old_api_history(self):
+        runtime = SimpleNamespace(
+            resolve_unmatched_page_options=AsyncMock(return_value=ResolvedAttribute('loose', '宽松', 'human_override', 'dom-snapshot')),
+            resolve=AsyncMock())
+        listing = await self._listing(runtime)
+        result = await listing.fill_attribute('版型', '旧风格')
+        self.assertEqual(result, ('宽松',))
+        runtime.resolve.assert_not_awaited()
+        self.assertTrue(runtime.resolve_unmatched_page_options.await_args.kwargs['confirmed_only'])
+
+    async def test_failed_historical_selection_creates_forced_review(self):
+        runtime = SimpleNamespace(resolve_unmatched_page_options=AsyncMock(return_value=None),
+                                  review_pending_or_omitted=lambda *args: False)
+        listing = await self._listing(runtime)
+        listing._resolve_learning_groups = AsyncMock(return_value=(('修身,宽松',),))
+        listing._select_values = AsyncMock(return_value=None)
+        result = await listing.fill_attribute('版型', '原始风格')
+        self.assertIsNone(result)
+        kwargs = runtime.resolve_unmatched_page_options.await_args.kwargs
+        self.assertTrue(kwargs['force_review'])
+        self.assertFalse(kwargs['multi'])
+        self.assertEqual(kwargs['excel_value'], '原始风格')
+        self.assertEqual({o['name'] for o in kwargs['options']}, {'修身','宽松'})
+
+    async def test_removed_dependent_field_is_skipped_without_blocking_later_fields(self):
+        import asyncio
+        listing = await self._listing()
+        await self.page.locator('.complex-wrap').evaluate("""root => {
+          const node=document.createElement('div');node.className='el-form-item';node.id='dependent';
+          node.innerHTML='<label class="el-form-item__label">成分含量</label><div class="el-form-item__content"><input></div>';
+          root.firstElementChild.after(node);
+        }""")
+        original = listing.fill_attribute
+        async def fill(label, *args, **kwargs):
+            value = await original(label, *args, **kwargs)
+            if label == '版型':
+                await self.page.locator('#dependent').evaluate('node => node.remove()')
+            return value
+        listing.fill_attribute = fill
+        report = await asyncio.wait_for(listing.fill_category_attributes(PddFields(fields={
+            '版型':'宽松','成分含量':'50','货号/商家外部编码':'NGBL-2024'})), timeout=10)
+        self.assertIn('成分含量', report['ignored_fields'])
+        self.assertEqual(report['attributes']['商品货号'], ('NGBL-2024',))
+        self.assertNotIn('成分含量', report['skipped_values'])
+
+    async def test_cached_field_locator_survives_conditional_field_insertion(self):
+        listing = await self._listing()
+        items = await listing._attribute_items()
+        label, cached = next(v for v in items.values() if v[0] == '版型')
+        await cached.evaluate("""node => {
+          const extra = document.createElement('div');
+          extra.className='el-form-item';
+          extra.innerHTML='<label class="el-form-item__label">新增属性</label><div class="el-form-item__content"><input value="保持原样"></div>';
+          node.before(extra);
+        }""")
+        result = await listing.fill_attribute(label, '宽松', item=cached)
+        self.assertEqual(result, ('宽松',))
+        self.assertEqual(await self.page.locator('input[value="保持原样"]').input_value(), '保持原样')
+
+    async def test_material_uses_unique_platform_synonym(self):
+        listing = await self._listing()
+        await self.page.locator(".complex-wrap").evaluate(
+            """root => root.insertAdjacentHTML('beforeend', `
+              <div class="complex-item"><div class="el-form-item">
+                <label class="el-form-item__label">材质</label>
+                <div class="el-form-item__content"><div class="el-select">
+                  <input class="el-input__inner" readonly onclick="openSelect(this)">
+                  <div class="el-select-dropdown" style="display:none"><ul>
+                    <li class="el-select-dropdown__item" onclick="choose(this)">涤纶（聚酯纤维）</li>
+                  </ul></div>
+                </div></div>
+              </div></div>`);"""
+        )
+
+        actual = await listing.fill_attribute(
+            "材质", "涤纶/涤纶100%", exact_values=("涤纶",)
+        )
+
+        self.assertEqual(actual, ("涤纶（聚酯纤维）",))
 
     async def test_fills_excel_attributes_skips_only_crotch_and_applies_batch_presale(self):
         listing = await self._listing()
@@ -143,6 +392,254 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
         category = await listing.apply_recommended_category()
 
         self.assertEqual(category, "男装 > 休闲裤")
+
+    async def test_existing_full_cascader_category_is_reused_for_similar_excel_hints(self):
+        listing = await self._listing()
+        listing.category_hints = ("牛仔裤", "男士直筒牛仔裤")
+        await self.page.locator(".current").evaluate(
+            "node => node.textContent = '男装 > 牛仔裤 > 牛仔裤'"
+        )
+        await self.page.locator(".recommendation").evaluate("node => node.remove()")
+
+        category = await listing.apply_recommended_category()
+
+        self.assertEqual(category, "男装 > 牛仔裤 > 牛仔裤")
+
+    async def _jeans_category_search_fixture(self):
+        listing = await self._listing()
+        listing.category_hints = ("牛仔裤", "男士直筒牛仔裤")
+        await self.page.evaluate("""() => {
+          document.querySelector('.current').textContent = '男装 > 休闲裤 > 休闲裤';
+          document.querySelector('.platform-category-input').insertAdjacentHTML('beforeend',
+            `<button onclick="document.querySelector('#category-dialog').style.display='block'">修改类目</button>`);
+          document.querySelector('.recommendation button').onclick = () => {
+            throw Error('不应选中与 Excel 不匹配的推荐');
+          };
+          document.body.insertAdjacentHTML('beforeend', `
+            <div role="dialog" aria-label="修改类目" id="category-dialog" style="display:none">
+              <input placeholder="请输入类目关键词，支持模糊查询"
+                oninput="document.querySelector('#suggestions').style.display='block'">
+              <div id="selected">已选：</div>
+              <div class="el-cascader-panel" id="category-panel" style="display:none">
+                <div class="el-cascader-menu"><div class="el-cascader-node" aria-haspopup="true">男装</div></div>
+                <div class="el-cascader-menu"><div class="el-cascader-node" aria-haspopup="true"
+                  onclick="document.querySelector('#leaf-menu').style.display='block'">牛仔裤</div></div>
+                <div class="el-cascader-menu" id="leaf-menu" style="display:none"><div class="el-cascader-node leaf"
+                  onclick="document.querySelector('#selected').textContent='已选：男装 > 牛仔裤 > 牛仔裤';
+                    document.querySelector('.current').textContent='男装 > 牛仔裤 > 牛仔裤'">牛仔裤</div></div>
+              </div>
+              <button onclick="if (document.querySelector('#selected').textContent !== '已选：')
+                document.querySelector('#category-dialog').style.display='none'">确定</button>
+            </div>
+            <div class="el-autocomplete-suggestion el-popper" id="suggestions" style="display:none">
+              <ul><li onclick="document.querySelector('#selected').textContent='已选：男装 > 牛仔裤';
+                document.querySelector('#suggestions').style.display='none';
+                setTimeout(() => document.querySelector('#category-panel').style.display='block', 200)">男装 > 牛仔裤</li></ul>
+            </div>`);
+        }""")
+
+        return listing
+
+    async def test_wrong_current_and_recommended_category_use_excel_manual_search(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.evaluate("""() => {
+          window.categorySearchInputs = [];
+          document.querySelector('#category-dialog input').addEventListener('input', event => {
+            window.categorySearchInputs.push(event.target.value);
+          });
+        }""")
+        self.assertEqual(
+            await listing.apply_recommended_category(),
+            "男装 > 牛仔裤 > 牛仔裤",
+        )
+        self.assertEqual(await listing._category_text(), "男装 > 牛仔裤 > 牛仔裤")
+        self.assertEqual(await self.page.evaluate('window.categorySearchInputs'), ['牛仔裤'])
+
+    async def test_category_search_splits_excel_or_before_typing(self):
+        listing = await self._jeans_category_search_fixture()
+        listing.category_hints = ("男装 > 牛仔裤/男士直筒牛仔裤",)
+        await self.page.evaluate("""() => {
+          window.categorySearchInputs=[];
+          document.querySelector('#category-dialog input').addEventListener('input', event => {
+            window.categorySearchInputs.push(event.target.value);
+          });
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), "男装 > 牛仔裤 > 牛仔裤")
+        self.assertEqual(await self.page.evaluate('window.categorySearchInputs'), ['牛仔裤'])
+
+    async def test_category_review_waits_for_all_terms_and_restores_earlier_result(self):
+        listing = await self._jeans_category_search_fixture()
+        listing.category_hints = ("直筒牛仔裤/牛仔长裤",)
+        listing.attribute_runtime = object()
+        await self.page.evaluate("""() => {
+          window.categorySearchInputs=[];
+          document.querySelector('#category-dialog input').addEventListener('input', event => {
+            window.categorySearchInputs.push(event.target.value);
+            document.querySelector('#suggestions li').textContent = event.target.value==='直筒牛仔裤'
+              ? '男装 > 牛仔裤' : '男装 > 西裤';
+          });
+        }""")
+
+        async def review(paths):
+            self.assertEqual(await self.page.evaluate('window.categorySearchInputs'), ['直筒牛仔裤', '牛仔长裤'])
+            self.assertEqual(set(paths), {'男装 > 牛仔裤', '男装 > 西裤'})
+            return listing._normalize_category_path('男装 > 牛仔裤')
+
+        listing._resolve_category_uncertainty = AsyncMock(side_effect=review)
+        self.assertEqual(await listing._apply_excel_category_search(), '男装 > 牛仔裤 > 牛仔裤')
+        self.assertEqual(await self.page.evaluate('window.categorySearchInputs'), ['直筒牛仔裤', '牛仔长裤', '直筒牛仔裤'])
+
+    async def test_full_jeans_search_path_does_not_append_an_extra_level(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.evaluate("""() => {
+          document.querySelector('#suggestions li').textContent = '男装 > 牛仔裤 > 牛仔裤';
+          document.querySelector('#leaf-menu').style.display = 'block';
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤 > 牛仔裤')
+
+    async def _capture_jeans_tree(self, listing, ids=(239, 7289, 7298), leaf=1):
+        root, branch, child = ids
+        await listing._capture_category_tree(SimpleNamespace(status=200, json=AsyncMock(return_value={
+            'result': 1, 'data': [
+                {'cid': root, 'parentCid': 0, 'name': '男装', 'level': 1, 'leaf': 0,
+                 'children': [
+                     {'cid': branch, 'parentCid': root, 'name': '牛仔裤', 'level': 2, 'leaf': 0,
+                      'children': [
+                          {'cid': child, 'parentCid': branch, 'name': '牛仔裤', 'level': 3, 'leaf': leaf}
+                      ]}
+                 ]}
+            ]
+        })))
+
+    async def test_root_only_render_waits_for_child_columns_with_json_proof(self):
+        # Live search first exposes only root categories; child menus arrive
+        # asynchronously. IDs may change and are not DOM matching criteria.
+        for ids in ((239, 7289, 7298), (90001, 90002, 90003)):
+            with self.subTest(ids=ids):
+                listing = await self._jeans_category_search_fixture()
+                await self._capture_jeans_tree(listing, ids)
+                await self.page.evaluate("""() => {
+                  const menus = document.querySelectorAll('.el-cascader-menu');
+                  menus[1].style.display = 'none';
+                  menus[0].firstElementChild.onclick = () => {
+                    setTimeout(() => menus[1].style.display = 'block', 300);
+                  };
+                }""")
+                self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤 > 牛仔裤')
+
+    async def test_json_dom_leaf_disagreement_stops_before_confirmation(self):
+        listing = await self._jeans_category_search_fixture()
+        await self._capture_jeans_tree(listing, leaf=0)
+        with self.assertRaisesRegex(PddFormListingError, 'JSON 与 DOM 末级标记不一致'):
+            await listing.apply_recommended_category()
+        self.assertTrue(await self.page.locator('#category-dialog').is_visible())
+
+    async def test_same_name_json_sibling_ambiguity_stops_before_confirmation(self):
+        listing = await self._jeans_category_search_fixture()
+        await self._capture_jeans_tree(listing)
+        listing._category_tree_nodes['99999'] = {
+            'cid': 99999, 'parentCid': 7289, 'name': '牛仔裤', 'level': 3, 'leaf': 1
+        }
+        with self.assertRaisesRegex(PddFormListingError, 'JSON 与 DOM 路径不一致或有歧义'):
+            await listing.apply_recommended_category()
+        self.assertTrue(await self.page.locator('#category-dialog').is_visible())
+
+    async def test_legacy_two_level_jeans_category_remains_supported(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.evaluate("""() => {
+          document.querySelector('#leaf-menu').remove();
+          const leaf = document.querySelectorAll('.el-cascader-node')[1];
+          leaf.removeAttribute('aria-haspopup');
+          leaf.onclick = () => {
+            document.querySelector('#selected').textContent = '已选：男装 > 牛仔裤';
+            document.querySelector('.current').textContent = '男装 > 牛仔裤';
+          };
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤')
+
+    async def test_same_name_intermediate_branch_preserves_its_depth(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.evaluate("""() => {
+          const branch = document.querySelector('#leaf-menu .leaf');
+          branch.setAttribute('aria-haspopup', 'true');
+          branch.onclick = () => document.querySelector('#final-menu').style.display = 'block';
+          document.querySelector('#category-panel').insertAdjacentHTML('beforeend', `
+            <div class="el-cascader-menu" id="final-menu" style="display:none">
+              <div class="el-cascader-node" onclick="
+                document.querySelector('#selected').textContent='已选：男装 > 牛仔裤 > 牛仔裤 > 牛仔裤';
+                document.querySelector('.current').textContent='男装 > 牛仔裤 > 牛仔裤 > 牛仔裤'">牛仔裤</div>
+            </div>`);
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤 > 牛仔裤 > 牛仔裤')
+
+    async def test_manual_leaf_readback_must_keep_the_complete_path(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.locator('#leaf-menu .leaf').evaluate("""node => {
+          node.onclick = () => {
+            document.querySelector('#selected').textContent = '已选：男装 > 牛仔裤';
+          };
+        }""")
+        with self.assertRaisesRegex(PddFormListingError, '末级回读不一致'):
+            await listing.apply_recommended_category()
+        self.assertTrue(await self.page.locator('#category-dialog').is_visible())
+
+    async def test_unrelated_only_child_is_not_automatically_selected(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.locator('#leaf-menu .leaf').evaluate(
+            "node => node.textContent = '休闲裤'"
+        )
+        with self.assertRaisesRegex(PddFormListingError, '下一级候选不唯一或不存在'):
+            await listing.apply_recommended_category()
+        self.assertTrue(await self.page.locator('#category-dialog').is_visible())
+        self.assertEqual(await listing._category_text(), '男装 > 休闲裤 > 休闲裤')
+
+    async def test_uncertain_child_uses_reviewed_full_path_and_dom_readback(self):
+        listing = await self._jeans_category_search_fixture()
+        path = '男装 > 牛仔裤 > 直筒牛仔裤'
+        async def resolve(request):
+            self.assertEqual(request.field_label, '商品类目')
+            self.assertEqual(request.evidence['parent_path'], ['男装', '牛仔裤'])
+            candidate = next(c for c in request.candidates if c.label == path)
+            return ResolvedAttribute(candidate.value_id, candidate.label, 'review_learning', 'snapshot')
+        listing.attribute_runtime = SimpleNamespace(resolve=resolve)
+        await self.page.locator('#leaf-menu .leaf').evaluate("""node => {
+          node.textContent = '直筒牛仔裤';
+          node.onclick = () => {
+            document.querySelector('#selected').textContent = '已选：男装 > 牛仔裤 > 直筒牛仔裤';
+            document.querySelector('.current').textContent = '男装 > 牛仔裤 > 直筒牛仔裤';
+          };
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), path)
+
+    async def test_search_candidates_keep_full_row_including_highlighted_name(self):
+        listing = await self._jeans_category_search_fixture()
+        await self.page.locator('#suggestions').evaluate("""node => {
+          node.style.display = 'block';
+          node.innerHTML = '<ul><li>男装 &gt; <span>牛仔裤</span></li></ul>';
+        }""")
+        self.assertEqual([text for text, node in await listing._visible_category_result_nodes()],
+                         ['男装 > 牛仔裤'])
+
+    async def test_recommended_jeans_path_accepts_configured_child_readback(self):
+        listing = await self._listing()
+        listing.category_hints = ('牛仔裤',)
+        await self.page.evaluate("""() => {
+          document.querySelector('.recommendation span:nth-child(2)').textContent = '男装 > 牛仔裤';
+          document.querySelector('.recommendation button').onclick = () => {
+            document.querySelector('.current').textContent = '男装 > 牛仔裤 > 牛仔裤';
+          };
+        }""")
+        self.assertEqual(await listing.apply_recommended_category(), '男装 > 牛仔裤 > 牛仔裤')
+
+    async def test_recommended_path_does_not_accept_unconfigured_child(self):
+        listing = await self._listing()
+        await self.page.evaluate("""() => {
+          document.querySelector('.recommendation button').onclick = () => {
+            document.querySelector('.current').textContent = '男装 > 休闲裤 > 牛仔裤';
+          };
+        }""")
+        with self.assertRaisesRegex(PddFormListingError, '类目应用后校验失败'):
+            await listing.apply_recommended_category()
 
     async def test_batch_stock_uses_generic_quantity_not_douyin_spot_stock(self):
         listing = await self._listing()

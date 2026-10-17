@@ -1,6 +1,7 @@
 """使用本地 DOM 重现已观察到的快麦模板控件，不连接或写入线上商品。"""
 import unittest
 import logging
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -49,10 +50,14 @@ function showTemplate(){
 function applyTemplate(){
  document.querySelector('#sizes').innerHTML=sizes.map(s=>`<div class="specification-value-flex_input"><input value="${s}"></div>`).join('');
  document.querySelector('#template').style.display='none';
- document.querySelector('#rows').innerHTML=sizes.map(s=>`<tr><td>军绿色</td><td>${s}</td><td><input type="text"></td>${Array(6).fill('<td><input type="text" value="0"></td>').join('')}</tr>`).join('');
+ const colors=[...document.querySelectorAll('#colors .specification-value-flex_input input')].map(input=>input.value);
+ document.querySelector('#rows').innerHTML=colors.flatMap(color=>sizes.map(s=>`<tr><td>${color}</td><td>${s}</td><td><input type="text"></td>${Array(6).fill('<td><input type="text" value="0"></td>').join('')}</tr>`)).join('');
 }
 function generate(){
- [...document.querySelectorAll('#rows tr')].forEach((row,i)=>row.querySelector('input').value=document.querySelector('#style-code').value+'军绿色'+sizes[i]);
+ [...document.querySelectorAll('#rows tr')].forEach(row=>{
+   const cells=row.querySelectorAll('td');
+   row.querySelector('input').value=document.querySelector('#style-code').value+cells[0].innerText+cells[1].innerText;
+ });
  document.querySelector('#generator').style.display='none';
 }
 </script>
@@ -60,6 +65,70 @@ function generate(){
 
 
 class BrowserTemplateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_sku_images_follow_untouched_page_colors(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('''
+                  <div id="sku-form"><div class="block-specification">
+                    <div class="title-bg"><input value="颜色"></div>
+                    <div class="specification-value"><div class="specification-value-flex">
+                      <div class="specification-value-flex_item">
+                        <div class="specification-value-flex_input"><input value="灰色"></div>
+                        <div class="specification-value-flex_img"><input type="file"></div>
+                      </div>
+                      <div class="specification-value-flex_item">
+                        <div class="specification-value-flex_input"><input value="棕色"></div>
+                        <div class="specification-value-flex_img"><input type="file"></div>
+                      </div>
+                      <div class="specification-value-flex_item"><button>添加规格值</button></div>
+                    </div>
+                  </div></div>
+                ''')
+                with tempfile.TemporaryDirectory() as directory:
+                    brown = Path(directory) / '棕色.png'
+                    gray = Path(directory) / '灰色.png'
+                    brown.write_bytes(b'brown image')
+                    gray.write_bytes(b'gray image')
+                    with patch.object(erp, 'wait_for_image_uploads', AsyncMock()):
+                        with self.assertRaisesRegex(erp.AutomationError, '灰色.*0 张'):
+                            await erp.replace_sku_images(
+                                page, page.locator('#sku-form'),
+                                (brown, Path(directory) / '黑色.png'), 3,
+                            )
+                        self.assertEqual(
+                            await page.locator('.specification-value-flex_img input').evaluate_all(
+                                'inputs => inputs.map(input => input.files.length)'
+                            ),
+                            [0, 0],
+                        )
+                        uploaded = await erp.replace_sku_images(
+                            page, page.locator('#sku-form'), (brown, gray), 3
+                        )
+                self.assertEqual(uploaded, 2)
+                self.assertEqual(
+                    await page.locator('.specification-value-flex_img input').evaluate_all(
+                        'inputs => inputs.map(input => input.files[0]?.name)'
+                    ),
+                    ['灰色.png', '棕色.png'],
+                )
+                self.assertEqual(
+                    await page.locator('.specification-value-flex_input input').evaluate_all(
+                        'inputs => inputs.map(input => input.value)'
+                    ),
+                    ['灰色', '棕色'],
+                )
+                await page.locator('.specification-value-flex_item').nth(1).locator(
+                    '.specification-value-flex_img'
+                ).evaluate('node => node.remove()')
+                with self.assertRaisesRegex(erp.AutomationError, '没有唯一对应的 SKU 图位'):
+                    await erp.replace_sku_images(
+                        page, page.locator('#sku-form'), (brown, gray), 3
+                    )
+            finally:
+                await browser.close()
+
     async def test_real_locators_apply_default_templates_and_validate_every_sku(self):
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(channel='chrome', headless=True)
@@ -68,7 +137,11 @@ class BrowserTemplateTests(unittest.IsolatedAsyncioTestCase):
                 await page.set_content(HTML)
                 # 新增按钮展开后，真实页面会出现“手工新增商品”菜单项；此处标题兼作该菜单项。
                 drawer = await erp.open_new_product_drawer(page, 3)
-                product = SimpleNamespace(style_code='TEST-7', main_images=[Path('/tmp/product.png')])
+                product = SimpleNamespace(
+                    style_code='TEST-7',
+                    main_images=[Path('/tmp/product.png')],
+                    colors=('复古蓝',),
+                )
                 args = SimpleNamespace(timeout=3, upload_timeout=3)
                 with patch.object(erp, 'sync_image_group', AsyncMock()) as uploading:
                     result = await erp.fill_new_product_form(page, drawer, product, args)
@@ -77,7 +150,25 @@ class BrowserTemplateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(uploading.call_args.args[2], product.main_images)
                 report = await erp.validate_new_product_form(drawer, product)
                 self.assertEqual(report['sku_count'], 5)
-                self.assertEqual(report['rows'][-1]['商品编码'], 'TEST-7军绿色2XL')
+                self.assertEqual(report['rows'][-1]['商品编码'], 'TEST-7复古蓝2XL')
+                for index, label in enumerate(('颜色分类', '尺码大小', '* 商品编码 批量生成')):
+                    await page.locator('#head th').nth(index).locator('.cell').evaluate(
+                        '(cell, label) => { cell.removeAttribute("title"); cell.textContent = label; }',
+                        label,
+                    )
+                sku_rows = await erp.read_base_sku_color_code_rows(drawer)
+                self.assertEqual(
+                    erp.validate_base_sku_color_codes(sku_rows, 'TEST-7', ('复古蓝',)),
+                    5,
+                )
+                await page.locator('#rows tr').first.locator('td').first.evaluate(
+                    "cell => cell.innerText = '灰色'"
+                )
+                with self.assertRaisesRegex(erp.AutomationError, '颜色与商品编码不一致'):
+                    erp.validate_base_sku_color_codes(
+                        await erp.read_base_sku_color_code_rows(drawer),
+                        'TEST-7', ('复古蓝', '灰色'),
+                    )
                 await page.locator('#rows tr').last.locator('input').first.fill('WRONG')
                 with self.assertRaises(erp.AutomationError):
                     await erp.validate_new_product_form(drawer, product)
@@ -90,6 +181,126 @@ class BrowserTemplateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(saved['confirmed_by'], 'creation_dialog')
             finally:
                 await browser.close()
+
+    async def test_save_success_toast_wins_over_stale_form_error(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('''
+                  <div id="drawer">
+                    <div class="el-form-item__error">必填；请正确填写价格库存列表</div>
+                    <div class="drawer-footer">
+                      <button onclick="setTimeout(() => {
+                        const toast = document.createElement('div');
+                        toast.className = 'el-message--success';
+                        toast.textContent = '保存成功';
+                        document.body.append(toast);
+                      }, 3100)">保存</button>
+                    </div>
+                  </div>
+                ''')
+
+                result = await erp.click_save_and_confirm(
+                    page,
+                    page.locator('#drawer'),
+                    False,
+                    6,
+                    logging.getLogger('save-browser-test'),
+                )
+
+                self.assertEqual(result['confirmed_by'], 'toast')
+            finally:
+                await browser.close()
+
+    async def test_new_product_colors_follow_excel_order(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('''
+                  <div id="drawer"><div class="block-specification">
+                    <div class="title-bg"><input value="颜色"></div>
+                    <div class="specification-value"><div class="specification-value-flex_input"><input value="灰色"></div>
+                      <div class="specification-value-flex_input"><input value="棕色"></div></div>
+                  </div></div>
+                ''')
+                report = await erp.sync_base_color_spec_values(
+                    page.locator('#drawer'), ('棕色', '灰色')
+                )
+                self.assertEqual(report['before'], ('灰色', '棕色'))
+                self.assertEqual(report['after'], ('棕色', '灰色'))
+                self.assertEqual(report['changed'], 2)
+            finally:
+                await browser.close()
+
+    async def test_size_chart_missing_page_size_errors_without_editing(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('''
+                  <div id="drawer"><div class="block-specification">
+                    <div><div class="title-bg"><input value="颜色"></div>
+                      <div class="specification-value">
+                        <div class="specification-value-flex_input"><input value="灰色"></div>
+                        <div class="specification-value-flex_input"><input value="棕色"></div>
+                      </div></div>
+                    <div><div class="title-bg"><input value="尺码"></div>
+                      <div class="specification-value">
+                        <div class="specification-value-flex_item"><div class="specification-value-flex_input"><input value="S"></div><button title="删除" onclick="this.parentElement.remove()">删除</button></div>
+                        <div class="specification-value-flex_item"><div class="specification-value-flex_input"><input value="M"></div><button title="删除" onclick="this.parentElement.remove()">删除</button></div>
+                        <div class="specification-value-flex_item"><div class="specification-value-flex_input"><input value="2XL"></div><button title="删除" onclick="this.parentElement.remove()">删除</button></div>
+                      </div></div>
+                  </div></div>
+                ''')
+                drawer = page.locator('#drawer')
+                page_sizes = await erp.read_base_specification_values(drawer, '尺码')
+                with self.assertRaisesRegex(erp.AutomationError, '页面 S / M / 2XL；尺码表 S / M'):
+                    erp.validate_base_size_spec_values(page_sizes, ('S', 'M'))
+                self.assertEqual(
+                    await erp.read_base_specification_values(drawer, '尺码'),
+                    ('S', 'M', '2XL'),
+                )
+                self.assertEqual(
+                    await erp.read_base_specification_values(drawer, '颜色'),
+                    ('灰色', '棕色'),
+                )
+            finally:
+                await browser.close()
+
+    async def test_size_chart_extra_size_errors_without_editing(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('''
+                  <div id="drawer"><div class="block-specification">
+                    <div class="title-bg"><input value="尺码"></div>
+                    <div class="specification-value">
+                      <div class="specification-value-flex_input"><input value="S"></div>
+                      <div class="specification-value-flex_input"><input value="2XL"></div>
+                    </div>
+                  </div></div>
+                ''')
+                drawer = page.locator('#drawer')
+                page_sizes = await erp.read_base_specification_values(drawer, '尺码')
+                with self.assertRaisesRegex(erp.AutomationError, '页面 S / 2XL；尺码表 S / 2XL / 3XL'):
+                    erp.validate_base_size_spec_values(page_sizes, ('S', '2XL', '3XL'))
+                self.assertEqual(
+                    await erp.read_base_specification_values(drawer, '尺码'),
+                    ('S', '2XL'),
+                )
+            finally:
+                await browser.close()
+
+    def test_size_chart_order_difference_preserves_page_order(self):
+        report = erp.validate_base_size_spec_values(
+            ('S', 'M', '2XL'), ('2XL', 'S', 'M')
+        )
+        self.assertEqual(report['after'], ('S', 'M', '2XL'))
+        self.assertEqual(report['added'], 0)
+        self.assertEqual(report['removed'], 0)
 
 
 if __name__ == '__main__':

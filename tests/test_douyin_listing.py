@@ -2,19 +2,23 @@ import asyncio
 import logging
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from attribute_runtime import AttributeRequest, AttributeRuntime, ResolvedAttribute, ReviewRequired
+from learning_store import LearningStore
 from douyin_data import MaterialComponent
 from douyin_listing import (
     DouyinListing,
     DouyinListingError,
     choose_unique_option,
+    materialize_text_value,
     normalize_option,
     value_candidates,
 )
-from size_image_recognition import SkuRecommendation
+from size_image_recognition import ClothingSkuRecommendation, SkuRecommendation
 
 
 LOGGER = logging.getLogger("douyin-listing-tests")
@@ -39,8 +43,27 @@ class OptionMatchingTests(unittest.TestCase):
             choose_unique_option("羊毛", options)
 
     def test_confirmed_elasticity_alias_keeps_excel_value_first(self):
-        self.assertEqual(value_candidates("弹力", "无弹"), ("无弹", "无弹力"))
+        self.assertEqual(
+            value_candidates("弹力", "无弹"),
+            ("无弹", "无弹力", "无弹性"),
+        )
         self.assertEqual(value_candidates("厚度", "常规款"), ("常规款",))
+
+    def test_security_level_description_maps_to_platform_class(self):
+        self.assertEqual(
+            value_candidates("安全等级", "B（接触皮肤）"),
+            ("B（接触皮肤）", "B类"),
+        )
+        self.assertEqual(
+            value_candidates("安全级别", "A（婴幼儿用品）"),
+            ("A（婴幼儿用品）", "A类"),
+        )
+
+    def test_dynamic_today_text_uses_run_date(self):
+        self.assertEqual(
+            materialize_text_value("动态选择当天", today=date(2026, 9, 12)),
+            "2026.09.12",
+        )
 
 
 class _EventPage:
@@ -87,6 +110,23 @@ class _PropertyResponse:
 
 
 class CategoryPropertyCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_drain_response_tasks_has_a_hard_time_limit(self):
+        page = _EventPage()
+        listing = DouyinListing(page, None, LOGGER, Path("ignored-artifacts"))
+        never_finishes = asyncio.create_task(asyncio.Event().wait())
+        listing._property_response_tasks.add(never_finishes)
+        never_finishes.add_done_callback(listing._property_response_tasks.discard)
+        try:
+            drained = await asyncio.wait_for(
+                listing._drain_property_response_tasks(timeout_seconds=0.01),
+                timeout=0.1,
+            )
+            self.assertFalse(drained)
+            self.assertIn(never_finishes, listing._property_response_tasks)
+        finally:
+            never_finishes.cancel()
+            await asyncio.gather(never_finishes, return_exceptions=True)
+
     async def test_only_fresh_request_generation_can_replace_category_cache(self):
         page = _EventPage()
         listing = DouyinListing(page, None, LOGGER, Path("ignored-artifacts"))
@@ -258,6 +298,8 @@ function deliveryInventory() {
       <label class="el-radio"><input type="radio" name="delivery-mode">现货预售混合模式</label>
       <label class="el-checkbox"><input type="checkbox">48小时内发货</label>
       <label class="el-checkbox"><input type="checkbox">15天内</label>
+      ${['价格', '现货库存', '预售库存(15天内)'].map(label => `<div class="sku-batch-item"><div class="sku-batch-item_label">${label}：</div><input></div>`).join('')}
+      <button onclick="window.skuBatchClicks=(window.skuBatchClicks||0)+1; const values=[...this.parentElement.querySelectorAll('.sku-batch-item input')].map(e=>e.value); this.parentElement.querySelectorAll('.sku-table tbody tr').forEach(row=>row.querySelectorAll('input').forEach((e,i)=>e.value=values[i]));">批量设置</button>
       <div class="el-table sku-table">
         <div class="el-table__main-wrapper">
           <div class="el-table__header-wrapper"><table><thead><tr>
@@ -432,6 +474,74 @@ function openDouyin() {
 
 
 class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_dropdown_readback_uses_model_before_retry(self):
+        from learning_models import CandidateValue
+        from tests.test_attribute_runtime import FakeClient
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        select = (await self.listing._attribute_item('厚度')).locator('.el-select').first
+        await self.page.evaluate("""() => {
+          const original = pickOption;
+          window.writeCount = 0;
+          pickOption = (...args) => {
+            window.writeCount++;
+            if (window.writeCount > 1) original(...args);
+            else args[0].closest('.el-select-dropdown').style.display = 'none';
+          };
+        }""")
+        store = LearningStore(Path(self.tempdir.name) / 'learning.sqlite3')
+        store.migrate()
+        client = FakeClient()
+        calls = []
+        def judge(payload):
+            calls.append(payload)
+            return {'status': 'suggested', 'source': 'deepseek', 'api_called': True,
+                'snapshot_version': payload['snapshot_version'], 'value_ids': ['normal'],
+                'confidence': .99, 'reason': '常规款与 Excel 原文一致',
+                'evidence_kinds': ['excel'],
+                'assessment': {'relation': 'equivalent', 'source_text': payload['excel_value'],
+                    'assumptions': [], 'conflicts': [], 'competing_value_ids': []}}
+        client.semantic_judge = judge
+        runtime = AttributeRuntime(store, client, 'run', 'product')
+        runtime.begin_review_collection('douyin')
+        self.listing.attribute_runtime = runtime
+        try:
+            await runtime.resolve(AttributeRequest('douyin', 'pants', 'thickness', '厚度',
+                (CandidateValue('normal', '常规款'), CandidateValue('thick', '加厚款')),
+                '常规款', {'excel': True}, False, 'schema'))
+            actual = await self.listing._select_values(select, ('常规款',), label='厚度', multi=False)
+            self.assertEqual(actual, ('常规款',))
+            self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
+            self.assertEqual(len(calls), 0)
+            self.assertFalse(runtime.deferred_reviews)
+        finally:
+            await runtime.drain()
+            store.close()
+
+    async def test_unmapped_dropdown_uses_visible_candidates_for_review(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        runtime = SimpleNamespace(resolve_unmatched_page_options=AsyncMock(return_value=None))
+        self.listing.attribute_runtime = runtime
+        self.listing._api_property = AsyncMock(return_value=None)
+        item = await self.listing._attribute_item("厚度")
+        select = item.locator(".el-select").first
+
+        resolved = await self.listing._resolve_learning_select_value(
+            "厚度", select, ("页面没有的值",), direct_input_failed=True,
+            fallback_options=({"name": "常规款"}, {"name": "加厚款"}),
+        )
+
+        self.assertIsNone(resolved)
+        self.assertEqual(
+            runtime.resolve_unmatched_page_options.await_args.kwargs["platform_id"],
+            "douyin",
+        )
+        self.assertEqual(
+            tuple(v["name"] for v in runtime.resolve_unmatched_page_options.await_args.kwargs["options"]),
+            ("常规款", "加厚款"),
+        )
+
     async def asyncSetUp(self):
         from playwright.async_api import async_playwright
 
@@ -452,6 +562,32 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.playwright.stop()
         self.tempdir.cleanup()
+
+    async def test_shoe_warranty_selects_90_days_when_category_exposes_service(self):
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => panel.insertAdjacentHTML('beforeend', `
+          <div class="el-form-item">
+            <label class="el-form-item__label">售后服务承诺</label>
+            <div class="el-form-item__content"><label>
+              <input type="radio" name="warranty">保修期内提供维修（寄修）
+            </label></div>
+          </div>
+          <div class="el-form-item">
+            <label class="el-form-item__label">选择保修天数</label>
+            <div class="el-form-item__content"><div class="el-select"><input></div></div>
+          </div>`)
+        """)
+        self.listing._select_values = AsyncMock(return_value=("90天",))
+
+        self.assertIsNone(await self.listing.apply_leather_shoe_warranty("男装 > 休闲裤"))
+        self.assertFalse(await self.page.locator('input[name="warranty"]').is_checked())
+        self.assertEqual(
+            await self.listing.apply_leather_shoe_warranty("男鞋 > 休闲皮鞋"),
+            "90天",
+        )
+        self.assertTrue(await self.page.locator('input[name="warranty"]').is_checked())
+        self.assertEqual(await self.listing.apply_leather_shoe_warranty("鞋靴 > 男鞋 > 靴子"), "90天")
+        self.assertEqual(self.listing._select_values.await_args.args[1], ("90天",))
 
     async def test_delayed_tab_category_title_and_exact_select_controls(self):
         await self.listing.open()
@@ -477,6 +613,59 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             ".attr-item:has(.el-form-item__label:text-is('里料材质')) .el-tag"
         )
         self.assertEqual(await tags.count(), 1)
+
+    async def test_attribute_items_collects_labels_in_one_browser_scan(self):
+        first_item = object()
+        second_item = object()
+        item_locator = Mock()
+        item_locator.nth.side_effect = (first_item, second_item)
+        panel = SimpleNamespace(
+            evaluate=AsyncMock(
+                return_value=[
+                    {"index": 0, "label": "* 厚度："},
+                    {"index": 1, "label": "裤门襟"},
+                ]
+            ),
+            locator=Mock(return_value=item_locator),
+        )
+        self.listing.panel = panel
+        self.listing._ensure_panel_visible = AsyncMock()
+
+        items = await self.listing._attribute_items()
+
+        self.assertEqual(tuple(items), (normalize_option("厚度"), normalize_option("裤门襟")))
+        self.assertIs(items[normalize_option("厚度")][1], first_item)
+        self.assertIs(items[normalize_option("裤门襟")][1], second_item)
+        panel.evaluate.assert_awaited_once()
+
+    async def test_loading_wait_includes_fullscreen_portal_outside_drawer(self):
+        await self.listing.open()
+        await self.page.locator("body").evaluate(
+            """body => {
+              const mask = document.createElement('div');
+              mask.className = 'el-loading-mask is-fullscreen';
+              mask.style.cssText = 'position:fixed;inset:0;display:block;z-index:99999';
+              body.append(mask);
+            }"""
+        )
+
+        with self.assertRaisesRegex(DouyinListingError, "加载遮罩"):
+            await self.listing._wait_for_loading_masks(timeout_seconds=0.05)
+
+    async def test_open_select_waits_for_loading_mask_before_clicking(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        item = await self.listing._attribute_item("厚度")
+        select = item.locator(".el-select").first
+
+        with patch.object(
+            self.listing,
+            "_wait_for_loading_masks",
+            new=AsyncMock(),
+        ) as wait_for_masks:
+            await self.listing._open_select(select, multi=False)
+
+        wait_for_masks.assert_awaited_once()
 
     async def test_product_title_refreshes_dynamic_category_before_applying_it(self):
         await self.listing.open()
@@ -515,6 +704,49 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             await self.listing.apply_first_recommended_category(),
             "服装 > 男装 > 休闲裤",
         )
+
+    async def test_mismatched_recommendation_enters_category_learning_review(self):
+        await self.listing.open()
+        self.listing.category_hints = ("服装 > 男装 > 牛仔裤",)
+
+        async def approve_first(request):
+            self.assertEqual(request.field_id, "category_path")
+            self.assertEqual(request.field_label, "商品类目")
+            self.assertEqual(request.control_type, "category")
+            self.assertEqual(request.evidence["category_source"], "recommendation_mismatch")
+            self.assertEqual(len(request.candidates), 1)
+            candidate = request.candidates[0]
+            return ResolvedAttribute(
+                candidate.value_id, candidate.label, "human_override", request.schema_version
+            )
+
+        self.listing.attribute_runtime = SimpleNamespace(
+            resolve=AsyncMock(side_effect=approve_first)
+        )
+
+        actual = await self.listing.apply_first_recommended_category()
+
+        self.assertEqual(actual, "服装 > 男装 > 休闲裤")
+
+    async def test_existing_category_is_reapplied_to_capture_live_api_schema(self):
+        await self.listing.open()
+        self.assertEqual(
+            await self.listing.apply_first_recommended_category(),
+            "服装 > 男装 > 休闲裤",
+        )
+        self.listing.attribute_runtime = object()
+        self.listing._begin_category_property_capture = AsyncMock(return_value=7)
+        self.listing._wait_for_fresh_category_properties = AsyncMock(
+            return_value=True
+        )
+
+        self.assertEqual(
+            await self.listing.apply_first_recommended_category(),
+            "服装 > 男装 > 休闲裤",
+        )
+
+        self.listing._begin_category_property_capture.assert_awaited_once()
+        self.listing._wait_for_fresh_category_properties.assert_awaited_once_with(7)
         await self.page.locator(".prediction-item").evaluate(
             "element => element.remove()"
         )
@@ -525,6 +757,41 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             ),
             "服装 > 男装 > 休闲裤",
         )
+
+    async def test_text_field_recovers_when_input_detaches_after_lookup(self):
+        await self.listing.open()
+        original = self.listing._plain_text_field_controls
+        first = True
+        async def controls(label):
+            nonlocal first
+            found = await original(label)
+            if first:
+                first = False
+                handle = await found[0][1].element_handle()
+                await found[0][1].evaluate("el => el.replaceWith(el.cloneNode(true))")
+                return [(found[0][0], handle)]
+            return found
+        self.listing._plain_text_field_controls = controls
+        self.assertEqual(await self.listing.fill_text_field("货号", "NGBL-2022"), "NGBL-2022")
+        self.assertEqual(await self.listing.read_plain_text_field("货号"), "NGBL-2022")
+
+    async def test_text_field_scrolls_to_lazy_rendered_goods_code(self):
+        await self.listing.open()
+        await self.page.locator('[role="tabpanel"]').evaluate("""panel => {
+            const label = [...panel.querySelectorAll('.el-form-item__label')]
+                .find(el => el.textContent.trim() === '货号');
+            const item = label.closest('.el-form-item');
+            item.remove();
+            const scroll = document.createElement('div');
+            scroll.style.cssText = 'height:160px;overflow-y:auto';
+            scroll.innerHTML = '<div style="height:700px"></div>';
+            panel.prepend(scroll);
+            scroll.addEventListener('scroll', () => {
+                if (scroll.scrollTop > 50 && !item.isConnected) scroll.append(item);
+            });
+        }""")
+        actual = await asyncio.wait_for(self.listing.fill_text_field("货号", "SCROLL-2022"), timeout=8)
+        self.assertEqual(actual, "SCROLL-2022")
 
     async def test_text_field_locator_survives_form_item_index_shift(self):
         await self.listing.open()
@@ -543,12 +810,32 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         await controls[0][1].fill("NGBL-10588")
         self.assertEqual(await controls[0][1].input_value(), "NGBL-10588")
 
+    async def test_text_field_restores_douyin_tab_after_drawer_resets_to_base(self):
+        await self.listing.open()
+        await self.page.evaluate(
+            """() => {
+              document.querySelector('#douyin-tab').setAttribute('aria-selected', 'false');
+              document.querySelector('[role=tab]').setAttribute('aria-selected', 'true');
+              document.querySelector('#slot').innerHTML = '';
+            }"""
+        )
+
+        actual = await asyncio.wait_for(
+            self.listing.fill_text_field("货号", "NGBL-10588"), timeout=2
+        )
+
+        self.assertEqual(actual, "NGBL-10588")
+        self.assertEqual(
+            await self.page.locator('#douyin-tab').get_attribute('aria-selected'),
+            "true",
+        )
+
     async def test_material_rows_selection_percentages_and_upload_adapter(self):
         await self.listing.open()
         await self.listing.apply_first_recommended_category()
         calls = []
 
-        async def fake_sync(page, item, paths, label, timeout_seconds):
+        async def fake_sync(page, item, paths, label, timeout_seconds, **kwargs):
             calls.append((page, item, paths, label, timeout_seconds))
             return "skipped"
 
@@ -562,6 +849,246 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][2], (Path("wash-label.jpg"),))
         self.assertEqual(calls[0][3], "抖音水洗标/吊牌图")
 
+    async def test_material_selection_reopens_transiently_hidden_dropdown(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+
+        with patch.object(
+            self.listing,
+            "_select_values",
+            new=AsyncMock(side_effect=DouyinListingError("下拉层首次未渲染")),
+        ):
+            actual = await self.listing.apply_materials(
+                (MaterialComponent("棉", 100),), ()
+            )
+
+        self.assertEqual(actual, (("棉", 100),))
+        self.assertEqual(
+            await self.listing.panel.locator("#material-rows .el-input__inner").first.input_value(),
+            "棉",
+        )
+
+    async def test_material_component_is_skipped_when_category_has_no_field(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.page.locator(".el-form-item").filter(
+            has=self.page.get_by_text("面料材质", exact=True)
+        ).first.evaluate("element => element.remove()")
+
+        result = await self.listing.apply_materials_if_present((), ())
+
+        self.assertEqual(result, ())
+
+    async def test_material_component_requires_excel_value_when_visible(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+
+        with self.assertRaisesRegex(DouyinListingError, "Excel 缺少面料材质"):
+            await self.listing.apply_materials_if_present((), ())
+
+    async def test_material_component_ignores_read_only_summary_label(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.listing.panel.evaluate("""panel => panel.insertAdjacentHTML(
+          'afterbegin', '<div class="el-form-item"><label class="el-form-item__label">面料材质:</label><div class="el-form-item__content">棉100%</div></div>')
+        """)
+
+        actual = await self.listing.apply_materials_if_present(
+            (MaterialComponent("棉", 100),), ()
+        )
+
+        self.assertEqual(actual, (("棉", 100),))
+
+    async def test_material_summary_without_editor_is_skipped(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.listing.panel.locator(".attr-item").last.evaluate("element => element.remove()")
+        await self.listing.panel.evaluate("""panel => panel.insertAdjacentHTML(
+          'afterbegin', '<div class="el-form-item"><label class="el-form-item__label">面料材质:</label><div class="el-form-item__content">棉100%</div></div>')
+        """)
+
+        self.assertEqual(await self.listing.apply_materials_if_present((), ()), ())
+
+    async def test_required_material_editor_without_add_button_is_an_error(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.listing.panel.locator(".attr-item").last.evaluate("""element => {
+          element.querySelector('.el-form-item').classList.add('is-required');
+          element.querySelector('button').remove();
+        }""")
+
+        with self.assertRaisesRegex(DouyinListingError, "缺少添加材质入口"):
+            await self.listing.apply_materials_if_present((MaterialComponent("棉", 100),), ())
+
+    async def test_initial_required_error_text_does_not_block_material_editor(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.listing.panel.locator(".attr-item").last.evaluate("""element => {
+          const item = element.querySelector('.el-form-item');
+          item.classList.add('is-required', 'is-error');
+          item.querySelector('.el-form-item__content').insertAdjacentHTML(
+            'beforeend', '<div class="el-form-item__error">请添加面料材质</div>');
+        }""")
+
+        actual = await self.listing.apply_materials_if_present(
+            (MaterialComponent("棉", 100),), ()
+        )
+
+        self.assertEqual(actual, (("棉", 100),))
+
+    async def test_shoe_sizes_commit_exact_numbers_before_filling_foot_lengths(self):
+        from shoe_size import ShoeMeasurement
+        await self.listing.open()
+        await self.listing.panel.evaluate(r"""panel => {
+          panel.innerHTML = `<div class="block-specification">
+            <div><div class="title-bg"><input value="颜色分类" disabled></div>
+              <div class="specification-value"><div class="specification-value-flex_item"><div class="el-select"><input class="el-input__inner" value="棕色"></div></div></div></div>
+            <div><div class="title-bg"><input value="鞋码大小" disabled></div>
+            <div class="specification-value">
+            ${['39','40'].map(size => `<div class="specification-value-flex_item">
+              <div class="el-select"><input class="el-input__inner" value="${size}码"
+                onkeyup="this.parentElement.querySelector('.el-select-dropdown').style.display=this.value==='${size}'?'block':'none'">
+                <div class="el-select-dropdown" style="display:none">
+                  ${[`${size}-40`, size].map(v => `<div class="el-select-dropdown__item"
+                    onclick="this.closest('.el-select').querySelector('input').value='${v}'; this.parentElement.style.display='none'; window.shoeClicks.push('${v}')">${v}</div>`).join('')}
+                </div></div></div>`).join('')}</div></div></div>
+            <div class="el-table"><div class="el-table__header-wrapper"><table><thead><tr><th>尺码</th><th>脚长(cm)</th></tr></thead></table></div>
+              <div class="el-table__body-wrapper"><table><tbody>${['40','39'].map(s => `<tr><td>${s}</td><td><input oninput="window.clicksBeforeFeet=window.shoeClicks.slice()"></td></tr>`).join('')}</tbody></table></div></div>`;
+          window.shoeClicks=[];
+        }""")
+        result = await self.listing.fill_shoe_sizes((
+            ShoeMeasurement('39', '26.1-26.6'), ShoeMeasurement('40', '26.6-27.1'),
+        ))
+        self.assertEqual(await self.page.evaluate('window.shoeClicks'), ['39', '40'])
+        self.assertEqual(await self.page.evaluate('window.clicksBeforeFeet'), ['39', '40'])
+        inputs = self.listing.panel.locator('.el-table__body-wrapper input')
+        self.assertEqual(await inputs.nth(0).input_value(), result['40'])
+        self.assertEqual(await inputs.nth(1).input_value(), result['39'])
+        self.assertEqual(await self.listing.panel.locator('.specification-value input').first.input_value(), '棕色')
+
+    async def test_shoe_size_already_selected_disabled_candidate_is_reused(self):
+        from shoe_size import ShoeMeasurement
+        await self.listing.open()
+        await self.listing.panel.evaluate(r"""panel => {
+          panel.innerHTML = `<div class="block-specification"><div>
+            <div class="title-bg"><input value="鞋码大小" disabled></div>
+            <div class="specification-value"><div class="specification-value-flex_item">
+              <div class="el-select"><input class="el-input__inner" value="39"
+                onkeyup="this.parentElement.querySelector('.el-select-dropdown').style.display=this.value==='39'?'block':'none'">
+                <div class="el-select-dropdown" style="display:none">
+                  <div class="el-select-dropdown__item selected is-disabled"
+                    onclick="window.reselected=true">39</div>
+                </div></div></div></div></div>
+            <div class="el-table"><div class="el-table__header-wrapper"><table><thead>
+              <tr><th>尺码</th><th>脚长(cm)</th></tr></thead></table></div>
+              <div class="el-table__body-wrapper"><table><tbody>
+                <tr><td>39</td><td><input></td></tr>
+              </tbody></table></div></div></div>`;
+          window.reselected=false;
+        }""")
+        result = await self.listing.fill_shoe_sizes((ShoeMeasurement('39', '26.1-26.6'),))
+        self.assertEqual(result, {'39': '26.1-26.6'})
+        self.assertFalse(await self.page.evaluate('window.reselected'))
+        self.assertEqual(
+            await self.listing.panel.locator('.el-table__body-wrapper input').input_value(),
+            '26.1-26.6',
+        )
+
+    async def test_shoe_size_mismatch_stops_before_writing(self):
+        from shoe_size import ShoeMeasurement
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => {
+          panel.innerHTML = '<div class="block-specification"><div class="title-bg"><input value="鞋码大小"></div><div class="specification-value"><div class="specification-value-flex_item"><div class="el-select"><input class="el-input__inner" value="39码"></div></div></div></div>';
+        }""")
+        with self.assertRaisesRegex(DouyinListingError, '鞋码规格与尺码图不一致'):
+            await self.listing.fill_shoe_sizes((ShoeMeasurement('40', '26.6-27.1'),))
+        self.assertEqual(await self.listing.panel.locator('.el-input__inner').input_value(), '39码')
+
+    async def test_empty_old_shoe_rows_removed_but_numeric_rows_preserved(self):
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => {
+          panel.innerHTML = `<div class="el-table"><div class="el-table__body-wrapper"><table><tbody>
+          ${['39码','40码','39','40'].map(s=>`<tr><td><input value="${s}"></td><td><input></td><td><button onclick="this.closest('tr').remove()">删除</button></td></tr>`).join('')}
+          </tbody></table></div></div>`;
+        }""")
+        table = self.listing.panel.locator('.el-table')
+        await self.listing._remove_empty_renamed_shoe_rows(table, {'39':'26.1', '40':'26.6'})
+        names = await table.locator('td:first-child input').evaluate_all('xs=>xs.map(x=>x.value)')
+        self.assertEqual(names, ['39','40'])
+
+    async def test_old_shoe_row_with_measurements_blocks_all_cleanup(self):
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => {
+          panel.innerHTML = `<div class="el-table"><div class="el-table__body-wrapper"><table><tbody>
+          ${['39码','40码','39','40'].map(s=>`<tr><td><input value="${s}"></td><td><input value="${s==='40码'?'27':''}"></td><td><button onclick="this.closest('tr').remove()">删除</button></td></tr>`).join('')}
+          </tbody></table></div></div>`;
+        }""")
+        table = self.listing.panel.locator('.el-table')
+        with self.assertRaisesRegex(DouyinListingError, '含测量数据'):
+            await self.listing._remove_empty_renamed_shoe_rows(table, {'39':'26.1', '40':'26.6'})
+        self.assertEqual(await table.locator('tbody tr').count(), 4)
+
+    async def test_dismiss_dropdown_does_not_click_option_covering_field_label(self):
+        await self.listing.open()
+        await self.listing.panel.evaluate("""panel => {
+          panel.innerHTML = `<div class="el-form-item">
+            <label class="el-form-item__label" style="display:block;width:120px;height:30px">鞋底材质</label>
+            <div class="el-select"><input><div class="el-select__tags"><span class="el-tag">橡胶</span></div>
+              <div class="el-select-dropdown" style="position:fixed;background:white;z-index:99999">
+                <div class="el-select-dropdown__item" onclick="document.querySelector('.el-tag').remove();this.parentElement.style.display='none'">橡胶</div>
+              </div>
+            </div></div>`;
+          const label=panel.querySelector('label'), pop=panel.querySelector('.el-select-dropdown');
+          const box=label.getBoundingClientRect();
+          Object.assign(pop.style,{left:box.left+'px',top:box.top+'px',width:box.width+'px',height:box.height+'px'});
+          pop.firstElementChild.style.height=box.height+'px';
+          document.addEventListener('keydown', e=> {if(e.key==='Escape')e.stopImmediatePropagation()}, true);
+          document.addEventListener('mouseup', e=> {if(!e.target.closest('.el-select'))pop.style.display='none'});
+        }""")
+        select = self.listing.panel.locator('.el-select')
+        await self.listing._dismiss_select_dropdown(select)
+        self.assertEqual(await self.listing._read_select_values(select, multi=True), ('橡胶',))
+        self.assertFalse(await select.locator('.el-select-dropdown').is_visible())
+
+    async def test_multiple_materials_use_smart_fill_with_excel_text(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.page.evaluate(
+            """() => {
+              const wrap = document.querySelector('.measure-wrap');
+              const button = document.createElement('button');
+              button.textContent = '智能填充';
+              button.onclick = () => {
+                document.body.insertAdjacentHTML('beforeend',
+                  `<div class="el-dialog" role="dialog">
+                     <textarea></textarea><button type="button">确定</button>
+                   </div>`);
+                const dialog = document.querySelector('.el-dialog:last-child');
+                dialog.querySelector('button').onclick = () => {
+                  const rows = document.querySelectorAll('#material-rows .measure-item');
+                  rows[0].querySelector('.el-input__inner').value = '棉';
+                  rows[0].querySelector('.el-input-digit input').value = '94';
+                  document.querySelector('#material-rows').insertAdjacentHTML(
+                    'beforeend', materialRow());
+                  const second = document.querySelectorAll('#material-rows .measure-item')[1];
+                  second.querySelector('.el-input__inner').value = '氨纶';
+                  second.querySelector('.el-input-digit input').value = '6';
+                  dialog.remove();
+                };
+              };
+              wrap.insertBefore(button, wrap.firstChild);
+            }"""
+        )
+
+        actual = await self.listing.apply_materials(
+            (MaterialComponent("棉", 94), MaterialComponent("氨纶", 6)),
+            (),
+            "棉94%，氨纶6%",
+        )
+
+        self.assertEqual(actual, (("棉", 94), ("氨纶", 6)))
+        self.assertEqual(await self.page.locator("#material-rows .measure-item").count(), 2)
+
     async def test_or_value_prefers_existing_later_candidate_before_creating(self):
         await self.listing.open()
         await self.listing.apply_first_recommended_category()
@@ -569,6 +1096,380 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         actual = await self.listing.fill_attribute("里料材质", "不存在/亚麻")
 
         self.assertEqual(actual, ("亚麻",))
+
+    async def test_dismiss_select_uses_outside_click_when_escape_is_ignored(self):
+        await self.page.set_content(
+            """
+            <div id="prod-center-edit-dialog">
+              <div class="el-form-item">
+                <label class="el-form-item__label">里料材质</label>
+                <div class="el-select"><input class="el-input__inner" readonly></div>
+              </div>
+            </div>
+            <div id="dropdown" class="el-select-dropdown" style="display:block">
+              <div class="el-select-dropdown__item">骆马毛</div>
+            </div>
+            <script>
+              document.body.addEventListener('click', event => {
+                if (event.target === document.body) {
+                  document.querySelector('#dropdown').style.display = 'none';
+                }
+              });
+            </script>
+            """
+        )
+        drawer = self.page.locator("#prod-center-edit-dialog")
+        listing = DouyinListing(
+            self.page,
+            drawer,
+            LOGGER,
+            Path(self.tempdir.name),
+        )
+        select = drawer.locator(".el-select")
+
+        await listing._dismiss_select_dropdown(select)
+
+        self.assertEqual(
+            await self.page.locator(".el-select-dropdown:visible").count(),
+            0,
+        )
+
+    async def test_unmatched_select_directly_enters_excel_value(self):
+        await self.page.set_content(
+            """
+            <div id="prod-center-edit-dialog">
+              <div class="el-select">
+                <div class="el-select__tags">
+                  <input class="el-select__input" aria-controls="dropdown">
+                </div>
+                <input class="el-input__inner" readonly aria-controls="dropdown">
+              </div>
+            </div>
+            <div id="dropdown" class="el-select-dropdown" style="display:block">
+              <div class="el-select-dropdown__item">羊毛</div>
+              <div class="el-select-dropdown__item">亚麻</div>
+            </div>
+            <script>
+              const search = document.querySelector('.el-select__input');
+              search.addEventListener('click', () => {
+                document.querySelector('#dropdown').style.display = 'block';
+              });
+              search.addEventListener('keydown', event => {
+                if (event.key !== 'Enter' || !search.value) return;
+                const tag = document.createElement('span');
+                tag.className = 'el-tag';
+                tag.textContent = search.value;
+                document.querySelector('.el-select__tags').prepend(tag);
+                search.value = '';
+                document.querySelector('#dropdown').style.display = 'none';
+              });
+            </script>
+            """
+        )
+        drawer = self.page.locator("#prod-center-edit-dialog")
+        listing = DouyinListing(
+            self.page,
+            drawer,
+            LOGGER,
+            Path(self.tempdir.name),
+        )
+        select = drawer.locator(".el-select")
+
+        actual = await listing._select_values(
+            select,
+            ("棉混纺布",),
+            label="里料材质",
+            multi=True,
+        )
+
+        self.assertEqual(actual, ("棉混纺布",))
+
+    async def test_reviewed_multi_choice_is_selected_one_candidate_at_a_time(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        self.listing.attribute_runtime = object()
+        self.listing._resolve_learning_select_value = AsyncMock(
+            return_value=("棉,亚麻", ())
+        )
+
+        actual = await self.listing.fill_attribute("里料材质", "通用/男女通用")
+
+        self.assertEqual(actual, ("棉", "亚麻"))
+        tags = self.page.locator(
+            ".attr-item:has(.el-form-item__label:text-is('里料材质')) .el-tag"
+        )
+        self.assertEqual(await tags.all_inner_texts(), ["棉", "亚麻"])
+
+    async def test_direct_input_failure_falls_back_to_operational_review(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        item = await self.listing._attribute_item("厚度")
+        select = item.locator(".el-select").first
+        request = AttributeRequest(
+            platform_id="douyin",
+            category_leaf_id="mens-jacket",
+            field_id="thickness",
+            field_label="厚度",
+            candidates=(),
+            excel_value="不存在的值",
+            evidence={"excel": True, "direct_input_failed": True},
+            custom_allowed=False,
+            schema_version="snapshot",
+        )
+        review = ReviewRequired(
+            "review-id",
+            request,
+            "direct_input_failed",
+            "snapshot",
+        )
+        self.listing.attribute_runtime = object()
+
+        with patch.object(
+            self.listing,
+            "_resolve_learning_select_value",
+            new=AsyncMock(side_effect=review),
+        ) as resolve:
+            with self.assertRaises(ReviewRequired):
+                await self.listing._select_values(
+                    select,
+                    ("不存在的值",),
+                    label="厚度",
+                    multi=False,
+                    review_alternatives=("不存在的值",),
+                )
+
+        self.assertTrue(resolve.await_args.kwargs["direct_input_failed"])
+
+    async def test_learning_uses_douyin_api_ids_and_dom_cross_check(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-douyin-1",
+                )
+
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        self.listing._category_properties_generation = 1
+        self.listing._category_properties_leaf_id = "mens-casual-pants"
+        self.listing._category_properties = {
+            normalize_option("厚度"): (
+                {
+                    "name": "厚度",
+                    "type": "select",
+                    "id": "thickness-property",
+                    "options": (
+                        {"name": "常规款", "id": "regular"},
+                        {"name": "常规款（加厚）", "id": "thick"},
+                    ),
+                },
+            )
+        }
+
+        actual = await self.listing.fill_attribute("厚度", "常 规-款")
+
+        self.assertEqual(actual, ("常规款",))
+        self.assertEqual(len(runtime.requests), 1)
+        request = runtime.requests[0]
+        self.assertEqual(request.platform_id, "douyin")
+        self.assertEqual(request.category_leaf_id, "mens-casual-pants")
+        self.assertEqual(request.field_id, "thickness-property")
+        self.assertEqual(request.excel_value, "常规款")
+        self.assertEqual(
+            tuple((item.value_id, item.label) for item in request.candidates),
+            (("regular", "常规款"), ("thick", "常规款（加厚）")),
+        )
+
+    async def test_control_type_changes_learning_schema(self):
+        await self.test_learning_uses_douyin_api_ids_and_dom_cross_check()
+        runtime = self.listing.attribute_runtime
+        # Isolate the DOM control-kind observation; candidates stay identical.
+        from unittest.mock import MagicMock
+        control = MagicMock()
+        control.evaluate = AsyncMock(return_value=True)
+        await self.listing._resolve_learning_select_value(
+            "厚度", control, ("常规款",), observed_values=("常规款",))
+        multi = runtime.requests[-1]
+        control.evaluate = AsyncMock(return_value=False)
+        await self.listing._resolve_learning_select_value(
+            "厚度", control, ("常规款",), observed_values=("常规款",))
+        single = runtime.requests[-1]
+        self.assertEqual(multi.control_type, "multi_select")
+        self.assertNotEqual(multi.schema_version, single.schema_version)
+
+    async def test_learning_defers_to_excel_search_when_initial_options_do_not_match(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                raise AssertionError("Excel fallback must not request human review")
+
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        self.listing._category_properties_generation = 1
+        self.listing._category_properties_leaf_id = "mens-casual-pants"
+        self.listing._category_properties = {
+            normalize_option("厚度"): (
+                {
+                    "name": "厚度",
+                    "type": "select",
+                    "id": "thickness-property",
+                    "options": (
+                        {"name": "常规款", "id": "regular"},
+                        {"name": "常规款（加厚）", "id": "thick"},
+                    ),
+                },
+            )
+        }
+        item = await self.listing._attribute_item("厚度")
+        select = item.locator(".el-select").first
+
+        selected, _api_options = await self.listing._resolve_learning_select_value(
+            "厚度", select, ("页面尚未加载的值", "备用值")
+        )
+
+        self.assertEqual(selected, "页面尚未加载的值")
+        self.assertEqual(runtime.requests, [])
+
+    async def test_saved_value_records_learning_without_reselecting(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        self.assertEqual(
+            await self.listing.fill_attribute("厚度", "常规款"),
+            ("常规款",),
+        )
+        self.listing.attribute_runtime = object()
+        self.listing._resolve_learning_select_value = AsyncMock(
+            return_value=("常规款", ())
+        )
+
+        self.assertEqual(
+            await self.listing.fill_attribute("厚度", "常规款/加厚款"),
+            ("常规款",),
+        )
+        self.listing._resolve_learning_select_value.assert_awaited_once()
+        self.assertEqual(
+            self.listing._resolve_learning_select_value.await_args.kwargs[
+                "observed_values"
+            ],
+            ("常规款",),
+        )
+
+    async def test_text_or_keeps_matching_later_candidate_and_records_it(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                chosen = next(
+                    candidate
+                    for candidate in request.candidates
+                    if candidate.label == request.excel_value
+                )
+                return ResolvedAttribute(
+                    chosen.value_id,
+                    chosen.label,
+                    "explicit_text",
+                    "snapshot-text-or",
+                )
+
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        input_box = (
+            await self.listing._attribute_item("裤门襟")
+        ).locator("input:not([readonly])").first
+        await input_box.fill("2026年秋季")
+
+        actual = await self.listing.fill_attribute(
+            "裤门襟", "2026/动态选择当天/2026年秋季"
+        )
+
+        self.assertEqual(actual, ("2026年秋季",))
+        self.assertEqual(await input_box.input_value(), "2026年秋季")
+        self.assertEqual(runtime.requests[0].excel_value, "2026年秋季")
+        self.assertEqual(
+            tuple(candidate.label for candidate in runtime.requests[0].candidates),
+            ("2026", "动态选择当天", "2026年秋季"),
+        )
+
+    async def test_text_or_real_runtime_fills_first_excel_alternative_without_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory) / "learning.sqlite3")
+            store.migrate()
+            client = Mock()
+            client.post_event.return_value = {"event_id": "test-event"}
+            client.decide.side_effect = AssertionError("Excel 已确定，不应请求学习决策")
+            runtime = AttributeRuntime(store, client, "run", "product")
+            self.listing.attribute_runtime = runtime
+            try:
+                await self.listing.open()
+                await self.listing.apply_first_recommended_category()
+                item = await self.listing._attribute_item("裤门襟")
+                await item.locator(":scope > .el-form-item__label").evaluate(
+                    "el => el.textContent = '上市时间'"
+                )
+                actual = await self.listing.fill_attribute(
+                    "上市时间", "2026/2026年秋季/动态选择当天"
+                )
+                self.assertEqual(actual, ("2026",))
+                self.assertEqual(await item.locator("input:not([readonly])").first.input_value(), "2026")
+                self.assertEqual(runtime.deferred_reviews, ())
+            finally:
+                await runtime.drain()
+                store.close()
+
+    async def test_text_or_low_confidence_uses_review_runtime_not_raw_slash(self):
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                raise ReviewRequired(
+                    "review-text-or",
+                    request,
+                    "insufficient_evidence",
+                    request.schema_version,
+                )
+
+        runtime = Runtime()
+        self.listing.attribute_runtime = runtime
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        input_box = (
+            await self.listing._attribute_item("裤门襟")
+        ).locator("input:not([readonly])").first
+
+        with self.assertRaises(ReviewRequired):
+            await self.listing.fill_attribute(
+                "裤门襟", "2026/2026年秋季/动态选择当天"
+            )
+
+        self.assertEqual(await input_box.input_value(), "")
+        self.assertEqual(
+            runtime.requests[0].excel_value,
+            "2026/2026年秋季/动态选择当天",
+        )
 
     async def test_or_value_merges_partial_api_and_dom_before_matching(self):
         await self.listing.open()
@@ -625,6 +1526,64 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             ["155-170", "50-70", "84", "110", "106"],
         )
         self.assertGreater(await self.page.evaluate("window.sizeWriteCount"), 0)
+
+    async def test_clothing_size_recommendations_follow_live_clothing_headers(self):
+        await self.listing.open()
+        await self.page.locator(".size-recommend-table").evaluate(
+            """table => {
+              const labels = ['尺码', '身高(cm)', '体重(斤)', '衣长(cm)',
+                              '胸围(cm)', '肩宽(cm)', '袖长(cm)'];
+              table.querySelector('.el-table__header-wrapper thead').innerHTML =
+                '<tr>' + labels.map(label => `<th><div class="cell"><p>${label}</p></div></th>`).join('') + '</tr>';
+              table.querySelector('.el-table__fixed-right').remove();
+              table.querySelector('.el-table__body-wrapper tbody').innerHTML =
+                ['S', 'M'].map(size => '<tr data-size="' + size + '">' +
+                  '<td><div class="cell"><span class="size-name">' + size + '</span></div></td>' +
+                  Array.from({length: 6}, () => '<td><div class="cell"><input oninput="window.sizeWriteCount += 1"></div></td>').join('') +
+                  '</tr>').join('');
+            }"""
+        )
+        recommendations = (
+            ClothingSkuRecommendation("S", 155, 160, 50, 55, 63.5, 125, 55, 56),
+            ClothingSkuRecommendation("M", 160, 175, 55, 70, 65, 129, 56.5, 57),
+        )
+
+        actual = await self.listing.fill_size_recommendations(recommendations)
+
+        self.assertEqual(
+            actual["S"],
+            ("155-160", "50-55", "63.5", "125", "55", "56"),
+        )
+        self.assertEqual(
+            await self.page.locator("tr[data-size='M'] input").evaluate_all(
+                "inputs => inputs.map(input => input.value)"
+            ),
+            ["160-175", "55-70", "65", "129", "56.5", "57"],
+        )
+
+    async def test_clothing_size_chart_enables_optional_sleeve_column_before_filling(self):
+        await self.test_clothing_size_recommendations_follow_live_clothing_headers()
+        await self.page.locator(".size-recommend-table").evaluate('''table => {
+          table.querySelector('.el-table__header-wrapper th:last-child').remove();
+          table.querySelectorAll('.el-table__body-wrapper tbody tr').forEach(row => row.lastElementChild.remove());
+          const choice = document.createElement('label');
+          choice.className = 'el-checkbox';
+          choice.innerHTML = '<input type="checkbox"><span>袖长(cm)</span>';
+          choice.querySelector('input').onchange = () => {
+            table.querySelector('.el-table__header-wrapper tr').insertAdjacentHTML('beforeend',
+              '<th><div class="cell"><p>袖长(cm)</p></div></th>');
+            table.querySelectorAll('.el-table__body-wrapper tbody tr').forEach(row =>
+              row.insertAdjacentHTML('beforeend', '<td><input></td>'));
+          };
+          table.before(choice);
+        }''')
+        result = await self.listing.fill_size_recommendations((
+            ClothingSkuRecommendation("S", 155, 160, 50, 55, 63.5, 125, 55, 56),
+            ClothingSkuRecommendation("M", 160, 175, 55, 70, 65, 129, 56.5, 57),
+        ))
+        self.assertTrue(await self.page.get_by_role('checkbox', name='袖长(cm)', exact=True).is_checked())
+        self.assertEqual(result['S'][-1], '56')
+        self.assertEqual(result['M'][-1], '57')
 
     async def test_size_preflight_rejects_duplicate_and_missing_unexpected_before_writes(self):
         await self.listing.open()
@@ -690,6 +1649,7 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             ("现货预售混合模式", "48小时内发货", "15天内"),
         )
         self.assertEqual(await self.listing.fill_sku_price_inventory("586", 0, 100), 5)
+        self.assertEqual(await self.page.evaluate('window.skuBatchClicks'), 1)
 
         self.assertTrue(
             await self.page.locator("label", has_text="现货预售混合模式").locator("input").is_checked()
@@ -699,6 +1659,18 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
                 "input"
             ).evaluate_all("inputs => inputs.map(input => input.value)")
             self.assertEqual(values, ["586", "0", "100"])
+
+    async def test_full_sku_readback_catches_unrendered_unfilled_row(self):
+        await self.listing.open()
+        await self.listing.fill_sku_price_inventory('586', 0, 100)
+        await self.page.locator('.sku-table').evaluate('''e => {
+          e.__vue__ = {store: {states: {
+            columns: [{label:'价格', property:'price'}, {label:'现货库存', property:'stock'}, {label:'预售库存(15天内)', property:'presale'}],
+            data: [...Array(5).fill({price:586, stock:0, presale:100}), {price:0, stock:0, presale:''}]
+          }}};
+        }''')
+        with self.assertRaisesRegex(DouyinListingError, '第 6 行价格不一致'):
+            await self.listing._verify_sku_price_inventory({'价格': 586, '现货库存': 0, '预售库存': 100})
 
     @staticmethod
     def freight_payloads(missing_store_id=None):
@@ -801,6 +1773,74 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         first_value = await self.page.locator(".set-ship .el-select input").nth(1).input_value()
         self.assertEqual(first_value, "新疆，西藏，不包邮-T恤，裤子，装饰品")
 
+    async def _configure_empty_native_freight(self, *, accepted=None):
+        select = self.page.locator(".set-ship .el-select").first
+        await select.evaluate(
+            """(element, accepted) => {
+              const input = element.querySelector('input.el-input__inner');
+              const dropdown = element.querySelector('.el-select-dropdown');
+              input.value = '包邮';
+              input.removeAttribute('readonly');
+              dropdown.querySelector('ul').replaceChildren();
+              const component = {
+                value: 'old-id',
+                selected: {currentLabel: '包邮'},
+                selectedLabel: '包邮',
+                filterable: true,
+                query: '',
+                handleQueryChange(value) { this.query = value; },
+                $nextTick(callback) { callback(); }
+              };
+              element.__vue__ = component;
+              input.addEventListener('keydown', event => {
+                if (event.key === 'Enter' && (!accepted || input.value === accepted)) {
+                  component.value = 'excel-template-id';
+                  component.selected = {currentLabel: input.value};
+                  component.selectedLabel = input.value;
+                }
+                if (event.key === 'Escape') {
+                  input.value = component.selectedLabel;
+                  dropdown.style.display = 'none';
+                }
+              });
+            }""",
+            accepted,
+        )
+
+    async def test_empty_freight_candidates_commit_excel_value_directly(self):
+        await self.listing.open()
+        desired = "新疆，西藏，不包邮-T恤，裤子，装饰品"
+        second = "新疆西藏不包邮T恤裤子装饰品"
+        await self._configure_empty_native_freight(accepted=second)
+
+        async def failed_fetch():
+            raise DouyinListingError("运费只读接口请求异常：/shop/info.json")
+
+        self.listing._fetch_freight_payloads = failed_fetch
+        actual = await self.listing.apply_freight_templates(
+            (desired, "新疆西藏不包邮T恤裤子装饰品"),
+            target_shops=("钊叔 NEIGBORL 制",),
+            default_untargeted_template="包邮",
+        )
+
+        self.assertEqual(actual["applied"]["钊叔 NEIGBORL 制"], second)
+        self.assertEqual(actual["preserved"], {})
+
+    async def test_uncommitted_freight_search_text_is_not_treated_as_selected(self):
+        await self.listing.open()
+        await self._configure_empty_native_freight(accepted="不会匹配")
+
+        async def failed_fetch():
+            raise DouyinListingError("运费只读接口请求异常：/shop/info.json")
+
+        self.listing._fetch_freight_payloads = failed_fetch
+        with self.assertRaisesRegex(DouyinListingError, "手填后未提交成功"):
+            await self.listing.apply_freight_templates(
+                ("模板一", "模板二"),
+                target_shops=("钊叔 NEIGBORL 制",),
+                default_untargeted_template="包邮",
+            )
+
     async def test_freight_only_changes_configured_stores(self):
         await self.listing.open()
         payloads = self.freight_payloads()
@@ -870,11 +1910,82 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             "586",
             0,
             100,
+            5,
         )
 
         self.assertEqual(applied["attributes"]["货号"], ("NGBL-10588",))
         self.assertEqual(persisted["attributes"]["货号"], ("NGBL-10588",))
         self.assertTrue(all(row["价格"] == "586" for row in persisted["sku"]))
+
+    async def test_goods_code_is_skipped_only_when_live_schema_and_form_omit_it(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.page.locator(
+            ".el-form-item:has(.el-form-item__label:text-is('货号'))"
+        ).evaluate("element => element.remove()")
+        self.listing._category_properties_generation = 1
+        self.listing._category_properties = {"厚度": ({"name": "厚度"},)}
+        self.listing.fill_text_field = AsyncMock()
+        fields = SimpleNamespace(
+            short_title="复古工装裤", attributes={"货号/商家外部编码": "NGBL-10588"}
+        )
+
+        applied = await self.listing.apply_category_and_fields(fields)
+
+        self.listing.fill_text_field.assert_not_awaited()
+        self.assertNotIn("货号", applied["attributes"])
+        self.assertIn("货号/商家外部编码", applied["skipped_attributes"])
+
+        self.listing._category_properties["货号"] = ({"name": "货号"},)
+        self.listing.fill_text_field.side_effect = DouyinListingError("货号未渲染")
+        with self.assertRaisesRegex(DouyinListingError, "货号未渲染"):
+            await self.listing.apply_category_and_fields(fields)
+        self.listing.fill_text_field.assert_awaited_once_with("货号", "NGBL-10588")
+
+    async def test_saved_readback_checks_full_sku_model_not_only_visible_rows(self):
+        await self.listing.open()
+        fields = SimpleNamespace(short_title="复古工装裤", attributes={})
+        applied = await self.listing.apply_category_and_fields(fields)
+        await self.listing.fill_text_field("商品标题", "复古水洗工装裤")
+        await self.listing.fill_sku_price_inventory("586", 0, 100)
+        await self.page.locator(".sku-table").evaluate('''e => {
+          e.__vue__ = {store: {states: {
+            columns: [{label:'价格', property:'price'}, {label:'现货库存', property:'stock'}, {label:'预售库存(15天内)', property:'presale'}],
+            data: Array.from({length: 6}, () => ({price:586, stock:0, presale:100}))
+          }}};
+        }''')
+        expected = (
+            applied["category"], "复古水洗工装裤", applied["short_title"],
+            applied["attributes"], "586", 0, 100,
+        )
+
+        persisted = await self.listing.verify_persisted_values(*expected, 6)
+        self.assertEqual(persisted["sku_verified_rows"], 6)
+        self.assertEqual(persisted["sku_visible_rows"], 5)
+        with self.assertRaisesRegex(DouyinListingError, "SKU 行数不一致"):
+            await self.listing.verify_persisted_values(*expected, 7)
+
+    async def test_saved_readback_ignores_reviewed_no_fill_attribute(self):
+        await self.listing.open()
+        fields = SimpleNamespace(short_title="复古工装裤", attributes={})
+        applied = await self.listing.apply_category_and_fields(fields)
+        await self.listing.fill_text_field("商品标题", "复古水洗工装裤")
+        await self.listing.fill_sku_price_inventory("586", 0, 100)
+
+        attributes = dict(applied["attributes"])
+        attributes["适用年龄"] = None
+        persisted = await self.listing.verify_persisted_values(
+            applied["category"],
+            "复古水洗工装裤",
+            applied["short_title"],
+            attributes,
+            "586",
+            0,
+            100,
+            5,
+        )
+
+        self.assertNotIn("适用年龄", persisted["attributes"])
 
     async def test_apply_category_and_fields_maps_historical_trouser_fly_typo(self):
         await self.listing.open()

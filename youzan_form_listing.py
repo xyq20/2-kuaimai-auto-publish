@@ -6,19 +6,46 @@ remain owned by the common runner in ``kuaimai_erp.py``.
 
 from __future__ import annotations
 
+from field_policies import listing_date_text_value, positional_listing_date_value, without_color_attributes
+
+from field_policies import clear_category_field, REQUIRED_SERVICES
+
 import asyncio
+import json
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, urlsplit
+
+from attribute_runtime import AttributeRequest
+from canonical_fields import is_learning_managed_field
+from category_profile import (
+    category_input_levels,
+    category_path_levels,
+    category_search_terms,
+)
+from category_search import CategorySearchCapture
+from learning_models import CandidateValue, canonical_sha256
+from money_values import MoneyValueError, normalize_money_value
+from platform_candidate_source import (
+    select_supports_multiple,
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
+from platform_schema import FieldOption
 
 from taobao_listing import (
     TaobaoListing,
     TaobaoListingError,
     excel_aliases,
+    material_name_groups,
     normalize_label,
     normalize_option,
     parse_taobao_fabrics,
+    material_value_groups,
     selection_value_groups,
+    selection_value_groups_for_control,
 )
 from youzan_data import YouzanFields
 
@@ -71,7 +98,11 @@ YOUZAN_BATCH_ORDER = ("价格", "库存", "重量(kg)")
 YOUZAN_FREIGHT_TEMPLATES = {
     "pants": "T恤、裤子、饰品邮费模版",
     "coat": "鞋子、皮衣、外套邮费模版",
+    "footwear": "鞋子、皮衣、外套邮费模版",
 }
+YOUZAN_ATTRIBUTE_PATHS = frozenset(
+    ("/yz/getCategoryProperties", "/yz/getCategoryProperties.json")
+)
 
 
 def _numeric_equal(actual: str, expected: str) -> bool:
@@ -82,7 +113,7 @@ def _numeric_equal(actual: str, expected: str) -> bool:
 
 
 def _required_excel_value(
-    fields: Mapping[str, str], aliases: Sequence[str], label: str
+    fields: Mapping[str, str], aliases: Sequence[str], label: str, *, money: bool = False
 ) -> str:
     wanted = {normalize_label(alias) for alias in aliases}
     matches = [
@@ -96,6 +127,13 @@ def _required_excel_value(
                 label, "/".join(aliases)
             )
         )
+    if money:
+        try:
+            matches = [
+                (key, normalize_money_value(value)) for key, value in matches
+            ]
+        except MoneyValueError as exc:
+            raise YouzanFormListingError(f"Excel 有赞{label}{exc}") from exc
     values = {value for _key, value in matches}
     if len(values) != 1:
         raise YouzanFormListingError(
@@ -108,19 +146,239 @@ def _required_excel_value(
 
 def _category_parts(value: object) -> Tuple[str, ...]:
     return tuple(
-        normalize_label(part)
-        for part in re.split(r"[>＞/／]", str(value or ""))
-        if normalize_label(part)
+        "/".join(normalize_label(option) for option in level)
+        for level in category_path_levels(value)
+        if level
     )
+
+
+def _category_leaf_options(value: object) -> Tuple[str, ...]:
+    levels = category_path_levels(value)
+    return tuple(levels[-1]) if levels else ()
+
+
+def choose_youzan_category_text(
+    result_texts: Sequence[str], category_hints: Sequence[str]
+) -> str:
+    """Return one exact leaf match, preferring the most specific Excel hint."""
+
+    hint, matches = matching_youzan_category_texts(result_texts, category_hints)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise YouzanFormListingError(
+            "有赞类目接口或 DOM 完整路径不是唯一项："
+            "提示词 {0}={1}".format(hint, len(matches))
+        )
+    raise YouzanFormListingError("有赞类目候选中没有 Excel 的唯一精确提示词")
+
+
+def matching_youzan_category_texts(
+    result_texts: Sequence[str],
+    category_hints: Sequence[str],
+    *,
+    leaf_hints: Optional[Sequence[str]] = None,
+) -> Tuple[str, Tuple[str, ...]]:
+    """Return the first non-empty exact-leaf candidate group.
+
+    Keeping all candidates is required for learning mode: an ambiguous new
+    category must be shown to the operator instead of terminating as an
+    unclassified error or guessing one path.
+    """
+
+    hints = leaf_hints if leaf_hints is not None else category_hints
+    for hint in category_search_terms(hints):
+        wanted = normalize_label(hint)
+        matches = tuple(
+            dict.fromkeys(
+                text
+                for text in result_texts
+                if wanted in _category_leaf_options(text)
+            )
+        )
+        if matches:
+            return hint, matches
+    return "", ()
 
 
 class YouzanFormListing(TaobaoListing):
     """Fill and verify Youzan category, SKU, inventory and logistics data."""
 
+    attribute_platform_id = "yz"
+
     # FastMai marks remote Youzan candidates as Element UI ``created`` options
     # even though they came from the platform API.  Exact visible text is still
     # required and is read back after the click.
     allow_created_exact_dom_option = True
+
+    def __init__(
+        self,
+        page: Any,
+        drawer: Any,
+        logger: Any,
+        *,
+        attribute_runtime: Optional[Any] = None,
+        category_hints: Sequence[str] = (),
+    ) -> None:
+        super().__init__(
+            page,
+            drawer,
+            logger,
+            attribute_runtime=attribute_runtime,
+            category_hints=category_hints,
+        )
+        self._youzan_api_generation = 0
+        self._youzan_api_category_id = ""
+        self._youzan_api_fields: Dict[str, Tuple[Mapping[str, Any], ...]] = {}
+        self._youzan_request_contexts: Dict[int, Tuple[int, str]] = {}
+        self._youzan_response_tasks: set[asyncio.Task[Any]] = set()
+        self._install_youzan_attribute_listener()
+
+    @staticmethod
+    def _request_parameter(request: Any, name: str) -> str:
+        try:
+            query = parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+            values = [
+                str(value).strip()
+                for value in query.get(name, ())
+                if str(value).strip()
+            ]
+        except Exception:
+            values = []
+        if len(values) == 1:
+            return values[0]
+        raw = str(getattr(request, "post_data", "") or "")
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            parsed = parse_qs(raw, keep_blank_values=True)
+        if isinstance(parsed, Mapping):
+            value = parsed.get(name)
+            if isinstance(value, Sequence) and not isinstance(value, str):
+                values = [str(item).strip() for item in value if str(item).strip()]
+                return values[0] if len(values) == 1 else ""
+            return str(value or "").strip()
+        return ""
+
+    def _install_youzan_attribute_listener(self) -> None:
+        if not hasattr(self.page, "on"):
+            return
+
+        def on_request(request: Any) -> None:
+            try:
+                path = urlsplit(str(request.url)).path
+            except Exception:
+                return
+            if path not in YOUZAN_ATTRIBUTE_PATHS:
+                return
+            category_id = self._request_parameter(request, "categoryId")
+            if not category_id:
+                return
+            self._youzan_api_generation += 1
+            self._youzan_api_category_id = category_id
+            self._youzan_api_fields = {}
+            self._youzan_request_contexts[id(request)] = (
+                self._youzan_api_generation,
+                category_id,
+            )
+
+        def on_response(response: Any) -> None:
+            request = getattr(response, "request", None)
+            context = self._youzan_request_contexts.pop(id(request), None)
+            if context is None:
+                return
+            task = asyncio.create_task(
+                self._consume_youzan_attribute_response(response, context)
+            )
+            self._youzan_response_tasks.add(task)
+            task.add_done_callback(self._youzan_response_tasks.discard)
+
+        def on_request_failed(request: Any) -> None:
+            self._youzan_request_contexts.pop(id(request), None)
+
+        self.page.on("request", on_request)
+        self.page.on("response", on_response)
+        self.page.on("requestfailed", on_request_failed)
+
+    async def _consume_youzan_attribute_response(
+        self,
+        response: Any,
+        context: Tuple[int, str],
+    ) -> None:
+        generation, category_id = context
+        if generation != self._youzan_api_generation:
+            return
+        try:
+            payload = await response.json()
+        except Exception:
+            return
+        if generation != self._youzan_api_generation:
+            return
+        data = payload.get("data", payload) if isinstance(payload, Mapping) else {}
+        result = data.get("result", data) if isinstance(data, Mapping) else {}
+        raw_fields = result.get("publicPropertys") if isinstance(result, Mapping) else None
+        if not isinstance(raw_fields, Sequence) or isinstance(raw_fields, (str, bytes)):
+            return
+        records: Dict[str, List[Mapping[str, Any]]] = {}
+        for raw_field in raw_fields:
+            if not isinstance(raw_field, Mapping) or raw_field.get("propertyGroup") != 1:
+                continue
+            prop = raw_field.get("property")
+            if not isinstance(prop, Mapping):
+                continue
+            field_id = str(prop.get("id") or "").strip()
+            label = str(prop.get("name") or "").strip()
+            if not field_id or not label:
+                continue
+            raw_options = prop.get("valueNames")
+            if not isinstance(raw_options, Sequence) or isinstance(
+                raw_options, (str, bytes)
+            ):
+                raw_options = ()
+            options = tuple(
+                FieldOption(str(value).strip(), str(value).strip(), position)
+                for position, value in enumerate(raw_options)
+                if str(value).strip()
+            )
+            value_type = int(prop.get("valueType") or 0)
+            records.setdefault(normalize_label(label), []).append(
+                {
+                    "id": field_id,
+                    "label": label,
+                    "options": options,
+                    "custom_allowed": value_type == 1,
+                    "category_id": category_id,
+                }
+            )
+        self._youzan_api_fields = {key: tuple(value) for key, value in records.items()}
+
+    async def _drain_youzan_attribute_tasks(self) -> None:
+        await asyncio.sleep(0)
+        while self._youzan_response_tasks:
+            await asyncio.gather(
+                *tuple(self._youzan_response_tasks), return_exceptions=True
+            )
+
+    async def _captured_youzan_field(
+        self,
+        page_label: str,
+        *,
+        timeout_seconds: float = 3.0,
+    ) -> Mapping[str, Any]:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            await self._drain_youzan_attribute_tasks()
+            records = self._youzan_api_fields.get(normalize_label(page_label), ())
+            if len(records) == 1 and self._youzan_api_category_id:
+                return records[0]
+            await asyncio.sleep(0.05)
+        records = self._youzan_api_fields.get(normalize_label(page_label), ())
+        raise YouzanFormListingError(
+            "有赞属性“{0}”缺少唯一的接口 JSON 字段：字段数 {1}".format(
+                page_label,
+                len(records),
+            )
+        )
 
     async def _dismiss_select_dropdown(self, select: Any) -> None:
         for _attempt in range(2):
@@ -266,6 +524,8 @@ class YouzanFormListing(TaobaoListing):
 
         def walk(value: Any) -> None:
             if isinstance(value, Mapping):
+                if value.get("leaf") in (0, "0", False):
+                    return
                 for key, child in value.items():
                     normalized_key = normalize_label(key)
                     if (
@@ -286,7 +546,7 @@ class YouzanFormListing(TaobaoListing):
                     walk(child)
                 return
             if isinstance(value, str) and len(_category_parts(value)) >= 2:
-                add(re.split(r"[>＞/／]", value))
+                add(re.split(r"[>＞]", value))
 
         walk(payload)
         return tuple(paths)
@@ -337,6 +597,7 @@ class YouzanFormListing(TaobaoListing):
 
     async def apply_category(self, category_path: Sequence[str]) -> Mapping[str, Any]:
         path = tuple(str(value).strip() for value in category_path if str(value).strip())
+        self.category_hints = (" > ".join(path),)
         if not path:
             raise YouzanFormListingError("Excel 中缺少有赞商品分类")
         if self.panel is None:
@@ -346,70 +607,129 @@ class YouzanFormListing(TaobaoListing):
             raise YouzanFormListingError("有赞“修改类目”按钮不是唯一项：{0}".format(await buttons.count()))
         await buttons.first.click()
         dialog = await self._category_dialog()
-        search_term = path[0]
+        levels = category_input_levels(" > ".join(path))
+        # Parsed tuples contain path levels; only the final level is a
+        # keyword target. Slash peers retain their authored order.
+        leaf_hints = levels[-1] if levels else path
+        search_terms = category_search_terms(leaf_hints)
         search = await self._category_search_input(dialog)
-        target_parts = self._category_target_parts(search_term)
-        api_paths: List[str] = []
         api_urls: List[str] = []
-        response_tasks: List[asyncio.Task[Any]] = []
-
-        async def capture_category_response(response: Any) -> None:
-            try:
-                headers = await response.all_headers()
-                if "json" not in str(headers.get("content-type") or "").casefold():
-                    return
-                payload = await response.json()
-                rendered = str(payload)
-                if search_term not in rendered:
-                    return
-                for api_path in self._category_paths_from_json(payload):
-                    if api_path not in api_paths:
-                        api_paths.append(api_path)
-                if response.url not in api_urls:
-                    api_urls.append(response.url)
-            except Exception:
-                return
-
-        def on_category_response(response: Any) -> None:
-            response_tasks.append(asyncio.create_task(capture_category_response(response)))
-
-        self.page.on("response", on_category_response)
-        await search.fill(search_term)
-        deadline = asyncio.get_running_loop().time() + 30
         candidates: List[Tuple[str, Any]] = []
         api_matches: List[str] = []
-        try:
-            while asyncio.get_running_loop().time() < deadline:
-                api_matches = [
-                    value
-                    for value in api_paths
-                    if (
-                        _category_parts(value) == target_parts
-                        if len(target_parts) > 1
-                        else _category_parts(value)
-                        and _category_parts(value)[-1] == target_parts[0]
+        matched_hint = ""
+        observed_paths: Dict[str, str] = {}
+        async with CategorySearchCapture(self.page, self._category_paths_from_json) as capture:
+            for search_term in search_terms:
+                capture.start(search_term)
+                candidates = []
+                api_matches = []
+                await search.fill(search_term)
+                if self.logger is not None:
+                    self.logger.info("有赞类目按 Excel 顺序搜索：%s", search_term)
+                deadline = asyncio.get_running_loop().time() + 30
+                while asyncio.get_running_loop().time() < deadline:
+                    if capture.error:
+                        raise YouzanFormListingError("有赞类目搜索接口失败：" + capture.error)
+                    for observed_path in capture.paths:
+                        observed_paths.setdefault(observed_path, search_term)
+                    rows = await self._visible_category_rows()
+                    api_hint, api_group = matching_youzan_category_texts(
+                        capture.paths, path, leaf_hints=leaf_hints
                     )
-                ]
-                rows = await self._visible_category_rows()
-                candidates = [
-                    (text, node)
-                    for text, node in rows
-                    if (
-                        _category_parts(text) == target_parts
-                        if len(target_parts) > 1
-                        else _category_parts(text)
-                        and _category_parts(text)[-1] == target_parts[0]
+                    if capture.received and not api_group:
+                        break
+                    dom_hint, dom_group = matching_youzan_category_texts(
+                        tuple(text for text, _node in rows),
+                        path,
+                        leaf_hints=leaf_hints,
                     )
-                ]
-                if len(api_matches) == 1 and len(candidates) == 1:
+                    api_by_path = {_category_parts(text): text for text in api_group}
+                    dom_by_path = {
+                        _category_parts(text): (text, node) for text, node in rows
+                        if text in dom_group
+                    }
+                    common_paths = tuple(
+                        parts for parts in dom_by_path if parts in api_by_path
+                    )
+                    api_matches = [api_by_path[parts] for parts in common_paths]
+                    candidates = [
+                        (text, node)
+                        for text, node in rows
+                        if _category_parts(text) in common_paths
+                    ]
+                    matched_hint = dom_hint or api_hint
+                    if candidates:
+                        break
+                    await asyncio.sleep(0.1)
+                if candidates:
+                    api_urls = [url for url, _payload in capture.payloads]
                     break
-                if len(api_matches) > 1 or len(candidates) > 1:
-                    break
-                await asyncio.sleep(0.1)
-        finally:
-            self.page.remove_listener("response", on_category_response)
-            if response_tasks:
-                await asyncio.gather(*response_tasks, return_exceptions=True)
+                if not capture.received:
+                    raise YouzanFormListingError("有赞类目搜索接口在 30 秒内未响应：" + search_term)
+                if api_group:
+                    raise YouzanFormListingError("有赞类目 JSON 已定位，但对应 DOM 行未出现：" + search_term)
+        if not candidates and observed_paths:
+            reviewed = await self._resolve_category_review(
+                tuple(observed_paths), source="youzan_category_search_unmatched",
+                evidence={"api_category_search": True, "terminal_required": True},
+            )
+            if reviewed:
+                await search.fill(observed_paths[reviewed])
+                deadline = asyncio.get_running_loop().time() + 10
+                while asyncio.get_running_loop().time() < deadline:
+                    candidates = [(text, node) for text, node in await self._visible_category_rows()
+                                  if self._normalize_category_path(text) == self._normalize_category_path(reviewed)]
+                    if len(candidates) == 1:
+                        break
+                    await asyncio.sleep(.1)
+                api_matches = [reviewed]
+                api_urls = ["/category/base/queryCategoryList"]
+        candidate_paths = tuple(_category_parts(text) for text, _node in candidates)
+        if len(set(candidate_paths)) != len(candidate_paths):
+            raise YouzanFormListingError(
+                "有赞类目接口或 DOM 完整路径不是唯一项："
+                "DOM 存在重复完整路径"
+            )
+        if len(candidates) > 1:
+            runtime = getattr(self, "attribute_runtime", None)
+            if runtime is None:
+                raise YouzanFormListingError(
+                    "有赞类目接口或 DOM 完整路径不是唯一项："
+                    "提示词 {0}={1}".format(matched_hint, len(candidates))
+                )
+            category_values = tuple(
+                CandidateValue(text, text) for text, _node in candidates
+            )
+            schema_version = canonical_sha256(
+                {
+                    "platform_id": "yz",
+                    "field_id": "__category__",
+                    "options": [value.label for value in category_values],
+                }
+            )
+            resolved = await runtime.resolve(
+                AttributeRequest(
+                    platform_id="yz",
+                    category_leaf_id="__pending_category__",
+                    field_id="__category__",
+                    field_label="商品分类",
+                    candidates=category_values,
+                    excel_value="/".join(path),
+                    evidence={"excel": True, "api_dom": True},
+                    custom_allowed=False,
+                    schema_version=schema_version,
+                    control_type="select",
+                )
+            )
+            if resolved is None or getattr(resolved, "is_no_fill", False):
+                runtime.raise_deferred_reviews()
+                raise YouzanFormListingError("有赞商品分类等待运营审核")
+            candidates = [
+                (text, node)
+                for text, node in candidates
+                if text == resolved.label
+            ]
+            api_matches = [resolved.label]
         if len(api_matches) != 1 or len(candidates) != 1:
             raise YouzanFormListingError(
                 "有赞类目接口或 DOM 完整路径不是唯一项：接口 {0}，DOM {1}".format(
@@ -418,6 +738,7 @@ class YouzanFormListing(TaobaoListing):
             )
         selected_text, selected_node = candidates[0]
         await selected_node.click()
+        selected_text = await self._complete_category_leaf(dialog, selected_text)
         confirms = dialog.get_by_role(
             "button", name=re.compile(r"^\s*确\s*定\s*$")
         )
@@ -447,7 +768,6 @@ class YouzanFormListing(TaobaoListing):
             "api_candidate_count": len(api_matches),
             "api_urls": tuple(api_urls),
         }
-
     async def _attribute_vertical_bounds(self) -> Tuple[Optional[float], Optional[float]]:
         if self.panel is None:
             raise YouzanFormListingError("请先调用 open() 打开有赞资料")
@@ -518,6 +838,7 @@ class YouzanFormListing(TaobaoListing):
         page_items: Mapping[str, Tuple[str, Any]],
     ) -> Dict[str, Tuple[str, str]]:
         direct_sources: Dict[str, List[Tuple[str, str]]] = {}
+        page_items = without_color_attributes(page_items)
         alias_sources: Dict[str, List[Tuple[str, str]]] = {}
         for excel_key, raw_value in fields.items():
             aliases = set(excel_aliases(excel_key))
@@ -533,6 +854,8 @@ class YouzanFormListing(TaobaoListing):
                     )
         assignments: Dict[str, Tuple[str, str]] = {}
         for normalized_page, (page_label, _item) in page_items.items():
+            if clear_category_field("yz", page_label):
+                continue
             matches = direct_sources.get(normalized_page) or alias_sources.get(
                 normalized_page, ()
             )
@@ -545,7 +868,11 @@ class YouzanFormListing(TaobaoListing):
                         page_label, "、".join(key for key, _value in matches)
                     )
                 )
-            assignments[normalized_page] = (page_label, matches[0][1])
+            source_key, source_value = matches[0]
+            paired = positional_listing_date_value(page_label, source_key, source_value)
+            assignments[normalized_page] = (
+                page_label, paired if paired is not None else source_value
+            )
         return assignments
 
     @staticmethod
@@ -554,28 +881,131 @@ class YouzanFormListing(TaobaoListing):
     ) -> Optional[Tuple[str, ...]]:
         normalized = normalize_label(page_label)
         if normalized == normalize_label("面料"):
-            try:
-                values = tuple(component.name for component in parse_taobao_fabrics(fields))
-            except TaobaoListingError as exc:
-                raw = str(expected).strip()
-                if "%" in raw or "％" in raw:
-                    raise YouzanFormListingError(
-                        str(exc).replace("淘宝", "有赞")
-                    ) from exc
-                values = tuple(
-                    part.strip()
-                    for part in re.split(r"[、,，;+＋;/／]", raw)
-                    if part.strip()
-                )
-                if not values:
-                    raise YouzanFormListingError(
-                        "Excel 中的有赞面料为空"
-                    ) from exc
+            values = tuple(
+                "/".join(group) for group in material_name_groups(expected)
+            )
+            if not values:
+                raise YouzanFormListingError("Excel 中的有赞面料为空")
             return values or None
         if normalized == normalize_label("年份"):
             year = re.search(r"(?:19|20)\d{2}", str(expected))
             return (year.group(0),) if year else None
         return None
+
+    async def _resolve_learning_select_groups(
+        self,
+        page_label: str,
+        select: Any,
+        groups: Sequence[Sequence[str]],
+    ) -> Optional[Tuple[str, ...]]:
+        runtime = self.attribute_runtime
+        managed = is_learning_managed_field("yz", page_label)
+        if runtime is None:
+            raise YouzanFormListingError("有赞属性学习运行器未启用")
+        multi = await select_supports_multiple(select)
+        try:
+            field = await self._captured_youzan_field(page_label)
+        except YouzanFormListingError as exc:
+            if self.logger is not None:
+                self.logger.info(
+                    "有赞属性“%s”：接口字段未定位，改用当前 DOM 匹配/直接输入与回读：%s",
+                    page_label,
+                    exc,
+                )
+            return None
+        api_options = tuple(field.get("options") or ())
+        if not api_options and field.get("custom_allowed") is True:
+            # Youzan valueType=1 is an API-declared free-form selector.  It has
+            # no constrained platform candidate set.  Do not wait for a DOM
+            # option list that the platform has already told us is empty.
+            return tuple(group[0] for group in groups if group)
+        await self._open_select(select, multi=multi)
+        try:
+            try:
+                _dropdown, dom_options = await self._visible_dom_options(select)
+            except TaobaoListingError as exc:
+                if field.get("custom_allowed") is True and "未找到可见选项" in str(exc):
+                    return tuple(group[0] for group in groups if group)
+                raise
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        try:
+            candidates = reconcile_candidates(
+                api_options,
+                tuple(
+                    DomCandidate(
+                        str(option.get("value") or ""),
+                        str(option.get("name") or ""),
+                        not bool(option.get("disabled")),
+                    )
+                    for option in dom_options
+                ),
+            )
+        except CandidateSourceError as exc:
+            if not managed:
+                return None
+            raise YouzanFormListingError(
+                "有赞属性“{0}”接口候选与页面候选不一致：{1}".format(
+                    page_label,
+                    exc.reason_code,
+                )
+            ) from exc
+        field_id = str(field.get("id") or "").strip()
+        category_id = str(field.get("category_id") or "").strip()
+        if not field_id or not category_id:
+            if not managed:
+                return None
+            raise YouzanFormListingError(
+                "有赞属性“{0}”缺少接口字段 ID 或类目 ID".format(
+                    page_label
+                )
+            )
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "yz",
+                "category_leaf_id": category_id,
+                "field_id": field_id,
+                "control_type": "multi_select" if multi else "select",
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        resolved_values = []
+        for group in groups:
+            request_candidates, excel_value = await self._excel_before_review(
+                select, candidates, group, label=page_label,
+                preflight_request=AttributeRequest(
+                    platform_id="yz", category_leaf_id=category_id,
+                    field_id=field_id, field_label=page_label,
+                    candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
+                    excel_value="/".join(group), evidence={},
+                    custom_allowed=bool(field.get("custom_allowed")), schema_version=schema_version,
+                    control_type="multi_select" if multi else "select",
+                ),
+            )
+            resolved = await runtime.resolve(
+                AttributeRequest(
+                    platform_id="yz",
+                    category_leaf_id=category_id,
+                    field_id=field_id,
+                    field_label=page_label,
+                    candidates=request_candidates,
+                    excel_value=excel_value,
+                    evidence={"excel": bool(excel_value.strip())},
+                    custom_allowed=bool(field.get("custom_allowed")),
+                    schema_version=schema_version,
+                    control_type="multi_select" if multi else "select",
+                )
+            )
+            if resolved is None or getattr(resolved, "is_no_fill", False):
+                return ()
+            resolved_values.append(resolved.label)
+        return tuple(resolved_values)
 
     async def _fill_attribute(
         self,
@@ -592,15 +1022,59 @@ class YouzanFormListing(TaobaoListing):
             if await selects.count() != 1:
                 raise YouzanFormListingError("有赞属性“{0}”下拉框不唯一".format(page_label))
             select = selects.first
-            multi = await select.locator(".el-select__tags").count() > 0
+            multi = await select_supports_multiple(select)
             groups = (
-                tuple((str(value),) for value in exact_values)
+                material_value_groups(page_label, exact_values)
                 if exact_values is not None
-                else selection_value_groups(page_label, expected)
+                else await self._excel_groups_for_select(
+                    select, page_label, expected, multi=multi
+                )
             )
-            if not groups or (not multi and len(groups) != 1):
+            if not groups:
                 raise YouzanFormListingError("有赞属性“{0}”候选分组无法用于当前控件".format(page_label))
+            if (
+                self.attribute_runtime is not None
+                and self.attribute_platform_id == "yz"
+            ):
+                resolved_values = await self._resolve_learning_select_groups(
+                    page_label,
+                    select,
+                    groups,
+                )
+                if resolved_values == ():
+                    if self.logger is not None:
+                        self.logger.info(
+                            "有赞属性“%s”已加入本平台待审核汇总，继续填写后续字段",
+                            page_label,
+                        )
+                    return None
+                if resolved_values is not None:
+                    groups = tuple((value,) for value in resolved_values)
             direct_values = tuple(group[0] for group in groups if group)
+            records = self._youzan_api_fields.get(normalize_label(page_label), ())
+            if len(records) == 1 and records[0].get("custom_allowed") is True:
+                api_labels = {
+                    normalize_option(option.label)
+                    for option in tuple(records[0].get("options") or ())
+                }
+                date_group_or = (
+                    listing_date_text_value(page_label, expected)
+                    != str(expected).strip()
+                )
+                has_date_candidate = date_group_or and any(
+                    normalize_option(value) in api_labels
+                    for group in groups for value in group
+                )
+                if not has_date_candidate and any(
+                    normalize_option(value) not in api_labels
+                    for value in direct_values
+                ):
+                    return await self._set_select_values_directly(
+                        select,
+                        direct_values,
+                        label=page_label,
+                        multi=multi,
+                    )
             if await self._select_explicitly_has_no_data(select, multi=multi):
                 return await self._set_select_values_directly(
                     select,
@@ -610,7 +1084,7 @@ class YouzanFormListing(TaobaoListing):
                 )
             try:
                 actual = await self._select_values(
-                    select, groups, label=page_label, multi=multi
+                    select, groups, label=page_label, multi=multi, excel_value=expected
                 )
             except TaobaoListingError as exc:
                 if "未找到可见选项" in str(exc):
@@ -630,6 +1104,13 @@ class YouzanFormListing(TaobaoListing):
                     )
                 ) from exc
             if actual is None:
+                if (
+                    self.attribute_runtime is not None
+                    and self.attribute_runtime.review_pending_or_omitted(
+                        self.attribute_platform_id, page_label
+                    )
+                ):
+                    return None
                 return await self._set_select_values_directly(
                     select,
                     direct_values,
@@ -644,7 +1125,7 @@ class YouzanFormListing(TaobaoListing):
         if await inputs.count() != 1:
             raise YouzanFormListingError("有赞属性“{0}”可填控件不是唯一项".format(page_label))
         input_box = inputs.first
-        expected_text = str(expected).strip()
+        expected_text = listing_date_text_value(page_label, expected)
         if (await input_box.input_value()).strip() != expected_text:
             await input_box.fill(expected_text)
             await input_box.press("Tab")
@@ -804,12 +1285,15 @@ class YouzanFormListing(TaobaoListing):
     async def fill_category_attributes(
         self, fields: YouzanFields, *, style_code: str
     ) -> Mapping[str, Any]:
-        page_items = await self._attribute_items()
+        page_items = without_color_attributes(await self._attribute_items())
         assignments = await self._attribute_assignments(fields.fields, page_items)
         applied: Dict[str, Tuple[str, ...]] = {}
         skipped: Dict[str, str] = {}
         unmatched_required = []
         for normalized_page, (page_label, item) in page_items.items():
+            if clear_category_field("yz", page_label):
+                await self._clear_excluded_category_field(item, page_label)
+                continue
             required = await self._attribute_is_required(item)
             assignment = assignments.get(normalized_page)
             if normalize_label(page_label) == normalize_label("货号"):
@@ -819,15 +1303,46 @@ class YouzanFormListing(TaobaoListing):
                     unmatched_required.append(page_label)
                 continue
             _source, expected = assignment
-            actual = await self._fill_attribute(
-                page_label,
-                item,
-                expected,
-                exact_values=self._special_attribute_values(
+            if self.logger is not None:
+                self.logger.info(
+                    "有赞正在填写类目属性：字段=%s，Excel值=%s，必填=%s",
+                    page_label,
+                    expected,
+                    "是" if required else "否",
+                )
+            try:
+                exact_values = self._special_attribute_values(
                     fields.fields, page_label, expected
-                ),
-                required=required,
-            )
+                )
+                if (
+                    normalize_label(page_label) == normalize_label("面料")
+                    and exact_values is not None
+                    and len(exact_values) >= 2
+                ):
+                    actual = await self._fill_fabric_attribute(
+                        page_label,
+                        exact_values,
+                        item=item,
+                        writer=lambda value, values: self._fill_attribute(
+                            page_label,
+                            item,
+                            value,
+                            exact_values=values,
+                            required=required,
+                        ),
+                    )
+                else:
+                    actual = await self._fill_attribute(
+                        page_label,
+                        item,
+                        expected,
+                        exact_values=exact_values,
+                        required=required,
+                    )
+            except (TaobaoListingError, YouzanFormListingError) as exc:
+                raise YouzanFormListingError(
+                    "有赞属性“{0}”填写失败：{1}".format(page_label, exc)
+                ) from exc
             if actual is None:
                 skipped[page_label] = expected
             else:
@@ -847,6 +1362,41 @@ class YouzanFormListing(TaobaoListing):
                 if key not in assignments and normalize_label(page_label) != normalize_label("货号")
             ),
         }
+
+    async def _clear_excluded_category_field(self, item: Any, label: str) -> None:
+        selects = item.locator(".el-select:visible")
+        if await selects.count() != 1:
+            raise YouzanFormListingError(f"有赞不填写字段“{label}”控件不唯一")
+        select = selects.first
+        multi = await select_supports_multiple(select)
+        if not any(await self._read_select_values(select, multi=multi)):
+            return
+        if multi:
+            await self._clear_multi_select(select)
+        else:
+            await select.hover()
+            clear = select.locator(".el-icon-circle-close:visible")
+            if await clear.count() != 1:
+                raise YouzanFormListingError(f"有赞字段“{label}”无法清除旧值")
+            await clear.click(timeout=3000)
+        if any(await self._read_select_values(select, multi=multi)):
+            raise YouzanFormListingError(f"有赞字段“{label}”清空回读失败")
+
+    async def _service_settings(self, *, read_only: bool = False) -> Mapping[str, bool]:
+        result = {}
+        for text in REQUIRED_SERVICES["yz"]:
+            options = self.panel.locator("label.el-checkbox:visible").filter(
+                has=self.page.locator(".el-checkbox__label", has_text=re.compile(r"^\s*" + re.escape(text) + r"\s*$"))
+            )
+            if await options.count() != 1:
+                raise YouzanFormListingError(f"有赞服务“{text}”控件不唯一")
+            checkbox = options.locator('input[type="checkbox"]')
+            if not await checkbox.is_checked() and not read_only:
+                await options.click(timeout=3000)
+            if not await checkbox.is_checked():
+                raise YouzanFormListingError(f"有赞服务“{text}”未勾选或未持久化")
+            result[text] = True
+        return result
 
     async def _batch_input(self, label: str) -> Any:
         if self.panel is None:
@@ -926,6 +1476,7 @@ class YouzanFormListing(TaobaoListing):
                 fields,
                 ("价格", "一口价", "基本售价", "商品价格", "售卖价", "售价"),
                 "价格",
+                money=True,
             ),
             "库存": _required_excel_value(fields, ("数量", "库存"), "库存"),
             "重量(kg)": "1",
@@ -1061,6 +1612,31 @@ class YouzanFormListing(TaobaoListing):
         if await selects.count() != 1:
             raise YouzanFormListingError("有赞{0}下拉框不是唯一项".format(label))
         select = selects.first
+        # Check duplicate visible labels before the shared selector is allowed
+        # to pick the first same-name option.
+        try:
+            await self._open_select(select, multi=False)
+            _dropdown, options = await self._visible_dom_options(
+                select, timeout_seconds=0.75
+            )
+            matches = [
+                option for option in options
+                if normalize_option(option.get("name", ""))
+                == normalize_option(expected)
+            ]
+            if len(matches) > 1:
+                raise YouzanFormListingError(
+                    "有赞{0}候选不是唯一项：{1}".format(label, len(matches))
+                )
+        except YouzanFormListingError:
+            raise
+        except TaobaoListingError:
+            pass
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
         try:
             actual = await self._select_values(
                 select,
@@ -1150,11 +1726,13 @@ class YouzanFormListing(TaobaoListing):
         selected_template = await self._select_exact_unique(
             freight_item, template, "运费模板"
         )
+        services = await self._service_settings()
         report = {
             "weight": weight,
             "inventory_deduction": inventory,
             "delivery": ("快递发货",),
             "freight_template": selected_template,
+            "services": services,
         }
         if self.logger is not None:
             self.logger.info("有赞库存、配送与运费模板已填写并回读通过")
@@ -1192,19 +1770,51 @@ class YouzanFormListing(TaobaoListing):
         """Read critical values after save without changing the form."""
 
         actual_category = await self._category_text()
-        target = self._category_target_parts(fields.category_path[0])
+        expected_levels = category_input_levels(" > ".join(fields.category_path))
+        actual_levels = category_input_levels(actual_category)
         actual_parts = _category_parts(actual_category)
-        category_matches = (
-            actual_parts == target
-            if len(target) > 1
-            else bool(actual_parts) and actual_parts[-1] == target[0]
-        )
+        expected_leaf = {
+            normalize_label(option)
+            for option in (expected_levels[-1] if expected_levels else ())
+        }
+        actual_leaf = {
+            normalize_label(option)
+            for option in (actual_levels[-1] if actual_levels else ())
+        }
+        if not actual_leaf and actual_parts:
+            actual_leaf = {actual_parts[-1]}
+        # A supplier category can contain several same-level alternatives while
+        # the marketplace stores only the chosen leaf (for example
+        # ``休闲裤/男士休闲直筒裤/工装休闲裤`` -> ``休闲裤``).  Verify the
+        # persisted leaf against that candidate set instead of treating the
+        # alternatives as fabricated parent levels.
+        category_matches = bool(expected_leaf & actual_leaf)
+        if len(expected_levels) > 1 and category_matches:
+            expected_root = {
+                normalize_label(option) for option in expected_levels[0]
+            }
+            actual_flat = {
+                normalize_label(option)
+                for level in actual_levels
+                for option in level
+            }
+            category_matches = bool(expected_root & actual_flat) or (
+                len(expected_levels) == 1
+            )
         if not category_matches:
             raise YouzanFormListingError(
                 "有赞保存后类目回读失败：{0!r}".format(actual_category)
             )
 
         persisted_attributes = await self._verify_persisted_attributes(fields)
+        services = await self._service_settings(read_only=True)
+        for _key, (label, item) in (await self._attribute_items()).items():
+            if clear_category_field("yz", label):
+                select = item.locator(".el-select:visible")
+                if await select.count() != 1 or any(await self._read_select_values(
+                    select.first, multi=await select_supports_multiple(select)
+                )):
+                    raise YouzanFormListingError(f"有赞字段“{label}”保存后仍有误填值")
 
         expected_sku = self._expected_sku_values(fields.fields)
         rows = self._validate_sku_snapshot(
@@ -1258,6 +1868,7 @@ class YouzanFormListing(TaobaoListing):
             "inventory_deduction": "付款减库存",
             "delivery": ("快递发货",),
             "freight_template": freight_values[0],
+            "services": services,
         }
 
     async def _verify_persisted_attributes(
@@ -1283,8 +1894,12 @@ class YouzanFormListing(TaobaoListing):
             selects = item.locator(":scope > .el-form-item__content .el-select:visible")
             if await selects.count() == 1:
                 select = selects.first
-                multi = await select.locator(".el-select__tags").count() > 0
+                multi = await select_supports_multiple(select)
                 actual = await self._read_select_values(select, multi=multi)
+                if special is None:
+                    groups = await self._excel_groups_for_select(
+                        select, page_label, expected, multi=multi
+                    )
             else:
                 inputs = item.locator(
                     ':scope > .el-form-item__content input:not([readonly]):not([type="hidden"]):visible'
@@ -1336,8 +1951,21 @@ class YouzanFormListing(TaobaoListing):
         attributes = await self.fill_category_attributes(fields, style_code=style_code)
         sku_batch = await self.fill_sku_batch(fields.fields)
         logistics = await self.fill_sales_and_logistics(fields.garment_kind)
+        if self.logger is not None:
+            final_sku = await self._sku_table_snapshot()
+            weight_index = self._sku_column_index(final_sku['headers'], '重量(kg)')
+            self.logger.info('有赞保存前最终 SKU 重量：%s',
+                [row[weight_index] for row in final_sku['rows']])
         errors = await self._visible_validation_errors()
-        if errors:
+        if (
+            errors
+            and not (
+                self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+            )
+        ):
             raise YouzanFormListingError("有赞页面校验错误：" + "；".join(errors))
         return {
             "product_type": product_type,
@@ -1345,6 +1973,14 @@ class YouzanFormListing(TaobaoListing):
             "attributes": attributes,
             "sku_batch": sku_batch,
             "sales_and_logistics": logistics,
+            "deferred_validation_errors": (
+                errors
+                if self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+                else ()
+            ),
         }
 
 
@@ -1352,4 +1988,6 @@ __all__ = [
     "YOUZAN_FREIGHT_TEMPLATES",
     "YouzanFormListing",
     "YouzanFormListingError",
+    "choose_youzan_category_text",
+    "matching_youzan_category_texts",
 ]

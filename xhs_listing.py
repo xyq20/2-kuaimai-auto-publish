@@ -19,8 +19,10 @@ from platform_schema import (
     CategoryResolution,
     FieldSchema,
     SectionSchema,
+    field_options,
     option_summary,
 )
+from category_profile import choose_category_object
 
 
 _DETAIL = EndpointSpec(
@@ -187,6 +189,22 @@ def _descriptor_fields(values: Any) -> Tuple[FieldSchema, ...]:
     return tuple(fields)
 
 
+def normalize_xhs_attribute_options(values: Any) -> Tuple[Any, ...]:
+    """Normalize legacy id/name and current valueId/valueName candidates."""
+    normalized = []
+    for value in _items(values):
+        if not isinstance(value, Mapping):
+            normalized.append(value)
+            continue
+        item = dict(value)
+        if item.get("id") in (None, "") and item.get("valueId") not in (None, ""):
+            item["id"] = item.get("valueId")
+        if item.get("name") in (None, "") and item.get("valueName") not in (None, ""):
+            item["name"] = item.get("valueName")
+        normalized.append(item)
+    return tuple(normalized)
+
+
 def _delivery_rule_options(values: Tuple[Any, ...]) -> Tuple[Any, ...]:
     normalized = []
     for index, value in enumerate(values):
@@ -338,6 +356,7 @@ class XhsListing:
                 section="fixed",
                 control_type="select_one",
                 option_summary=option_summary(_items(logistics), source="logistics"),
+                option_values=field_options(_items(logistics), source="logistics"),
                 api_paths=(_LOGISTICS.path,),
             ),
             FieldSchema(
@@ -347,6 +366,7 @@ class XhsListing:
                 section="fixed",
                 control_type="select_one",
                 option_summary=option_summary(_items(freight), source="freight"),
+                option_values=field_options(_items(freight), source="freight"),
                 api_paths=(_FREIGHT.path,),
             ),
         )
@@ -377,7 +397,12 @@ class XhsListing:
             },
         )
         observations.append(observation)
+        if observation.status != "ok":
+            self._tree_issue(state, "category_tree_api_" + observation.status)
+            return ()
         values = _items(payload) or _items(_mapping(payload).get("list"))
+        if not values:
+            self._tree_issue(state, "category_tree_missing_children")
         return await self._consume_tree_values(
             api,
             values,
@@ -418,6 +443,8 @@ class XhsListing:
                 self._tree_issue(state, "category_tree_node_budget_exceeded")
                 break
             state["node_count"] += 1
+            if value.get("state") in (0, "0") or value.get("disabled") in (True, "true"):
+                continue
             name = str(value.get("name") or value.get("categoryName") or "").strip()
             child_path = path + ((name,) if name else ())
             child_id = value.get("cid") or value.get("categoryId") or value.get("id")
@@ -435,7 +462,9 @@ class XhsListing:
                 continue
             state["visited"].add(child_key)
             nested_children = _items(value.get("children"))
-            if nested_children:
+            # Full-tree responses can explicitly contain an empty parent.
+            # Only a missing children key denotes a lazy subtree to fetch.
+            if "children" in value:
                 candidates.extend(
                     await self._consume_tree_values(
                         api,
@@ -458,6 +487,22 @@ class XhsListing:
                     )
                 )
         return tuple(candidates)
+
+    async def read_category_tree(
+        self, api: Optional[ApiClient] = None
+    ) -> Tuple[CategoryCandidate, ...]:
+        """Read all active leaves without the discovery report's display cap."""
+        observations = []
+        state = {"visited": set(), "request_count": 0, "node_count": 0, "issues": []}
+        candidates = await self._walk_tree(self._client(api), "0", (), observations, state)
+        self._resolution_fragment = SchemaFragment(
+            endpoints=tuple(observations), issues=tuple(state["issues"])
+        )
+        if state["issues"] or not candidates:
+            raise PlatformDiscoveryError(
+                "小红书完整类目树不可用：" + ";".join(state["issues"] or ["no_active_leaves"])
+            )
+        return candidates
 
     async def resolve_category(
         self,
@@ -496,39 +541,42 @@ class XhsListing:
             observations,
             state,
         )
-        hints = _hint_leaves(context)
-        exact = tuple(
+        chosen, strategy = choose_category_object(candidates, context.category_hints)
+        hint_leaves = _hint_leaves(context)
+        exact_candidates = tuple(
             candidate
             for candidate in candidates
-            if hints and normalize_label(candidate.path[-1]) in hints
+            if hint_leaves and normalize_label(candidate.path[-1]) in hint_leaves
         )
         blocking_issues = tuple(
             issue
             for issue in state["issues"]
             if issue != "category_tree_report_budget_exceeded"
         )
-        if len(exact) > _TREE_REPORT_BUDGET:
+        if len(candidates) > _TREE_REPORT_BUDGET:
             self._tree_issue(state, "category_tree_report_budget_exceeded")
-            exact = exact[:_TREE_REPORT_BUDGET]
-        elif not exact and len(candidates) > _TREE_REPORT_BUDGET:
-            self._tree_issue(state, "category_tree_report_budget_exceeded")
-        reported_candidates = exact or candidates[:_TREE_REPORT_BUDGET]
+        if strategy.startswith("ambiguous") and exact_candidates:
+            reported_candidates = exact_candidates[:_TREE_REPORT_BUDGET]
+        elif chosen is not None:
+            reported_candidates = (chosen,)
+        else:
+            reported_candidates = candidates[:_TREE_REPORT_BUDGET]
         self._resolution_fragment = SchemaFragment(
             endpoints=tuple(observations),
             issues=tuple(state["issues"]),
         )
-        if len(exact) == 1 and not blocking_issues:
+        if chosen is not None and not blocking_issues:
             return CategoryResolution(
                 status="resolved",
                 source="tree",
-                selected=exact[0],
+                selected=chosen,
                 candidates=reported_candidates,
             )
         return CategoryResolution(
             status="review_required",
             source="tree",
             candidates=reported_candidates,
-            reason="ambiguous_exact_leaf" if len(exact) > 1 else "no_exact_leaf",
+            reason="ambiguous_exact_leaf" if strategy.startswith("ambiguous") else "no_excel_match",
         )
 
     async def activate_category(
@@ -577,7 +625,12 @@ class XhsListing:
                 },
             )
             observations.append(values_observation)
-            options = _items(_mapping(values).get("values")) or _items(values)
+            values_mapping = _mapping(values)
+            options = (
+                _items(values_mapping.get("values"))
+                or _items(values_mapping.get("attributeValueV3s"))
+                or _items(values)
+            )
             multiple = value.get("isMulti")
             attribute_fields.append(
                 FieldSchema(
@@ -598,7 +651,12 @@ class XhsListing:
                         if isinstance(value.get("customizable"), bool)
                         else None
                     ),
-                    option_summary=option_summary(options, source="api"),
+                    option_summary=option_summary(
+                        normalize_xhs_attribute_options(options), source="api"
+                    ),
+                    option_values=field_options(
+                        normalize_xhs_attribute_options(options), source="api"
+                    ),
                     api_paths=(_ATTRIBUTES.path, _ATTRIBUTE_VALUES.path),
                 )
             )
@@ -655,6 +713,7 @@ class XhsListing:
                 section="delivery",
                 control_type="select_one",
                 option_summary=option_summary(existing_options, source="api"),
+                option_values=field_options(existing_options, source="api"),
                 api_paths=(_DELIVERY.path,),
             ),
             FieldSchema(
@@ -664,6 +723,7 @@ class XhsListing:
                 section="delivery",
                 control_type="select_one",
                 option_summary=option_summary(presale_options, source="api"),
+                option_values=field_options(presale_options, source="api"),
                 api_paths=(_DELIVERY.path,),
             ),
         )
@@ -678,4 +738,4 @@ class XhsListing:
         )
 
 
-__all__ = ["XhsListing"]
+__all__ = ["XhsListing", "normalize_xhs_attribute_options"]

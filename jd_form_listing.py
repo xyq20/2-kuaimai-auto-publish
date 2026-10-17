@@ -2,21 +2,50 @@
 
 from __future__ import annotations
 
+from field_policies import (
+    is_single_material_expression,
+    listing_date_text_value,
+    match_option_candidates,
+    positional_listing_date_value,
+    skip_color_attribute,
+    without_color_attributes,
+)
+
 import asyncio
 import json
 import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
+from attribute_runtime import AttributeRequest
+from canonical_fields import is_learning_managed_field
+from category_profile import category_input_hints, category_search_terms, preferred_category_leaf
+from category_search import CategorySearchCapture, category_response_paths
+from douyin_data import MaterialComponent
 from jd_data import JdFields
+from learning_models import CandidateValue, canonical_sha256
+from money_values import MoneyValueError, normalize_money_value
+from platform_candidate_source import (
+    select_supports_multiple,
+    CandidateSourceError,
+    DomCandidate,
+    reconcile_candidates,
+)
+from platform_schema import FieldOption, FieldSchema
 from taobao_listing import (
+    TAOBAO_MATERIAL_OPTION_ALIASES,
     TaobaoListingError,
     excel_aliases,
+    material_name_groups,
     normalize_label,
     normalize_option,
+    parse_material_components,
+    parse_taobao_materials,
+    preferred_exact_candidate_label,
     selection_value_groups,
+    value_candidates,
 )
 from youzan_form_listing import YouzanFormListing, YouzanFormListingError
 
@@ -28,7 +57,9 @@ class JdFormListingError(RuntimeError):
 JD_CATEGORY_PATH = ("服饰内衣", "男装", "男士休闲裤", "男士休闲直筒裤")
 JD_BRAND = "NEIGBORL"
 JD_DELIVERY_TEMPLATE = "48小时发货"
+JD_GROSS_WEIGHT = "1"
 JD_SKU_THICKNESS = "常规"
+JD_PROPERTIES_ENDPOINT = "/jd/getCategoryProperties.json"
 JD_BATCH_ORDER = ("京东价", "库存")
 JD_EXACT_OPTION_MAP: Mapping[str, Mapping[str, str]] = {
     normalize_label("面料"): {
@@ -67,6 +98,10 @@ JD_IGNORED_ATTRIBUTE_LABELS = frozenset(
     )
 )
 
+JD_CLEARED_ATTRIBUTE_LABELS = frozenset(
+    (normalize_label("产地"),)
+)
+
 # 京东风格是二级级联。Excel 写的是「休闲风/时尚都市」，二级页实际候选是
 # 「简约风 / oversize」，按运营确认把休闲风和时尚都市兼容到简约风。
 JD_CASCADER_LEAF_ALIASES: Mapping[Tuple[str, str], Tuple[str, ...]] = {
@@ -74,6 +109,159 @@ JD_CASCADER_LEAF_ALIASES: Mapping[Tuple[str, str], Tuple[str, ...]] = {
     (normalize_label("风格"), normalize_option("休闲")): ("简约风",),
     (normalize_label("风格"), normalize_option("时尚都市")): ("简约风",),
 }
+
+
+def _json_values(value: Any) -> Tuple[Any, ...]:
+    return tuple(value) if isinstance(value, (tuple, list)) else ()
+
+
+def _first_mapping_value(value: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    for key in keys:
+        candidate = value.get(key)
+        if candidate not in (None, ""):
+            return candidate
+    return None
+
+
+def _jd_option(option: Any, position: int) -> FieldOption:
+    if not isinstance(option, Mapping):
+        return FieldOption("", str(option), position)
+    value_id = _first_mapping_value(
+        option,
+        (
+            "value_id",
+            "id",
+            "vid",
+            "valueId",
+            "propertyValueId",
+            "propValueId",
+            "attrValueId",
+            "code",
+        ),
+    )
+    label = _first_mapping_value(
+        option,
+        (
+            "label",
+            "name",
+            "valueName",
+            "propertyValueName",
+            "propValueName",
+            "attrValueName",
+            "displayName",
+            "display_name",
+        ),
+    )
+    raw_value = option.get("value")
+    if value_id in (None, "") and label not in (None, "") and raw_value not in (None, ""):
+        value_id = raw_value
+    elif label in (None, "") and value_id not in (None, "") and raw_value not in (None, ""):
+        label = raw_value
+    return FieldOption(
+        "" if value_id is None else str(value_id),
+        "" if label is None else str(label),
+        position,
+    )
+
+
+def parse_jd_attribute_fields(payload: Any) -> Tuple[FieldSchema, ...]:
+    """Extract strict JD field/value identities from the captured JSON body.
+
+    FastMai has returned several envelope and descriptor shapes over time.  The
+    parser therefore walks the decoded response, but only accepts an object as
+    a field when it owns a field ID, a field label and an explicit option list.
+    Missing option IDs or labels remain empty and fail closed during API/DOM
+    reconciliation instead of being invented from page text.
+    """
+
+    matches: Dict[Tuple[str, str], FieldSchema] = {}
+    field_id_keys = (
+        "refPid",
+        "propId",
+        "propertyId",
+        "attrId",
+        "attributeId",
+        "id",
+    )
+    field_label_keys = (
+        "propertyName",
+        "propName",
+        "attrName",
+        "attributeName",
+        "name",
+        "label",
+    )
+    option_keys = (
+        "values",
+        "options",
+        "attrValueList",
+        "propertyValues",
+        "propValues",
+        "attributeValues",
+        "attrValues",
+        "valueList",
+    )
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    visit(json.loads(text))
+                except (TypeError, ValueError):
+                    pass
+            return
+        if isinstance(value, (tuple, list)):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, Mapping):
+            return
+
+        source_id = _first_mapping_value(value, field_id_keys)
+        label = _first_mapping_value(value, field_label_keys)
+        raw_options: Tuple[Any, ...] = ()
+        for key in option_keys:
+            raw_options = _json_values(value.get(key))
+            if raw_options:
+                break
+        if source_id not in (None, "") and label not in (None, "") and raw_options:
+            options = tuple(
+                _jd_option(option, position)
+                for position, option in enumerate(raw_options)
+            )
+            key = (str(source_id), normalize_label(str(label)))
+            matches[key] = FieldSchema(
+                schema_key="jd:attribute:{0}".format(source_id),
+                source_id=str(source_id),
+                label=str(label),
+                section="attributes",
+                control_type="select_many"
+                if value.get("multiple") is True
+                or isinstance(value.get("chooseMaxNum"), int)
+                and value.get("chooseMaxNum") > 1
+                else "select_one",
+                required=(
+                    value.get("required")
+                    if isinstance(value.get("required"), bool)
+                    else value.get("isRequired")
+                    if isinstance(value.get("isRequired"), bool)
+                    else None
+                ),
+                multiple=value.get("multiple")
+                if isinstance(value.get("multiple"), bool)
+                else None,
+                custom_allowed=value.get("canNote")
+                if isinstance(value.get("canNote"), bool)
+                else False,
+                option_values=options,
+                api_paths=(JD_PROPERTIES_ENDPOINT,),
+            )
+        for child in value.values():
+            visit(child)
+
+    visit(payload)
+    return tuple(matches.values())
 
 
 def _expand_cascader_candidates(label: str, candidates: Sequence[str]) -> Tuple[str, ...]:
@@ -98,7 +286,7 @@ def _numeric_equal(actual: str, expected: str) -> bool:
 
 
 def _required_excel_value(
-    fields: Mapping[str, str], aliases: Sequence[str], label: str
+    fields: Mapping[str, str], aliases: Sequence[str], label: str, *, money: bool = False
 ) -> str:
     wanted = {normalize_label(alias) for alias in aliases}
     matches = [
@@ -112,6 +300,13 @@ def _required_excel_value(
                 label, "/".join(aliases)
             )
         )
+    if money:
+        try:
+            matches = [
+                (key, normalize_money_value(value)) for key, value in matches
+            ]
+        except MoneyValueError as exc:
+            raise JdFormListingError(f"Excel 京东{label}{exc}") from exc
     values = {value for _key, value in matches}
     if len(values) != 1:
         raise JdFormListingError(
@@ -135,9 +330,27 @@ def _first_excel_value(
 
 
 def _material_name(value: str) -> str:
-    text = str(value).strip()
-    text = re.sub(r"\s*[（(]\s*\d+(?:\.\d+)?\s*[%％]\s*[）)]\s*$", "", text)
-    return text.strip()
+    names = []
+    for text in re.split(r"[/／,，、;；]", str(value)):
+        text = re.sub(r"\s*[（(]?\s*\d+(?:\.\d+)?\s*[%％]\s*[）)]?\s*$", "", text).strip()
+        if text and text not in names:
+            names.append(text)
+    return "/".join(names)
+
+
+def _jd_material_components(value: str) -> Tuple[MaterialComponent, ...]:
+    """Reuse the shared Excel composition parser for JD material rows."""
+    try:
+        return parse_taobao_materials({"材质成分": value})
+    except TaobaoListingError as exc:
+        if is_single_material_expression(value):
+            return ()
+        raise JdFormListingError(str(exc).replace("淘宝", "京东")) from exc
+
+
+def _material_option_desired(name: str) -> str:
+    aliases = TAOBAO_MATERIAL_OPTION_ALIASES.get(normalize_option(name), ())
+    return "/".join((name,) + aliases)
 
 
 def _material_percentage(value: str) -> Optional[str]:
@@ -168,6 +381,57 @@ def _category_parts(value: object) -> Tuple[str, ...]:
         normalize_label(part)
         for part in re.split(r"[>＞/／]", str(value or ""))
         if normalize_label(part)
+    )
+
+
+def _jd_category_hints(fields: Mapping[str, str]) -> Tuple[str, ...]:
+    raw_value = _required_excel_value(fields, ("商品分类",), "商品分类")
+    # Flatten only after parsing the expression: ``>`` is path context and
+    # ``/`` contributes peer alternatives, never deeper path levels.
+    hints = category_input_hints(raw_value)
+    if not hints:
+        raise JdFormListingError("Excel 京东商品分类没有可用提示词")
+    return hints
+
+
+def jd_category_target(fields: Mapping[str, str]) -> Tuple[Tuple[str, ...], str]:
+    """Choose the first authored leaf; the page still proves uniqueness."""
+
+    hints = _jd_category_hints(fields)
+    target = preferred_category_leaf((fields["商品分类"],))
+    if not target:
+        raise JdFormListingError("Excel 京东商品分类无法生成搜索词")
+    return hints, target
+
+
+def _jd_category_matches(current: str, hints: Sequence[str], target: str) -> bool:
+    parts = _category_parts(current)
+    hint_text = " ".join(str(hint) for hint in hints)
+    for markers in (("男装", "男士", "男鞋"), ("女装", "女士", "女鞋")):
+        if any(marker in hint_text for marker in markers) and not any(
+            marker in part for part in parts for marker in markers
+        ):
+            return False
+    if parts[-1:] == (normalize_label(target),):
+        return True
+    # 男鞋平台类目可使用 Excel 的其它 OR 备选；保留男鞋分支约束。
+    if any("男鞋" in hint for hint in hints):
+        return bool(
+            len(parts) >= 3
+            and any(part in {"男鞋", "流行男鞋"} for part in parts[:-1])
+            and parts[-1] in {normalize_label(hint) for hint in hints}
+        )
+
+    # JD may already have a compatible leaf selected while its search API
+    # does not expose the supplier's most specific wording (for example,
+    # Excel “毛针织开衫” while the page has “男士套头毛衣/针织衫”). Keep the
+    # existing category when the gender branch matches and one of the final
+    # category segments contains an Excel category hint.
+    normalized_hints = tuple(normalize_label(hint) for hint in hints)
+    return any(
+        hint == part or hint in part or part in hint
+        for part in parts[-2:]
+        for hint in normalized_hints
     )
 
 
@@ -302,9 +566,617 @@ def classify_image_indices_by_color(
 class JdFormListing(YouzanFormListing):
     """Fill and verify JD category, attributes, SKU data and delivery time."""
 
+    attribute_platform_id = "jd"
     allow_created_exact_dom_option = True
     attribute_wait_timeout_seconds = 30.0
     attribute_stable_seconds = 0.75
+
+    def _start_api_capture(self) -> None:
+        previous_request_handler = getattr(self, "_api_request_handler", None)
+        if previous_request_handler is not None:
+            self.page.remove_listener("request", previous_request_handler)
+        previous_handler = getattr(self, "_api_response_handler", None)
+        if previous_handler is not None:
+            try:
+                self.page.remove_listener("response", previous_handler)
+            except Exception:
+                pass
+        self._api_http_failures: Dict[str, int] = {}
+        self._api_observations: List[Mapping[str, Any]] = []
+        self._api_capture_tasks: List[asyncio.Task[Any]] = []
+        self._api_request_sequence: Dict[int, int] = {}
+
+        def handle_request(request: Any) -> None:
+            if urlsplit(request.url).path == JD_PROPERTIES_ENDPOINT:
+                self._api_request_sequence[id(request)] = len(self._api_request_sequence) + 1
+
+        self._api_request_handler = handle_request
+        self.page.on("request", handle_request)
+
+        def handle_response(response: Any) -> None:
+            try:
+                path = urlsplit(response.url).path
+            except Exception:
+                return
+            if path.startswith("/jd/"):
+                status = int(response.status)
+                if status >= 400:
+                    self._api_http_failures[path] = status
+                    if self.logger is not None:
+                        self.logger.warning("京东接口请求失败：HTTP %s，路径 %s", status, path)
+                elif 200 <= status < 300:
+                    self._api_http_failures.pop(path, None)
+            if path != JD_PROPERTIES_ENDPOINT:
+                return
+            task = asyncio.create_task(self._capture_api_response(response))
+            self._api_capture_tasks.append(task)
+
+        self._api_response_handler = handle_response
+        self.page.on("response", handle_response)
+
+    async def _capture_api_response(self, response: Any) -> None:
+        observation: Dict[str, Any] = {
+            "path": JD_PROPERTIES_ENDPOINT,
+            "http_status": int(response.status),
+            "body": "unavailable",
+            "attribute_fields": (),
+            "category_id": "",
+            "request_sequence": getattr(self, "_api_request_sequence", {}).get(id(getattr(response, "request", None)), 0),
+        }
+        try:
+            payload = await response.json()
+            observation["body"] = "json"
+            observation["attribute_fields"] = parse_jd_attribute_fields(payload)
+            query = parse_qs(urlsplit(response.url).query)
+            for key in ("categoryId", "leafCategoryId", "cid"):
+                values = tuple(query.get(key, ()))
+                if len(values) == 1 and str(values[0]).strip():
+                    observation["category_id"] = str(values[0]).strip()
+                    break
+        except Exception:
+            pass
+        self._api_observations.append(observation)
+
+    async def _active_api_observation(self) -> Mapping[str, Any]:
+        tasks = tuple(getattr(self, "_api_capture_tasks", ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        observations = sorted(enumerate(getattr(self, "_api_observations", ())),
+                              key=lambda pair: (pair[1].get("request_sequence", 0), pair[0]))
+        active_category = next((str(item.get("category_id") or "")
+                                for _, item in reversed(observations) if item.get("category_id")), "")
+        for _, item in reversed(observations):
+            if str(item.get("category_id") or "") == active_category and item.get("attribute_fields"):
+                return item
+        return {"category_id": active_category, "attribute_fields": ()}
+
+    async def _captured_api_field_definition(self, page_label: str) -> FieldSchema:
+        observation = await self._active_api_observation()
+        wanted = normalize_label(page_label)
+        matches: Dict[Tuple[str, str], FieldSchema] = {}
+        for field in observation.get("attribute_fields", ()):
+            if normalize_label(field.label) == wanted:
+                matches[(str(field.source_id or ""), field.schema_key)] = field
+        if len(matches) != 1:
+            raise JdFormListingError(
+                "京东属性“{0}”缺少唯一的接口 JSON 字段定义".format(
+                    page_label
+                )
+            )
+        return next(iter(matches.values()))
+
+    async def _captured_api_field(self, page_label: str) -> Tuple[FieldSchema, str]:
+        field = await self._captured_api_field_definition(page_label)
+        category_id = str((await self._active_api_observation()).get("category_id") or "").strip()
+        if not category_id:
+            raise JdFormListingError(
+                "京东属性“{0}”缺少唯一的接口类目 ID".format(page_label)
+            )
+        return field, category_id
+
+    async def _select_numeric_material_option(
+        self,
+        select: Any,
+        desired: str,
+        *,
+        field_label: str = "材质",
+        review_unmatched: bool = True,
+    ) -> Optional[Tuple[str, ...]]:
+        """Click the live JD material option and prove its numeric platform ID."""
+        try:
+            field, category_id = await self._captured_api_field(field_label)
+        except JdFormListingError:
+            field = await self._captured_api_field_definition(field_label)
+            category_id = ""
+        desired_labels = tuple(
+            part.strip() for part in re.split(r"[/／]", desired) if part.strip()
+        )
+        numeric_options = tuple(
+            option
+            for option in field.option_values
+            if re.fullmatch(r"\d+", str(option.value_id).strip())
+        )
+        # 公共分层匹配：京东候选“氨纶(聚氨酯弹性纤维)”标注了 Excel 名“氨纶”，
+        # 同时独立候选“弹性纤维”只是别名“聚氨酯弹性纤维”的子串，必须降级，
+        # 否则双向子串会命中两个候选导致中断（多平台表单适配器可复用）。
+        matches = tuple(
+            numeric_options[index]
+            for index in match_option_candidates(
+                desired_labels, tuple(option.label for option in numeric_options)
+            )
+        )
+        if len(matches) != 1:
+            runtime = getattr(self, "attribute_runtime", None)
+            if (
+                review_unmatched
+                and runtime is not None
+                and category_id
+                and field.source_id
+            ):
+                schema_version = canonical_sha256(
+                    {
+                        "platform_id": "jd",
+                        "category_leaf_id": category_id,
+                        "field_id": str(field.source_id),
+                        "options": [
+                            {"value_id": option.value_id, "label": option.label}
+                            for option in numeric_options
+                        ],
+                    }
+                )
+                resolved = await runtime.resolve(
+                    AttributeRequest(
+                        platform_id="jd",
+                        category_leaf_id=category_id,
+                        field_id=str(field.source_id),
+                        field_label=field_label,
+                        candidates=tuple(
+                            CandidateValue(option.value_id, option.label)
+                            for option in numeric_options
+                        ),
+                        excel_value="/".join(desired_labels),
+                        evidence={
+                            "excel": bool(desired_labels),
+                            "force_review": True,
+                        },
+                        custom_allowed=False,
+                        schema_version=schema_version,
+                        control_type="select",
+                    )
+                )
+                if resolved is None or getattr(resolved, "is_no_fill", False):
+                    return None
+                matches = tuple(
+                    option
+                    for option in numeric_options
+                    if option.value_id == resolved.value_id
+                )
+                if len(matches) != 1:
+                    raise JdFormListingError(
+                        "京东属性{0}的审核结果不在当前数字候选中".format(
+                            field_label
+                        )
+                    )
+            else:
+                available = "、".join(
+                    "{0}[{1}]".format(option.label, option.value_id)
+                    for option in field.option_values
+                    if option.label
+                )
+                raise JdFormListingError(
+                    "京东属性{0}没有唯一的数字 ID 候选：期望 {1}；接口候选 {2}".format(
+                        field_label,
+                        "/".join(desired_labels) or "空",
+                        available or "无",
+                    )
+                )
+        target = matches[0]
+
+        async def selected_ids() -> Tuple[str, ...]:
+            raw_ids = await select.evaluate(
+                """element => {
+                  const component = element.__vue__;
+                  if (!component) return [];
+                  const result = [];
+                  const append = value => {
+                    if (Array.isArray(value)) {
+                      value.forEach(append);
+                      return;
+                    }
+                    if (value === undefined || value === null || value === '') return;
+                    if (typeof value === 'object') {
+                      append(value.value ?? value.id ?? value.valueId);
+                      return;
+                    }
+                    result.push(String(value));
+                  };
+                  append(component.value);
+                  append(component.selected && component.selected.value);
+                  return [...new Set(result)];
+                }"""
+            )
+            return tuple(
+                str(value).strip() for value in raw_ids if str(value).strip()
+            )
+
+        current_labels = await self._read_select_values(select, multi=False)
+        current_ids = await selected_ids()
+        if (
+            len(current_labels) == 1
+            and normalize_option(current_labels[0]) == normalize_option(target.label)
+            and any(re.fullmatch(r"\d+", value) for value in current_ids)
+        ):
+            return current_labels
+
+        # A persisted text-only value makes Element UI disable the matching
+        # live option as a duplicate. Clear that stale selection first so the
+        # real numeric option can be clicked normally.
+        if any(current_labels) or current_ids:
+            await select.hover()
+            clear_buttons = select.locator(
+                ".el-select__clear:visible, .el-icon-circle-close:visible"
+            )
+            if await clear_buttons.count() == 1:
+                await clear_buttons.first.click(force=True, timeout=2_000)
+            else:
+                cleared = await select.evaluate(
+                    """async element => {
+                      const component = element.__vue__;
+                      if (!component) return false;
+                      if (typeof component.deleteSelected === 'function') {
+                        component.deleteSelected({stopPropagation() {}});
+                      } else if (typeof component.$emit === 'function') {
+                        component.value = component.multiple ? [] : '';
+                        component.selected = component.multiple ? [] : {};
+                        component.selectedLabel = '';
+                        component.query = '';
+                        component.$emit('input', component.value);
+                        component.$emit('change', component.value);
+                        component.$emit('clear');
+                      } else {
+                        return false;
+                      }
+                      if (typeof component.$nextTick === 'function') {
+                        await new Promise(resolve => component.$nextTick(resolve));
+                      }
+                      return true;
+                    }"""
+                )
+                if not cleared:
+                    raise JdFormListingError(
+                        "京东属性{0}无法清除旧文字值".format(field_label)
+                    )
+            clear_deadline = asyncio.get_running_loop().time() + 2
+            while asyncio.get_running_loop().time() < clear_deadline:
+                if not any(await self._read_select_values(select, multi=False)):
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise JdFormListingError(
+                    "京东属性{0}旧文字值清空回读失败".format(field_label)
+                )
+
+        await self._open_select(select, multi=False)
+        await self._search_select(select, target.label)
+        deadline = asyncio.get_running_loop().time() + 5
+        dropdown = None
+        last_options: List[Mapping[str, Any]] = []
+        dom_matches: List[Mapping[str, Any]] = []
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                dropdown, options = await self._visible_dom_options(
+                    select, timeout_seconds=0.4
+                )
+            except TaobaoListingError:
+                await asyncio.sleep(0.1)
+                continue
+            last_options = options
+            dom_matches = [
+                option
+                for option in options
+                if normalize_option(option.get("name", ""))
+                == normalize_option(target.label)
+                and not option.get("created")
+                and not option.get("disabled")
+            ]
+            if dom_matches:
+                break
+            await asyncio.sleep(0.1)
+
+        if len(dom_matches) != 1 or dropdown is None:
+            available = "、".join(
+                "{0}[{1}]".format(option.get("name", ""), option.get("value", ""))
+                for option in last_options
+            )
+            raise JdFormListingError(
+                "京东属性{0}没有唯一的同名页面候选：期望 {1}；页面候选 {2}".format(
+                    field_label,
+                    target.label,
+                    available or "无",
+                )
+            )
+        option = dropdown.locator(".el-select-dropdown__item").nth(
+            int(dom_matches[0]["index"])
+        )
+        try:
+            await option.click(timeout=2_000)
+        except Exception as exc:
+            raise JdFormListingError(
+                "京东属性{0}候选点击失败：{1}[{2}]".format(
+                    field_label,
+                    target.label, target.value_id
+                )
+            ) from exc
+
+        deadline = asyncio.get_running_loop().time() + 2
+        last_labels: Tuple[str, ...] = ()
+        last_ids: Tuple[str, ...] = ()
+        while asyncio.get_running_loop().time() < deadline:
+            last_labels = await self._read_select_values(select, multi=False)
+            last_ids = await selected_ids()
+            if (
+                len(last_labels) == 1
+                and normalize_option(last_labels[0]) == normalize_option(target.label)
+                and any(re.fullmatch(r"\d+", value) for value in last_ids)
+            ):
+                await self._dismiss_select_dropdown(select)
+                if self.logger is not None:
+                    self.logger.info(
+                        "京东属性%s已按名称选择并绑定数字值：%s[%s]",
+                        field_label,
+                        target.label,
+                        "/".join(
+                            value
+                            for value in last_ids
+                            if re.fullmatch(r"\d+", value)
+                        ),
+                    )
+                return last_labels
+            await asyncio.sleep(0.05)
+        raise JdFormListingError(
+            "京东属性{0}数字值回读失败：期望名称 {1}，页面文字={2}，底层值={3}".format(
+                field_label,
+                target.label,
+                last_labels,
+                last_ids,
+            )
+        )
+
+    async def _bound_select_values(self, select: Any) -> Tuple[str, ...]:
+        """Read the Element UI select's underlying bound values."""
+        raw_ids = await select.evaluate(
+            """element => {
+              const component = element.__vue__;
+              if (!component) return [];
+              const result = [];
+              const append = value => {
+                if (Array.isArray(value)) {
+                  value.forEach(append);
+                  return;
+                }
+                if (value === undefined || value === null || value === '') return;
+                if (typeof value === 'object') {
+                  append(value.value ?? value.id ?? value.valueId);
+                  return;
+                }
+                result.push(String(value));
+              };
+              append(component.value);
+              append(component.selected && component.selected.value);
+              return [...new Set(result)];
+            }"""
+        )
+        return tuple(
+            str(value).strip() for value in raw_ids if str(value).strip()
+        )
+
+    async def _clear_non_numeric_select_value(
+        self, select: Any, page_label: str
+    ) -> None:
+        """Drop a self-typed text binding so JD publish gets a numeric valueId.
+
+        快麦把表单模型里的值原样传给京东铺货 API；历史运行直填过的自造
+        文字（created 选项）会让 API 报“属性值需是数字格式”。仅当底层
+        绑定确有非数字值时才清空，真实数字绑定与空值保持不动。
+        """
+        values = await self._bound_select_values(select)
+        if not values or all(re.fullmatch(r"\d+", value) for value in values):
+            return
+        cleared = await select.evaluate(
+            """async element => {
+              const component = element.__vue__;
+              if (!component) return false;
+              if (typeof component.deleteSelected === 'function') {
+                component.deleteSelected({stopPropagation() {}});
+              } else if (typeof component.$emit === 'function') {
+                component.value = component.multiple ? [] : '';
+                component.selected = component.multiple ? [] : {};
+                component.selectedLabel = '';
+                component.$emit('input', component.value);
+                component.$emit('change', component.value);
+                component.$emit('clear');
+              } else {
+                return false;
+              }
+              if (typeof component.$nextTick === 'function') {
+                await new Promise(resolve => component.$nextTick(resolve));
+              }
+              return true;
+            }"""
+        )
+        if not cleared:
+            raise JdFormListingError(
+                "京东属性“{0}”无法清除自造文字值".format(page_label)
+            )
+        if self.logger is not None:
+            self.logger.info(
+                "京东属性“%s”底层是自造文字值（铺货 API 要求数字 valueId），已清空待人工审核",
+                page_label,
+            )
+
+    async def _interface_field_has_options(self, page_label: str) -> bool:
+        """True when the captured JD schema defines valueId candidates."""
+        try:
+            field = await self._captured_api_field_definition(page_label)
+        except JdFormListingError:
+            return False
+        return bool(field.option_values)
+
+    async def _resolve_learning_select_value(
+        self,
+        page_label: str,
+        select: Any,
+        desired: str,
+    ) -> Optional[str]:
+        runtime = getattr(self, "attribute_runtime", None)
+        if runtime is None:
+            return desired
+        aliases = value_candidates(page_label, desired)
+        managed = is_learning_managed_field("jd", page_label)
+        try:
+            field, category_id = await self._captured_api_field(page_label)
+        except JdFormListingError as exc:
+            if self.logger is not None:
+                self.logger.info(
+                    "京东属性“%s”：接口字段未定位，改用当前 DOM 匹配/直接输入与回读：%s",
+                    page_label,
+                    exc,
+                )
+            return desired
+        if not field.source_id:
+            if self.logger is not None:
+                self.logger.info(
+                    "京东属性“%s”：接口字段 ID 为空，改用当前 DOM 匹配与回读",
+                    page_label,
+                )
+            return desired
+        multi = await select_supports_multiple(select)
+        current = tuple(
+            value
+            for value in await self._read_select_values(select, multi=multi)
+            if normalize_option(value)
+        )
+        current_equivalent = (
+            current[0]
+            if not multi
+            and len(current) == 1
+            and any(
+                normalize_option(current[0]) == normalize_option(alias)
+                for alias in aliases
+            )
+            else None
+        )
+        await self._open_select(select, multi=multi)
+        try:
+            _dropdown, options = await self._visible_dom_options(select)
+        finally:
+            try:
+                await self._dismiss_select_dropdown(select)
+            except Exception:
+                pass
+        dom_values = tuple(
+            DomCandidate(
+                str(option.get("value") or ""),
+                str(option.get("name") or ""),
+                not bool(option.get("disabled")),
+            )
+            for option in options
+        )
+        try:
+            candidates = reconcile_candidates(field.option_values, dom_values)
+        except CandidateSourceError as exc:
+            if not managed:
+                return desired
+            raise JdFormListingError(
+                "京东属性“{0}”接口候选与页面候选不一致：{1}".format(
+                    page_label, exc.reason_code
+                )
+            ) from exc
+        schema_version = canonical_sha256(
+            {
+                "platform_id": "jd",
+                "category_leaf_id": category_id,
+                "field_id": str(field.source_id),
+                "control_type": "multi_select" if multi else "select",
+                "options": [
+                    {"value_id": value.value_id, "label": value.label}
+                    for value in candidates
+                ],
+            }
+        )
+        # Every live field with a known schema can be reviewed, including
+        # fields newly introduced by another category. Preserve Excel OR order.
+        exact = (
+            None
+            if multi and re.search(r"[,，、;；]", str(desired))
+            else preferred_exact_candidate_label(
+                tuple(value.label for value in candidates),
+                aliases,
+            )
+        )
+        if current_equivalent is not None:
+            current_candidate = preferred_exact_candidate_label(
+                tuple(value.label for value in candidates),
+                (current_equivalent,),
+            )
+            if current_candidate is not None:
+                exact = current_candidate
+                if self.logger is not None:
+                    self.logger.info(
+                        "京东属性“%s”页面已是 Excel 等价候选 %s，保持当前值",
+                        page_label,
+                        current_candidate,
+                    )
+        request_candidates = tuple(
+            CandidateValue(value.value_id, value.label) for value in candidates
+        )
+        reuse = getattr(runtime, "reusable_choice", None)
+        reusable = reuse(AttributeRequest(
+            platform_id="jd", category_leaf_id=category_id,
+            field_id=str(field.source_id), field_label=page_label,
+            candidates=request_candidates, excel_value=str(desired).strip(),
+            evidence={}, custom_allowed=True, schema_version=schema_version,
+            control_type="multi_select" if multi else "select",
+        )) if callable(reuse) else None
+        if (
+            exact is None
+            and str(desired).strip()
+            and reusable is None
+            and not field.option_values
+        ):
+            # Exhaust the Excel input route before requesting human review.
+            # 京东类目属性提交铺货时必须是平台数字 valueId；接口已给出候选
+            # 列表的字段禁止直填自造文字，否则铺货 API 报
+            # “属性[...]的值需是数字格式”。直填仅保留给无候选的自由文本字段。
+            direct = re.split(r"[/／]", desired)[0].strip()
+            try:
+                actual = await self._set_select_values_directly(
+                    select, (direct,), label=page_label, multi=multi
+                )
+                if actual == (direct,):
+                    exact = direct
+                    request_candidates += (CandidateValue(direct, direct),)
+            except (YouzanFormListingError, TaobaoListingError, JdFormListingError):
+                if self.logger is not None:
+                    self.logger.info("京东属性%s直接输入未通过回读，加入审核汇总", page_label)
+        resolved = await runtime.resolve(
+            AttributeRequest(
+                platform_id="jd",
+                category_leaf_id=category_id,
+                field_id=str(field.source_id),
+                field_label=page_label,
+                candidates=request_candidates,
+                excel_value=exact if exact is not None else str(desired).strip(),
+                evidence={"excel": bool(str(desired).strip())},
+                # Operator input is permitted; the writer still verifies it.
+                custom_allowed=True,
+                schema_version=schema_version,
+                control_type="multi_select" if multi else "select",
+            )
+        )
+        if resolved is None or getattr(resolved, "is_no_fill", False):
+            return None
+        return resolved.label
 
     async def _raise_as_jd(self, awaitable: Any) -> Any:
         try:
@@ -351,6 +1223,34 @@ class JdFormListing(YouzanFormListing):
             await asyncio.sleep(0.05)
         raise JdFormListingError("打开京东属性下拉框后未找到可见选项")
 
+    async def _visible_cascader_menu_options(
+        self, menu_index: int, timeout_seconds: float = 5
+    ) -> List[Mapping[str, Any]]:
+        """读取指定可见菜单；级联重新打开后第一个菜单始终是一级目录。"""
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            menus = self.page.locator(".el-cascader-menu:visible")
+            menu_count = await menus.count()
+            if menu_index >= 0 and menu_count <= menu_index:
+                await asyncio.sleep(0.05)
+                continue
+            menu = menus.last if menu_index < 0 else menus.nth(menu_index)
+            result = await menu.evaluate(
+                """element => Array.from(element.querySelectorAll('.el-cascader-node'))
+                  .map((node, index) => ({
+                    name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
+                    index: String(index),
+                    hasChildren: Boolean(node.querySelector('.el-icon-arrow-right')),
+                    isActive: node.classList.contains('is-active'),
+                    disabled: node.classList.contains('is-disabled')
+                  }))
+                  .filter(item => item.name.trim() && !item.disabled)"""
+            )
+            if result:
+                return result
+            await asyncio.sleep(0.05)
+        raise JdFormListingError("打开京东属性下拉框后未找到指定级联菜单选项")
+
     @staticmethod
     def _match_cascader_option(
         options: Sequence[Mapping[str, Any]], candidates: Sequence[str]
@@ -365,6 +1265,43 @@ class JdFormListing(YouzanFormListing):
                 return matches[0]
         return None
 
+    async def _click_cascader_node_stably(self, node: Any, *, timeout: float = 3) -> None:
+        """等待级联节点完成 Vue 过渡后再点击。"""
+        deadline = asyncio.get_running_loop().time() + timeout
+        previous_box = None
+        stable_checks = 0
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                visible = await node.is_visible()
+                box = await node.bounding_box() if visible else None
+            except Exception:
+                box = None
+            if box is not None:
+                # 京东菜单带有 Vue 过渡，节点可能在整个过渡期间都无法
+                # 通过 Playwright 的 actionability 稳定检查。节点已可见时
+                # 直接触发原生 click，交给页面自己的事件处理器完成重绘。
+                try:
+                    await node.evaluate("element => element.click()")
+                    return
+                except Exception:
+                    pass
+                normalized_box = tuple(
+                    round(float(value), 2) for value in box.values()
+                )
+                if normalized_box == previous_box:
+                    stable_checks += 1
+                else:
+                    previous_box = normalized_box
+                    stable_checks = 0
+                if stable_checks >= 2:
+                    try:
+                        await node.click(timeout=500)
+                        return
+                    except Exception:
+                        stable_checks = 0
+            await asyncio.sleep(0.05)
+        raise JdFormListingError("京东级联菜单节点在重绘后未稳定，无法点击")
+
     async def _click_cascader_option(self, option: Mapping[str, Any]) -> None:
         menus = self.page.locator(".el-cascader-menu:visible")
         if await menus.count() == 0:
@@ -372,7 +1309,7 @@ class JdFormListing(YouzanFormListing):
         last_menu = menus.last
         before_menus = await menus.count()
         nodes = last_menu.locator(".el-cascader-node")
-        await nodes.nth(int(option["index"])).click(timeout=2000)
+        await self._click_cascader_node_stably(nodes.nth(int(option["index"])))
         if not option.get("hasChildren"):
             return
         deadline = asyncio.get_running_loop().time() + 3
@@ -380,6 +1317,267 @@ class JdFormListing(YouzanFormListing):
             if await self.page.locator(".el-cascader-menu:visible").count() > before_menus:
                 return
             await asyncio.sleep(0.05)
+
+    async def _select_cascader_path(
+        self,
+        cascader: Any,
+        path: Sequence[str],
+        label: str,
+    ) -> Tuple[str, ...]:
+        """Select one previously enumerated cascader path by its labels."""
+        chosen_path = tuple(str(value).strip() for value in path if str(value).strip())
+        if not chosen_path:
+            raise JdFormListingError("京东属性{0}审核结果没有有效级联路径".format(label))
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await self._open_cascader(cascader)
+        for depth, expected in enumerate(chosen_path):
+            options = await self._visible_cascader_menu_options(0 if depth == 0 else -1)
+            chosen = self._match_cascader_option(options, (expected,))
+            if chosen is None:
+                raise JdFormListingError(
+                    f"京东属性{label}审核路径回选失败：{' > '.join(chosen_path)}"
+                )
+            menus = self.page.locator(".el-cascader-menu:visible")
+            menu = menus.first if depth == 0 else menus.last
+            await self._click_cascader_node_stably(
+                menu.locator(".el-cascader-node").nth(int(chosen["index"]))
+            )
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return chosen_path
+
+    async def _review_unmatched_cascader_leaves(
+        self,
+        cascader: Any,
+        paths: Sequence[Tuple[str, ...]],
+        expected: str,
+        label: str,
+    ) -> Optional[Tuple[str, ...]]:
+        """Send every discovered leaf path to review when Excel misses it.
+
+        JD's style control is a cascader, so a missing Excel leaf cannot be
+        represented by the ordinary select resolver.  Keep the complete path
+        in the review label (including its parent) and use a stable DOM ID;
+        this lets the operator choose a duplicate leaf unambiguously and lets
+        the confirmed result be clicked back through the real cascader.
+        """
+        runtime = getattr(self, "attribute_runtime", None)
+        if runtime is None:
+            return None
+        unique_paths = tuple(dict.fromkeys(
+            tuple(str(value).strip() for value in path if str(value).strip())
+            for path in paths
+            if any(str(value).strip() for value in path)
+        ))
+        if not unique_paths:
+            return None
+        try:
+            _field, category_id = await self._captured_api_field(label)
+        except JdFormListingError:
+            category_id = "dom:" + canonical_sha256(
+                {"platform_id": "jd", "field_label": label, "paths": unique_paths}
+            )[:20]
+            field_id = "dom:" + normalize_label(label)
+        else:
+            field_id = str(_field.source_id or "").strip() or (
+                "dom:" + normalize_label(label)
+            )
+        candidates = tuple(
+            CandidateValue(
+                "dom:" + canonical_sha256(
+                    {"platform_id": "jd", "field_label": label, "path": path}
+                )[:20],
+                " > ".join(path),
+            )
+            for path in unique_paths
+        )
+        schema_version = canonical_sha256({
+            "platform_id": "jd",
+            "category_leaf_id": category_id,
+            "field_id": field_id,
+            "options": [
+                {"value_id": value.value_id, "label": value.label}
+                for value in candidates
+            ],
+        })
+        self._last_cascader_review_submitted = True
+        resolved = await runtime.resolve(
+            AttributeRequest(
+                platform_id="jd",
+                category_leaf_id=category_id,
+                field_id=field_id,
+                field_label=label,
+                candidates=candidates,
+                excel_value=str(expected).strip(),
+                evidence={
+                    "excel": bool(str(expected).strip()),
+                    "live_dom": True,
+                    "cascader": True,
+                    "force_review": True,
+                },
+                custom_allowed=False,
+                schema_version=schema_version,
+                control_type="select",
+            )
+        )
+        if resolved is None or getattr(resolved, "is_no_fill", False):
+            return None
+        matches = tuple(
+            path
+            for path, candidate in zip(unique_paths, candidates)
+            if str(resolved.value_id) == candidate.value_id
+            or normalize_option(str(resolved.label))
+            == normalize_option(candidate.label)
+        )
+        if len(matches) != 1:
+            raise JdFormListingError(
+                "京东属性{0}审核结果不在当前末级候选中：{1}".format(
+                    label, getattr(resolved, "label", "")
+                )
+            )
+        return await self._select_cascader_path(cascader, matches[0], label)
+
+    async def _select_cascader_from_all_menus(
+        self,
+        cascader: Any,
+        candidates: Sequence[str],
+        label: str,
+    ) -> Optional[Tuple[str, ...]]:
+        """展开级联控件的完整一、二级菜单后按叶子精确筛选。
+
+        京东风格等字段的 Excel 值通常只有二级叶子（例如“街头风”），
+        而首屏只展示父菜单（例如“潮流风”）。只读取当前菜单会误报
+        “没有候选”；这里先列出所有父子路径，再重新打开并点击命中的
+        完整路径。
+        """
+        await self._open_cascader(cascader)
+        # 京东会在点击输入框后异步挂载菜单；不能用一次性的 count()
+        # 判断，否则首轮返回 0 就会错误回退到旧的单路径逻辑。
+        try:
+            await self._visible_cascader_options(cascader, timeout_seconds=5)
+        except JdFormListingError:
+            return None
+        menus = self.page.locator(".el-cascader-menu:visible")
+        if await menus.count() == 0:
+            return None
+        root_menu = menus.first
+        # Element UI renders nodes inside a <ul> in production, while some
+        # compatible builds place them directly under the menu.  Use the same
+        # descendant selector for both shapes; the old direct-child selector
+        # silently produced no paths and fell back to the incomplete menu walk.
+        roots = await root_menu.evaluate(
+            """element => Array.from(element.querySelectorAll('.el-cascader-node'))
+              .map((node, index) => ({
+                name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
+                index: String(index),
+                hasChildren: Boolean(node.querySelector('.el-icon-arrow-right')),
+                disabled: node.classList.contains('is-disabled')
+              }))
+              .filter(item => item.name.trim() && !item.disabled)"""
+        )
+        paths: List[Tuple[str, ...]] = []
+        for root_index, root in enumerate(roots):
+            # 选择一个父项后京东会重建/虚拟化一级菜单；每个候选都重新
+            # 打开并按文本定位，避免复用上一轮的旧节点或初始索引。
+            if root_index:
+                try:
+                    await self.page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                deadline = asyncio.get_running_loop().time() + 2
+                while asyncio.get_running_loop().time() < deadline:
+                    if await self.page.locator(".el-cascader-menu:visible").count() == 0:
+                        break
+                    await asyncio.sleep(0.05)
+                await self._open_cascader(cascader)
+            # 重新打开后若控件保留上次活动路径，最后一个可见菜单可能是
+            # 旧的二级菜单；一级目录必须固定从第一个菜单读取。
+            options = await self._visible_cascader_menu_options(0)
+            chosen_root = self._match_cascader_option(
+                options, (str(root["name"]).strip(),)
+            )
+            if chosen_root is None:
+                raise JdFormListingError(
+                    f"京东级联一级菜单重绘后找不到“{root['name']}”"
+                )
+            root_menu = self.page.locator(".el-cascader-menu:visible").first
+            await self._click_cascader_node_stably(
+                root_menu.locator(".el-cascader-node").nth(int(chosen_root["index"]))
+            )
+            if not root.get("hasChildren"):
+                paths.append((str(root["name"]).strip(),))
+                continue
+            deadline = asyncio.get_running_loop().time() + 3
+            while asyncio.get_running_loop().time() < deadline:
+                menus = self.page.locator(".el-cascader-menu:visible")
+                if await menus.count() >= 2:
+                    break
+                await asyncio.sleep(0.05)
+            menus = self.page.locator(".el-cascader-menu:visible")
+            if await menus.count() < 2:
+                continue
+            child_menu = menus.last
+            children = await child_menu.evaluate(
+                """element => Array.from(element.querySelectorAll('.el-cascader-node'))
+                  .map(node => ({
+                    name: (node.querySelector('.el-cascader-node__label') || {}).textContent || '',
+                    hasChildren: Boolean(node.querySelector('.el-icon-arrow-right')),
+                    disabled: node.classList.contains('is-disabled')
+                  }))
+                  .filter(item => item.name.trim() && !item.disabled)"""
+            )
+            paths.extend(
+                (str(root["name"]).strip(), str(child["name"]).strip())
+                for child in children
+            )
+
+        wanted = {normalize_option(value) for value in candidates if str(value).strip()}
+        chosen_path = next(
+            (path for path in paths if normalize_option(path[-1]) in wanted),
+            None,
+        )
+        self._last_cascader_paths = tuple(dict.fromkeys(paths))
+        if chosen_path is None:
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return None
+
+        # 重新打开后按刚才列出的完整路径提交，避免依赖当前活动父菜单。
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await self._open_cascader(cascader)
+        for depth, expected in enumerate(chosen_path):
+            options = await self._visible_cascader_menu_options(0 if depth == 0 else -1)
+            chosen = self._match_cascader_option(options, (expected,))
+            if chosen is None:
+                raise JdFormListingError(
+                    f"京东属性{label}完整菜单回选失败：{' > '.join(chosen_path)}"
+                )
+            menu = self.page.locator(".el-cascader-menu:visible")
+            menu = menu.first if depth == 0 else menu.last
+            await self._click_cascader_node_stably(
+                menu.locator(".el-cascader-node").nth(int(chosen["index"]))
+            )
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        if self.logger is not None:
+            self.logger.info(
+                "京东属性%s已展开完整一二级菜单并选中：%s",
+                label,
+                " > ".join(chosen_path),
+            )
+        return chosen_path
 
     async def _select_cascader_values(
         self,
@@ -394,6 +1592,45 @@ class JdFormListing(YouzanFormListing):
         if not groups:
             return None
         await cascader.scroll_into_view_if_needed()
+        self._last_cascader_paths = ()
+        self._last_cascader_review_submitted = False
+        flattened_candidates = tuple(
+            candidate
+            for group in groups
+            for candidate in _expand_cascader_candidates(label, group)
+        )
+        expanded_path = await self._select_cascader_from_all_menus(
+            cascader,
+            flattened_candidates,
+            label,
+        )
+        if expanded_path is not None:
+            return expanded_path
+        # 风格是平台级联字段。若 Excel 的最后一级名称不在当前完整菜单
+        # 中，保留所有末级路径交给审核，避免把“没有精确候选”直接升级成
+        # 页面错误；审核确认后再按真实父子菜单路径回选。
+        if normalize_label(label) == normalize_label("风格"):
+            reviewed_path = await self._review_unmatched_cascader_leaves(
+                cascader,
+                getattr(self, "_last_cascader_paths", ()),
+                "/".join(
+                    str(value).strip()
+                    for group in groups
+                    for value in group
+                    if str(value).strip()
+                ),
+                label,
+            )
+            if reviewed_path is not None:
+                if self.logger is not None:
+                    self.logger.info(
+                        "京东属性%s审核确认末级候选并回选：%s",
+                        label,
+                        " > ".join(reviewed_path),
+                    )
+                return reviewed_path
+            if getattr(self, "attribute_runtime", None) is not None:
+                return None
         await self._open_cascader(cascader)
         chosen_values: List[str] = []
         leftover: Tuple[str, ...] = ()
@@ -451,6 +1688,7 @@ class JdFormListing(YouzanFormListing):
         return tuple(chosen_values)
 
     async def open(self) -> "JdFormListing":
+        self._start_api_capture()
         tab = self.drawer.get_by_role("tab", name="京东资料", exact=True)
         try:
             await tab.wait_for(state="visible", timeout=30_000)
@@ -581,14 +1819,25 @@ class JdFormListing(YouzanFormListing):
         inside = await from_root(dialog)
         return inside or await from_root(self.page)
 
-    async def apply_category(self) -> Mapping[str, Any]:
-        target = JD_CATEGORY_PATH[-1]
+    async def apply_category(self, fields: Mapping[str, str]) -> Mapping[str, Any]:
+        category_hints, target = jd_category_target(fields)
+        self.category_hints = tuple(category_hints)
         try:
             current = await self._category_text()
         except JdFormListingError:
             current = ""
-        if _category_parts(current)[-1:] == (normalize_label(target),):
-            return {"path": JD_CATEGORY_PATH, "selected": current, "changed": False}
+        if _jd_category_matches(current, category_hints, target):
+            if self.logger is not None:
+                self.logger.info(
+                    "京东已有类目与 Excel 类目兼容，保留当前类目：%s",
+                    current,
+                )
+            return {
+                "hints": category_hints,
+                "target": target,
+                "selected": current,
+                "changed": False,
+            }
         if self.panel is None:
             raise JdFormListingError("请先打开京东资料")
         modify = self.panel.get_by_role("button", name="修改类目", exact=True)
@@ -607,51 +1856,81 @@ class JdFormListing(YouzanFormListing):
                 raise JdFormListingError("京东修改类目弹窗缺少唯一搜索框")
             search = inputs.first
 
+        observed_paths: Dict[str, str] = {}
+        reviewed_path = ""
         api_matches: List[str] = []
         api_candidates: List[Mapping[str, Any]] = []
-        tasks: List[asyncio.Task[Any]] = []
-
-        async def capture(response: Any) -> None:
-            try:
-                headers = await response.all_headers()
-                if "json" not in str(headers.get("content-type") or "").casefold():
-                    return
-                payload = await response.json()
-                nodes = self._json_category_nodes(payload, target)
-                if nodes:
-                    path = urlsplit(response.url).path
-                    if path not in api_matches:
-                        api_matches.append(path)
-                    for node in nodes:
-                        record = {"response_path": path, **dict(node)}
-                        if record not in api_candidates:
-                            api_candidates.append(record)
-            except Exception:
-                return
-
-        def handler(response: Any) -> None:
-            tasks.append(asyncio.create_task(capture(response)))
-
-        self.page.on("response", handler)
-        await search.fill(target)
-        deadline = asyncio.get_running_loop().time() + 30
         candidates: List[Any] = []
-        stable_since: Optional[float] = None
-        try:
-            while asyncio.get_running_loop().time() < deadline:
-                candidates = await self._category_dom_candidates(dialog, target)
-                if api_matches and len(candidates) == 1:
-                    if stable_since is None:
-                        stable_since = asyncio.get_running_loop().time()
-                    elif asyncio.get_running_loop().time() - stable_since >= 1.0:
+        async with CategorySearchCapture(self.page, category_response_paths) as capture:
+            for target in category_search_terms((fields["商品分类"],)):
+                capture.start(target)
+                api_matches.clear()
+                api_candidates.clear()
+                candidates = []
+                await search.fill(target)
+                if self.logger is not None:
+                    self.logger.info("京东类目按 Excel 顺序搜索：%s", target)
+                deadline = asyncio.get_running_loop().time() + 30
+                stable_since: Optional[float] = None
+                while asyncio.get_running_loop().time() < deadline:
+                    if capture.error:
+                        raise JdFormListingError("京东类目搜索接口失败：" + capture.error)
+                    for observed_path in capture.paths:
+                        observed_paths.setdefault(observed_path, target)
+                    if capture.received and not any(
+                        normalize_label(target) == normalize_label(path.split(" > ")[-1])
+                        for path in capture.paths
+                    ):
                         break
-                else:
-                    stable_since = None
-                await asyncio.sleep(0.1)
-        finally:
-            self.page.remove_listener("response", handler)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                    for response_url, payload in capture.payloads:
+                        nodes = self._json_category_nodes(payload, target)
+                        # Some responses carry only categoryNameList rather
+                        # than scalar name nodes. The exact leaf is evidence.
+                        if nodes or capture.paths:
+                            path = urlsplit(response_url).path
+                            if path not in api_matches:
+                                api_matches.append(path)
+                            for node in nodes:
+                                record = {"response_path": path, **dict(node)}
+                                if record not in api_candidates:
+                                    api_candidates.append(record)
+                    candidates = await self._category_dom_candidates(dialog, target)
+                    if api_matches and len(candidates) == 1:
+                        if stable_since is None:
+                            stable_since = asyncio.get_running_loop().time()
+                        elif asyncio.get_running_loop().time() - stable_since >= 1.0:
+                            break
+                    else:
+                        stable_since = None
+                    await asyncio.sleep(0.1)
+                if api_matches and len(candidates) == 1:
+                    break
+                if not capture.received:
+                    raise JdFormListingError("京东类目搜索接口在 30 秒内未响应：" + target)
+                if capture.paths and any(
+                    normalize_label(target) == normalize_label(path.split(" > ")[-1])
+                    for path in capture.paths
+                ):
+                    if len(candidates) > 1:
+                        break  # Real competing paths go through model/review below.
+                    raise JdFormListingError("京东类目 JSON 已定位，但 DOM 未出现：" + target)
+        if (not api_matches or len(candidates) != 1) and observed_paths:
+            reviewed_path = await self._resolve_category_review(
+                tuple(observed_paths), source="jd_category_search_unmatched",
+                evidence={"api_category_search": True, "terminal_required": True},
+                excel_value=fields["商品分类"],
+            )
+            if reviewed_path:
+                await search.fill(observed_paths[reviewed_path])
+                deadline = asyncio.get_running_loop().time() + 10
+                while asyncio.get_running_loop().time() < deadline:
+                    candidates = [node for text, node in await self._visible_category_result_nodes()
+                                  if self._normalize_category_path(text) == self._normalize_category_path(reviewed_path)]
+                    if len(candidates) == 1:
+                        break
+                    await asyncio.sleep(.1)
+                api_matches = ["/category/base/queryCategoryList"]
+                target = reviewed_path.split(" > ")[-1]
         if not api_matches or len(candidates) != 1:
             raise JdFormListingError(
                 "京东类目接口与 DOM 交叉校验失败：接口 {0}，DOM {1}".format(
@@ -710,7 +1989,9 @@ class JdFormListing(YouzanFormListing):
         for attempt in range(5):
             # 等待 DOM 稳定
             await asyncio.sleep(0.3)
-            live_candidates = await self._category_dom_candidates(dialog, target)
+            live_candidates = ([node for text, node in await self._visible_category_result_nodes()
+                                if self._normalize_category_path(text) == self._normalize_category_path(reviewed_path)]
+                               if reviewed_path else await self._category_dom_candidates(dialog, target))
             if len(live_candidates) == 0:
                 if self.logger is not None:
                     self.logger.warning(
@@ -763,6 +2044,10 @@ class JdFormListing(YouzanFormListing):
                 if not invoked:
                     await row.focus()
                     await row.press("Enter")
+            if reviewed_path:
+                await self._complete_category_leaf(dialog, reviewed_path)
+                selected = True
+                break
             selected_deadline = asyncio.get_running_loop().time() + 5
             while asyncio.get_running_loop().time() < selected_deadline:
                 state = await selection_state()
@@ -777,6 +2062,12 @@ class JdFormListing(YouzanFormListing):
             await asyncio.sleep(0.5)
         if not selected:
             raise JdFormListingError("京东类目 DOM 点击后未同时出现勾选与已选路径")
+        lines = (await dialog.inner_text()).splitlines()
+        paths = [re.split(r"[：:]", line.strip(), maxsplit=1)[-1].strip()
+                 for line in lines if re.match(r"^已选\s*[：:]", line.strip())]
+        if not paths:
+            raise JdFormListingError("京东类目缺少完整已选路径，禁止确认")
+        selected_path = await self._validate_category_leaf(dialog, paths[-1])
         confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
         if await confirm.count() != 1:
             raise JdFormListingError("京东修改类目弹窗确定按钮不是唯一项")
@@ -784,7 +2075,7 @@ class JdFormListing(YouzanFormListing):
         await dialog.wait_for(state="hidden", timeout=20_000)
         await self._raise_as_jd(super()._wait_for_loading_masks())
         actual = await self._category_text()
-        if _category_parts(actual)[-1:] != (normalize_label(target),):
+        if self._normalize_category_path(actual) != self._normalize_category_path(selected_path):
             raise JdFormListingError(
                 "京东类目确认后回读失败：页面为 {0!r}".format(actual)
             )
@@ -795,7 +2086,8 @@ class JdFormListing(YouzanFormListing):
                 actual,
             )
         return {
-            "path": JD_CATEGORY_PATH,
+            "hints": category_hints,
+            "target": target,
             "selected": actual,
             "changed": True,
             "api_paths": tuple(api_matches),
@@ -889,32 +2181,74 @@ class JdFormListing(YouzanFormListing):
             raise JdFormListingError("京东字段{0}回读失败：{1!r}".format(label, actual))
         return actual
 
+    async def _read_input_item(self, label: str, *, numeric: bool = False) -> str:
+        """Read a saved value without changing the form."""
+        item = await self._form_item_exact(label)
+        inputs = await self._editable_inputs(item)
+        if len(inputs) != 1:
+            raise JdFormListingError("京东字段{0}输入框不是唯一项：{1}".format(label, len(inputs)))
+        value = (await inputs[0].input_value()).strip()
+        if not value:
+            raise JdFormListingError("京东保存后字段{0}为空".format(label))
+        return value
+
+    async def _read_delivery_template(self) -> str:
+        item = await self._form_item_exact("发货时效")
+        values = await self._read_persisted_attribute_item("发货时效", item)
+        if len(values) != 1 or normalize_option(values[0]) != normalize_option(JD_DELIVERY_TEMPLATE):
+            raise JdFormListingError("京东保存后发货时效不一致：{0}".format(values))
+        return values[0]
+
+    async def _select_exact_brand(self, brand_item: Any) -> Tuple[str, Tuple[str, ...]]:
+        """Select JD's fixed brand from the current visible dropdown.
+
+        JD's brand control can leave a stale value visible while a category
+        change is still rendering.  Its option click also must be bounded: a
+        generic in-page ``element.click()`` has been observed to wait forever
+        on the live form.  Use Playwright's actionable click with a hard timeout
+        and verify the control value immediately afterwards.
+        """
+        select = brand_item.locator(".el-select").first
+        if not await select.count():
+            raise JdFormListingError("京东品牌缺少下拉选择器")
+        await self._open_select(select, multi=False)
+        dropdown, options = await self._visible_dom_options(select)
+        matches = [
+            option
+            for option in options
+            if normalize_option(option.get("name", "")) == normalize_option(JD_BRAND)
+        ]
+        if len(matches) != 1:
+            raise JdFormListingError(
+                "京东品牌候选 NEIGBORL 不是唯一项：{0}".format(len(matches))
+            )
+        option = dropdown.locator(".el-select-dropdown__item").nth(
+            int(matches[0]["index"])
+        )
+        try:
+            await asyncio.wait_for(option.click(timeout=2_000), timeout=3.0)
+        except Exception as exc:
+            raise JdFormListingError("京东品牌候选 NEIGBORL 点击超时") from exc
+        brand, values = await self._read_brand_value(brand_item)
+        if normalize_option(brand) != normalize_option(JD_BRAND):
+            raise JdFormListingError(
+                "京东品牌选择后回读失败：{0!r}".format(values)
+            )
+        return brand, values
+
     async def fill_identity_and_parameters(
         self, fields: Mapping[str, str], *, style_code: str
     ) -> Mapping[str, str]:
         brand_item = await self._form_item_exact("品牌")
         brand, brand_values = await self._read_brand_value(brand_item)
         if not brand:
-            # 首先尝试使用下拉框选择品牌
-            select = brand_item.locator(".el-select").first
-            if await select.count():
+            if self.logger is not None:
+                self.logger.info('京东品牌使用可见候选精确选择：%s', JD_BRAND)
+            try:
+                brand, brand_values = await self._select_exact_brand(brand_item)
+            except JdFormListingError as exc:
                 if self.logger is not None:
-                    self.logger.info('京东品牌使用下拉框选择：%s', JD_BRAND)
-                try:
-                    actual = await self._raise_as_jd(
-                        self._select_values(
-                            select,
-                            ((JD_BRAND,),),
-                            label="品牌",
-                            multi=False,
-                        )
-                    )
-                    if actual:
-                        brand = actual[0]
-                        brand_values = actual
-                except Exception as e:
-                    if self.logger is not None:
-                        self.logger.warning('京东品牌下拉选择失败：%s', e)
+                    self.logger.warning('京东品牌下拉选择失败：%s', exc)
 
             # 如果下拉选择失败，尝试手动填写
             if not brand:
@@ -960,17 +2294,16 @@ class JdFormListing(YouzanFormListing):
             )
 
         origin = _required_excel_value(fields, ("产地",), "产地")
-        weight_source = _required_excel_value(fields, ("克重", "商品毛重"), "商品毛重")
-        gross_weight = _kilograms(weight_source)
         result = {
             "品牌": brand,
             "货号": await self._fill_input_item("货号", style_code),
             "商品毛重(公斤)": await self._fill_input_item(
-                "商品毛重(公斤)", gross_weight, numeric=True
+                "商品毛重(公斤)", JD_GROSS_WEIGHT, numeric=True
             ),
         }
         # 京东页中"商品参数"和"商品属性"各有一个产地；
-        # 这里明确取上方商品参数项，属性项由后续映射统一填写。
+        # 这里明确取上方商品参数项；下方商品属性中的产地由
+        # fill_attributes 主动保持为空，不复用 Excel 产地。
         origin_item = await self._form_item_exact("产地", occurrence=1)
         actual = await self._raise_as_jd(
             self._fill_attribute("产地", origin_item, origin, required=True)
@@ -1005,24 +2338,64 @@ class JdFormListing(YouzanFormListing):
     async def _collect_attribute_items(self) -> Dict[str, Tuple[str, Any]]:
         if self.panel is None:
             raise JdFormListingError("请先打开京东资料")
-        top, end = await self._attribute_bounds()
         result: Dict[str, Tuple[str, Any]] = {}
         counts: Dict[str, int] = {}
         items = self.panel.locator(".el-form-item")
-        for index in range(await items.count()):
+        # JD can render dozens of form items.  Reading visibility, bounds and
+        # labels with separate Playwright calls made one scan cost several
+        # seconds.  Collect the same metadata in one browser-side pass, then
+        # keep using locators for the actual writes and readbacks.
+        metadata = await self.panel.evaluate(
+            """panel => {
+                const visible = node => {
+                    if (!(node instanceof Element)) return false;
+                    const style = window.getComputedStyle(node);
+                    if (style.display === 'none' || style.visibility === 'hidden' ||
+                        style.visibility === 'collapse') return false;
+                    const rect = node.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const normalized = value => String(value || '')
+                    .replace(/\s+/g, '')
+                    .replace(/[\uff1a:]$/, '');
+                const sectionNames = new Set([
+                    '\u5546\u54c1\u5c5e\u6027', '\u9500\u552e\u5c5e\u6027', '\u5546\u54c1\u89c4\u683c', '\u89c4\u683c\u660e\u7ec6',
+                    '\u5546\u54c1\u56fe\u7247', '\u7269\u6d41\u4fe1\u606f', '\u552e\u540e\u670d\u52a1'
+                ]);
+                let top = null;
+                let end = null;
+                for (const node of panel.querySelectorAll('*')) {
+                    if (!visible(node)) continue;
+                    const name = normalized(node.innerText);
+                    if (!sectionNames.has(name)) continue;
+                    const y = node.getBoundingClientRect().y;
+                    if (name === '\u5546\u54c1\u5c5e\u6027') {
+                        top = y;
+                        end = null;
+                    } else if (top !== null && y > top) {
+                        end = end === null ? y : Math.min(end, y);
+                    }
+                }
+                const rows = [];
+                const formItems = Array.from(panel.querySelectorAll('.el-form-item'));
+                formItems.forEach((item, index) => {
+                    if (!visible(item)) return;
+                    const y = item.getBoundingClientRect().y;
+                    if (top !== null && y <= top) return;
+                    if (end !== null && y >= end) return;
+                    const label = Array.from(item.children).find(
+                        child => child.classList.contains('el-form-item__label') && visible(child)
+                    );
+                    if (!label) return;
+                    rows.push({index, label: String(label.innerText || '').trim()});
+                });
+                return rows;
+            }"""
+        )
+        for entry in metadata:
+            index = int(entry["index"])
             item = items.nth(index)
-            if not await item.is_visible():
-                continue
-            box = await item.bounding_box()
-            if box is not None:
-                if top is not None and box["y"] <= top:
-                    continue
-                if end is not None and box["y"] >= end:
-                    continue
-            label_node = item.locator(":scope > .el-form-item__label").first
-            if not await label_node.count() or not await label_node.is_visible():
-                continue
-            label = re.sub(r"^\s*\*\s*", "", (await label_node.inner_text()).strip())
+            label = re.sub(r"^\s*\*\s*", "", str(entry.get("label", "")).strip())
             normalized = normalize_label(label)
             if not normalized:
                 continue
@@ -1058,10 +2431,16 @@ class JdFormListing(YouzanFormListing):
         page_items: Mapping[str, Tuple[str, Any]],
     ) -> Dict[str, Tuple[str, str]]:
         sources: Dict[str, List[Tuple[str, str]]] = {}
+        page_items = without_color_attributes(page_items)
         for excel_key, raw_value in fields.items():
             excel_names = set(excel_aliases(excel_key))
             for page_key, (page_label, _item) in page_items.items():
                 base = page_key.split("#", 1)[0]
+                if (
+                    base in JD_CLEARED_ATTRIBUTE_LABELS
+                    or base in JD_IGNORED_ATTRIBUTE_LABELS
+                ):
+                    continue
                 accepted = {base}
                 accepted.update(JD_FIELD_ALIASES.get(base, ()))
                 if excel_names.intersection(accepted):
@@ -1078,8 +2457,47 @@ class JdFormListing(YouzanFormListing):
                         page_label, "、".join(key for key, _value in matches)
                     )
                 )
-            assignments[page_key] = (page_label, matches[0][1])
+            source_key, source_value = matches[0]
+            paired = positional_listing_date_value(page_label, source_key, source_value)
+            assignments[page_key] = (
+                page_label, paired if paired is not None else source_value
+            )
         return assignments
+
+    @staticmethod
+    async def _clear_attribute_item(page_label: str, item: Any) -> str:
+        inputs = item.locator(
+            'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):visible'
+        )
+        if await inputs.count() != 1:
+            raise JdFormListingError(
+                "京东属性{0}清空控件不是唯一项：{1}".format(
+                    page_label, await inputs.count()
+                )
+            )
+        input_box = inputs.first
+        if not (await input_box.input_value()).strip():
+            return ""
+        if await input_box.get_attribute("readonly") is None:
+            await input_box.click()
+            await input_box.fill("")
+            await input_box.press("Tab")
+        else:
+            clear_buttons = item.locator(
+                ".el-select__clear:visible, .el-icon-circle-close:visible, "
+                ".el-cascader__clearIcon:visible"
+            )
+            if await clear_buttons.count() != 1:
+                raise JdFormListingError(
+                    "京东属性{0}已有值但没有唯一清空入口".format(page_label)
+                )
+            await clear_buttons.first.click(force=True, timeout=2_000)
+        deadline = asyncio.get_running_loop().time() + 2
+        while asyncio.get_running_loop().time() < deadline:
+            if not (await input_box.input_value()).strip():
+                return ""
+            await asyncio.sleep(0.05)
+        raise JdFormListingError("京东属性{0}清空后回读失败".format(page_label))
 
     @staticmethod
     async def _is_required(item: Any) -> bool:
@@ -1105,10 +2523,56 @@ class JdFormListing(YouzanFormListing):
                 label=page_label,
             )
             if actual is None:
-                if required:
+                runtime = getattr(self, "attribute_runtime", None)
+                review_pending = bool(
+                    getattr(self, "_last_cascader_review_submitted", False)
+                    or (
+                        runtime is not None
+                        and (
+                            getattr(runtime, "has_deferred_reviews", False)
+                            or (
+                                callable(getattr(runtime, "review_pending_or_omitted", None))
+                                and runtime.review_pending_or_omitted(
+                                    self.attribute_platform_id, page_label
+                                )
+                            )
+                        )
+                    )
+                )
+                if required and not review_pending:
                     raise JdFormListingError("京东属性{0}没有 Excel 精确候选".format(page_label))
                 return None
             return actual
+
+        if normalized == normalize_label("材质"):
+            components = _jd_material_components(expected)
+            if components:
+                actual = await self._fill_material_components(item, components)
+                if actual is None and self.logger is not None:
+                    self.logger.info(
+                        "京东属性“材质”没有唯一数字候选，已加入本平台待审核汇总"
+                    )
+                return actual
+
+        if normalized == normalize_label("面料"):
+            selects = item.locator(":scope > .el-form-item__content .el-select:visible")
+            if await selects.count() != 1:
+                raise JdFormListingError("京东属性面料下拉框不是唯一项")
+            select = selects.first
+            fabric_names = tuple(
+                "/".join(group) for group in material_name_groups(expected)
+            )
+            if not fabric_names:
+                fabric_names = (str(expected).strip(),)
+
+            # JD is a numeric single-select. Do not invoke Taobao's
+            # multi-material -> free text -> Other fallback: missing schema
+            # is an adapter error, not evidence that Other is appropriate.
+            desired = (_material_option_desired(fabric_names[0]) if len(fabric_names) == 1
+                       else "，".join(fabric_names))
+            return await self._select_numeric_material_option(
+                select, desired, field_label=page_label, review_unmatched=True,
+            )
 
         selects = item.locator(":scope > .el-form-item__content .el-select:visible")
         inputs = await self._editable_inputs(item)
@@ -1126,30 +2590,140 @@ class JdFormListing(YouzanFormListing):
                     if await selects.count() and inputs:
                         break
                     await asyncio.sleep(0.1)
+        if normalized == normalize_label("材质"):
+            # 京东材质是“多行材质 + 含量”组件，不是一个多选下拉。
+            # 按 Excel 中的每个成分逐行添加，确保棉94%、氨纶6%都落到页面。
+            components = parse_material_components(expected)
+            if len(components) > 1:
+                add = item.get_by_role("button", name="添加", exact=True)
+                while await selects.count() < len(components):
+                    if await add.count() != 1:
+                        raise JdFormListingError("京东材质缺少唯一“添加”按钮")
+                    await add.click(force=True, timeout=5_000)
+                    await asyncio.sleep(0.2)
+                    selects = item.locator(":scope > .el-form-item__content .el-select:visible")
+                inputs = await self._editable_inputs(item)
+                if len(inputs) < len(components):
+                    raise JdFormListingError("京东材质含量输入行数不足")
+                actual_names = []
+                for index, (name, percent) in enumerate(components):
+                    selected = await self._select_numeric_material_option(
+                        selects.nth(index), _material_option_desired(name)
+                    )
+                    if selected is None:
+                        return None
+                    actual_names.append(selected[0])
+                    if percent is not None:
+                        await self._enter_as_user(inputs[index], percent)
+                        if not _numeric_equal((await inputs[index].input_value()).strip(), percent):
+                            raise JdFormListingError("京东材质第{0}行含量回读失败".format(index + 1))
+                return tuple(actual_names)
         desired = _material_name(expected) if material else expected
         desired = JD_EXACT_OPTION_MAP.get(normalized, {}).get(
             normalize_option(desired), desired
         )
+        if normalized == normalize_label("鞋跟高度") and await selects.count():
+            field = await self._captured_api_field_definition(page_label)
+            labels = tuple(option.label for option in field.option_values)
+            for alternative in re.split(r"[/／]", desired):
+                matches = match_option_candidates((alternative.strip(),), labels)
+                if len(matches) == 1:
+                    desired = labels[matches[0]]
+                    break
         actual: Optional[Tuple[str, ...]] = None
         if await selects.count():
             # Material rows contain a value select plus an optional percentage input.
             value_select = selects.first
-            multi = await value_select.locator(".el-select__tags").count() > 0
-            try:
-                actual = await self._raise_as_jd(
-                    self._select_values(
-                        value_select,
-                        ((desired,),) if material else selection_value_groups(page_label, desired),
-                        label=page_label,
-                        multi=multi,
-                    )
+            multi = await select_supports_multiple(value_select)
+            if normalized == normalize_label("材质"):
+                if multi:
+                    raise JdFormListingError("京东属性材质不应为多选控件")
+                actual = await self._select_numeric_material_option(
+                    value_select,
+                    desired,
                 )
-            except JdFormListingError:
-                raise
-            if actual is None:
-                if required:
-                    raise JdFormListingError("京东属性{0}没有 Excel 精确候选".format(page_label))
-                return None
+                if actual is None:
+                    if self.logger is not None:
+                        self.logger.info(
+                            "京东属性“材质”没有唯一数字候选，已加入本平台待审核汇总"
+                        )
+                    return None
+            else:
+                desired = await self._resolve_learning_select_value(
+                    page_label,
+                    value_select,
+                    desired,
+                )
+                if desired is None:
+                    # 转审核前先清掉底层自造文字绑定（若有）：快麦保存的
+                    # 就是表单模型值，历史直填的文字会让铺货 API 报
+                    # “属性值需是数字格式”。
+                    await self._clear_non_numeric_select_value(
+                        value_select, page_label
+                    )
+                    if self.logger is not None:
+                        self.logger.info(
+                            "京东属性“%s”已加入本平台待审核汇总，继续填写后续字段",
+                            page_label,
+                        )
+                    return None
+                try:
+                    actual = await self._raise_as_jd(
+                        self._select_values(
+                            value_select,
+                            (tuple(part.strip() for part in re.split(r"[/／]", desired) if part.strip()),)
+                            if material else await self._excel_groups_for_select(
+                                value_select, page_label, desired, multi=multi
+                            ),
+                            label=page_label,
+                            multi=multi,
+                        )
+                    )
+                except JdFormListingError:
+                    raise
+                if (
+                    actual is None
+                    and self.attribute_runtime is not None
+                    and self.attribute_runtime.review_pending_or_omitted(
+                        self.attribute_platform_id, page_label
+                    )
+                ):
+                    return None
+                if actual is None and normalized in {
+                    normalize_label(label) for label in
+                    ("鞋面材质", "鞋面内里材质", "鞋里材质", "鞋底材质", "鞋垫材质")
+                }:
+                    actual = await self._raise_as_jd(self._select_values(
+                        value_select, (("其他", "其它"),), label=page_label, multi=multi,
+                    ))
+                    if actual is not None and self.logger is not None:
+                        self.logger.info('京东鞋类属性“%s”无匹配材质，使用兜底候选：%s', page_label, actual)
+                if actual is None:
+                    if await self._interface_field_has_options(page_label):
+                        # valueId 型字段不允许直填自造文字候选，否则铺货
+                        # API 报“属性值需是数字格式”；清空后转人工审核。
+                        await self._clear_non_numeric_select_value(
+                            value_select, page_label
+                        )
+                        if getattr(self, "attribute_runtime", None) is None:
+                            raise JdFormListingError(
+                                "京东属性“{0}”没有可点选的数字候选，"
+                                "且本次未连接审核服务，无法创建待审核项".format(
+                                    page_label
+                                )
+                            )
+                        if self.logger is not None:
+                            self.logger.info(
+                                "京东属性“%s”没有可点选的数字候选，已清空自造文字并加入待审核汇总",
+                                page_label,
+                            )
+                        return None
+                    actual = await self._raise_as_jd(
+                        self._set_select_values_directly(
+                            value_select, (re.split(r"[/／]", desired)[0].strip(),),
+                            label=page_label, multi=multi,
+                        )
+                    )
         elif len(inputs) == 1:
             # 检查是否是只读的 cascader 输入框
             is_readonly = await inputs[0].get_attribute("readonly")
@@ -1179,7 +2753,7 @@ class JdFormListing(YouzanFormListing):
                     return None
             elif not is_readonly:
                 # 普通可编辑输入框
-                expected_text = str(desired).strip()
+                expected_text = listing_date_text_value(page_label, desired)
                 if (await inputs[0].input_value()).strip() != expected_text:
                     await self._enter_as_user(inputs[0], expected_text)
                 actual = ((await inputs[0].input_value()).strip(),)
@@ -1226,25 +2800,468 @@ class JdFormListing(YouzanFormListing):
                     await self._enter_as_user(percent_input, percentage)
                 if not _numeric_equal((await percent_input.input_value()).strip(), percentage):
                     raise JdFormListingError("京东属性{0}百分比回读失败".format(page_label))
+        if normalized == normalize_label("材质") and actual and is_single_material_expression(expected):
+            await self._remove_extra_material_rows(item)
+            remaining = item.locator(":scope > .el-form-item__content .el-select:visible")
+            if await remaining.count() != 1 or tuple(await self._read_select_values(remaining.first, multi=False)) != tuple(actual):
+                raise JdFormListingError("京东删除多余材质行后首行发生变化")
         return actual
+
+    def _material_selects(self, item: Any) -> Any:
+        return item.locator(":scope > .el-form-item__content .el-select:visible")
+
+    async def _material_add_control(self, item: Any) -> Any:
+        buttons = item.get_by_role("button", name="添加", exact=True)
+        if await buttons.count() == 1:
+            return buttons
+        texts = item.get_by_text("添加", exact=True)
+        visible = [
+            texts.nth(index)
+            for index in range(await texts.count())
+        ]
+        visible = [
+            candidate
+            for candidate in visible
+            if await candidate.is_visible()
+        ]
+        if len(visible) == 1:
+            return visible[0]
+        raise JdFormListingError("京东材质找不到唯一“添加”按钮")
+
+    async def _ensure_material_row_count(self, item: Any, expected_count: int) -> None:
+        if expected_count < 1:
+            raise JdFormListingError("京东材质至少需要一行")
+        selects = self._material_selects(item)
+        count = await selects.count()
+        if count == 0:
+            await (await self._material_add_control(item)).click(
+                force=True, timeout=5_000
+            )
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                if await selects.count() >= 1:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raise JdFormListingError("京东材质点击“添加”后未生成材质行")
+            count = await selects.count()
+        while count < expected_count:
+            await (await self._material_add_control(item)).click(
+                force=True, timeout=5_000
+            )
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                if await selects.count() == count + 1:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raise JdFormListingError(
+                    "京东材质点击“添加”后未生成第 {0} 行".format(count + 1)
+                )
+            count += 1
+        while count > expected_count:
+            deletes = item.get_by_text("删除", exact=True)
+            if await deletes.count() != count:
+                raise JdFormListingError(
+                    "京东材质行和删除按钮数量不一致，未删除不明控件"
+                )
+            await deletes.last.click(timeout=3_000)
+            deadline = asyncio.get_running_loop().time() + 2
+            while (
+                await selects.count() == count
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.02)
+            if await selects.count() != count - 1:
+                raise JdFormListingError("京东多余材质行删除回读失败")
+            count -= 1
+
+    async def _fill_material_components(
+        self,
+        item: Any,
+        components: Sequence[MaterialComponent],
+    ) -> Optional[Tuple[str, ...]]:
+        try:
+            expected_rows = self._expected_material_rows(components)
+        except TaobaoListingError as exc:
+            raise JdFormListingError(
+                str(exc).replace("淘宝", "京东").replace("材质成分", "材质")
+            ) from exc
+        await self._ensure_material_row_count(item, len(expected_rows))
+        selected_names: List[str] = []
+        for index, (name, percentage) in enumerate(expected_rows):
+            selects = self._material_selects(item)
+            if await selects.count() != len(expected_rows):
+                raise JdFormListingError(
+                    "京东材质行数不是 {0}".format(len(expected_rows))
+                )
+            select = selects.nth(index)
+            if await select_supports_multiple(select):
+                raise JdFormListingError("京东属性材质不应为多选控件")
+            try:
+                await self._raise_as_jd(self._dismiss_select_dropdown(select))
+            except JdFormListingError:
+                pass
+            actual = await self._select_numeric_material_option(
+                select,
+                _material_option_desired(name),
+            )
+            if actual is None:
+                return None
+            selected_names.extend(actual)
+            inputs = await self._editable_inputs(item)
+            if len(inputs) != len(expected_rows):
+                raise JdFormListingError(
+                    "京东材质百分比输入框数量不是 {0}".format(len(expected_rows))
+                )
+            percent_text = str(int(percentage))
+            percent_input = inputs[index]
+            if not _numeric_equal(
+                (await percent_input.input_value()).strip(), percent_text
+            ):
+                await self._enter_as_user(percent_input, percent_text)
+            if not _numeric_equal(
+                (await percent_input.input_value()).strip(), percent_text
+            ):
+                raise JdFormListingError(
+                    "京东属性材质第 {0} 行百分比回读失败".format(index + 1)
+                )
+        return tuple(selected_names)
+
+    async def _remove_extra_material_rows(self, item: Any) -> None:
+        """Only after the first component was verified, remove stale tail rows."""
+        await self._ensure_material_row_count(item, 1)
+
+    async def _verify_material_components(
+        self,
+        components: Sequence[MaterialComponent],
+        expected_attributes=None,
+    ) -> Mapping[str, Any]:
+        try:
+            expected_rows = self._expected_material_rows(components)
+        except TaobaoListingError as exc:
+            raise JdFormListingError(
+                str(exc).replace("淘宝", "京东").replace("材质成分", "材质")
+            ) from exc
+        items = await self._collect_attribute_items()
+        material = next(
+            (
+                item
+                for key, (_label, item) in items.items()
+                if key.split("#", 1)[0] == normalize_label("材质")
+            ),
+            None,
+        )
+        if material is None:
+            raise JdFormListingError("京东保存后材质字段消失")
+        selects = self._material_selects(material)
+        if await selects.count() != len(expected_rows):
+            raise JdFormListingError(
+                "京东保存后材质行数不一致：期望 {0}，页面 {1}".format(
+                    len(expected_rows), await selects.count()
+                )
+            )
+        filled_names = tuple(
+            str(value).strip()
+            for value in ((expected_attributes or {}).get("材质") or ())
+            if str(value).strip()
+        )
+        actual_names: List[str] = []
+        inputs = await self._editable_inputs(material)
+        if len(inputs) != len(expected_rows):
+            raise JdFormListingError("京东保存后材质百分比输入框数量不一致")
+        for index, (name, percentage) in enumerate(expected_rows):
+            actual = await self._read_select_values(
+                selects.nth(index), multi=False
+            )
+            aliases = (name,) + TAOBAO_MATERIAL_OPTION_ALIASES.get(
+                normalize_option(name), ()
+            )
+            if index < len(filled_names):
+                aliases = aliases + (filled_names[index],)
+            if len(actual) != 1 or not any(
+                normalize_option(actual[0]) == normalize_option(alias)
+                for alias in aliases
+            ):
+                raise JdFormListingError(
+                    "京东保存后材质第 {0} 行不一致：{1}".format(index + 1, actual)
+                )
+            actual_names.append(actual[0])
+            if not _numeric_equal(
+                await inputs[index].input_value(), str(percentage)
+            ):
+                raise JdFormListingError("京东保存后材质百分比不一致")
+        return {
+            "status": "verified",
+            "values": tuple(actual_names),
+            "percentage": (
+                str(expected_rows[0][1]) if len(expected_rows) == 1 else None
+            ),
+            "percentages": tuple(
+                str(percentage) for _name, percentage in expected_rows
+            ),
+            "row_count": len(expected_rows),
+        }
+
+    async def _verify_single_material(self, fields: JdFields, expected_attributes=None):
+        expression = _first_excel_value(fields.fields, ("材质", "材质成分"))
+        try:
+            components = parse_taobao_materials(fields.fields)
+        except TaobaoListingError as exc:
+            if expression and not is_single_material_expression(expression):
+                raise JdFormListingError(
+                    str(exc).replace("淘宝", "京东")
+                ) from exc
+            components = ()
+        if components:
+            return await self._verify_material_components(
+                components, expected_attributes
+            )
+        if expression is None or not is_single_material_expression(expression):
+            return {"status": "not_single_component"}
+        items = await self._collect_attribute_items()
+        material = next((item for key, (_label, item) in items.items()
+                         if key.split("#", 1)[0] == normalize_label("材质")), None)
+        if material is None:
+            raise JdFormListingError("京东保存后材质字段消失")
+        selects = self._material_selects(material)
+        if await selects.count() != 1:
+            raise JdFormListingError("京东保存后单成分材质仍有多余行或缺失")
+        actual = await self._read_select_values(selects.first, multi=False)
+        wanted = ((expected_attributes or {}).get("材质")
+                  or tuple(_material_name(expression).split("/")))
+        if len(actual) != 1 or not any(normalize_option(actual[0]) == normalize_option(v) for v in wanted):
+            raise JdFormListingError(f"京东保存后材质不一致：{actual}")
+        percentage = _material_percentage(expression)
+        if percentage is not None:
+            inputs = await self._editable_inputs(material)
+            if len(inputs) != 1 or not _numeric_equal(await inputs[0].input_value(), percentage):
+                raise JdFormListingError("京东保存后材质百分比不一致")
+        return {"status": "verified", "values": actual, "percentage": percentage, "row_count": 1}
+
+    async def _read_persisted_attribute_item(
+        self, page_label: str, item: Any
+    ) -> Tuple[str, ...]:
+        cascader = item.locator(".el-cascader").first
+        if await cascader.count():
+            input_box = cascader.locator("input.el-input__inner").first
+            if await input_box.count():
+                text = (await input_box.input_value()).strip()
+                values = tuple(
+                    value.strip()
+                    for value in re.split(r"\s*(?:/|>)\s*", text)
+                    if value.strip()
+                )
+                if values:
+                    return values
+
+        selects = item.locator(":scope > .el-form-item__content .el-select:visible")
+        selected: List[str] = []
+        for index in range(await selects.count()):
+            select = selects.nth(index)
+            multi = await select_supports_multiple(select)
+            selected.extend(
+                value
+                for value in await self._read_select_values(select, multi=multi)
+                if normalize_option(value)
+            )
+        if selected:
+            return tuple(selected)
+
+        values = tuple(
+            (await input_box.input_value()).strip()
+            for input_box in await self._editable_inputs(item)
+            if (await input_box.input_value()).strip()
+        )
+        if values:
+            return values
+        raise JdFormListingError(
+            "京东保存后属性{0}无可回读值".format(page_label)
+        )
+
+    @staticmethod
+    def _persisted_attribute_values_match(
+        page_label: str,
+        actual: Sequence[str],
+        expected: Sequence[str],
+    ) -> bool:
+        remaining = list(actual)
+        for expected_value in expected:
+            aliases = value_candidates(page_label, expected_value)
+            match_index = next(
+                (
+                    index
+                    for index, actual_value in enumerate(remaining)
+                    if any(
+                        normalize_option(actual_value) == normalize_option(alias)
+                        for alias in aliases
+                    )
+                ),
+                None,
+            )
+            if match_index is None:
+                return False
+            remaining.pop(match_index)
+        # JD cascaders persist the complete path.  The fill path can resolve
+        # Excel's alias to the leaf only, while the reopened control returns
+        # both the parent and leaf (for example ``休闲风,简约风``).  The parent
+        # is structural context, so accept it when the expected leaf values
+        # occur uniquely and in order.
+        if (
+            normalize_label(page_label) == normalize_label("风格")
+            and expected
+            and len(actual) >= len(expected)
+        ):
+            cursor = 0
+            for expected_value in expected:
+                aliases = value_candidates(page_label, expected_value)
+                match_index = next(
+                    (
+                        index
+                        for index in range(cursor, len(actual))
+                        if any(
+                            normalize_option(actual[index])
+                            == normalize_option(alias)
+                            for alias in aliases
+                        )
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    return False
+                cursor = match_index + 1
+            return True
+        return not remaining
+
+    async def _verify_persisted_attributes(
+        self,
+        expected_attributes: Optional[Mapping[str, Sequence[str]]],
+        material_report: Mapping[str, Any],
+    ) -> Dict[str, Tuple[str, ...]]:
+        expected_map = dict(expected_attributes or {})
+        if not expected_map:
+            return {}
+        items = await self._collect_attribute_items()
+        verified: Dict[str, Tuple[str, ...]] = {}
+        for expected_label, raw_expected in expected_map.items():
+            expected_source = (
+                raw_expected
+                if isinstance(raw_expected, (list, tuple))
+                else (raw_expected,)
+            )
+            expected = tuple(
+                str(value).strip()
+                for value in expected_source
+                if value is not None and str(value).strip()
+            )
+            if not expected:
+                continue
+            if (
+                normalize_label(expected_label) == normalize_label("材质")
+                and material_report.get("status") == "verified"
+            ):
+                actual = tuple(str(value) for value in material_report.get("values", ()))
+                if not self._persisted_attribute_values_match(
+                    expected_label, actual, expected
+                ):
+                    raise JdFormListingError(
+                        "京东保存后属性{0}不一致：{1}".format(
+                            expected_label, actual
+                        )
+                    )
+                verified[expected_label] = actual
+                continue
+
+            base = normalize_label(expected_label)
+            records = [
+                (page_label, item)
+                for key, (page_label, item) in items.items()
+                if key.split("#", 1)[0] == base
+            ]
+            if not records:
+                raise JdFormListingError(
+                    "京东保存后属性{0}已消失".format(expected_label)
+                )
+            observed: List[Tuple[str, ...]] = []
+            for page_label, item in records:
+                try:
+                    actual = await self._read_persisted_attribute_item(page_label, item)
+                except JdFormListingError:
+                    continue
+                observed.append(actual)
+                if self._persisted_attribute_values_match(
+                    page_label, actual, expected
+                ):
+                    verified[page_label] = actual
+                    break
+            else:
+                raise JdFormListingError(
+                    "京东保存后属性{0}不一致：期望 {1}，页面 {2}".format(
+                        expected_label, expected, observed
+                    )
+                )
+        return verified
 
     async def fill_attributes(self, fields: JdFields) -> Mapping[str, Any]:
         items = await self._attribute_items()
         assignments = await self._attribute_assignments(fields.fields, items)
         applied: Dict[str, Tuple[str, ...]] = {}
         skipped: Dict[str, str] = {}
+        cleared: Dict[str, str] = {}
+        ignored = []
         missing_required = []
+        applied_bases = set()
         for key, (page_label, item) in items.items():
+            base = key.split("#", 1)[0]
+            if base in JD_IGNORED_ATTRIBUTE_LABELS or skip_color_attribute(page_label):
+                ignored.append(page_label)
+                if self.logger is not None:
+                    self.logger.info('京东商品属性“%s”按规则不填写', page_label)
+                continue
+            # JD's material control is represented by nested form items with
+            # the same label.  Selecting the first row replaces the nested DOM,
+            # so a later duplicate occurrence from the original snapshot no
+            # longer exists.  Once the logical field has been filled and read
+            # back, do not treat that vanished duplicate as data loss.
+            if base in applied_bases:
+                if self.logger is not None and "#" in key:
+                    self.logger.info(
+                        '京东属性“%s”重复控件已随页面重渲染合并，已按首个控件回读结果跳过',
+                        page_label,
+                    )
+                continue
             # 选择一个属性后，京东表单会重新渲染后续复合字段。
             # Playwright 的 nth locator 会因 DOM 顺序变化指向错项，
             # 所以每次写入前按字段名重新解析当前页面结构。
             current_items = await self._collect_attribute_items()
             current = current_items.get(key)
             if current is None:
+                same_label = [
+                    value
+                    for current_key, value in current_items.items()
+                    if current_key.split("#", 1)[0] == base
+                ]
+                if len(same_label) == 1:
+                    current = same_label[0]
+                    if self.logger is not None:
+                        self.logger.info(
+                            '京东属性“%s”重渲染后序号变化，已按唯一字段名重新定位',
+                            page_label,
+                        )
+                elif assignments.get(key) is None:
+                    # An optional/unmapped control can legitimately disappear
+                    # when another attribute changes the dependent schema.
+                    continue
+            if current is None:
                 raise JdFormListingError(
                     "京东属性{0}在页面重新渲染后消失".format(page_label)
                 )
             page_label, item = current
+            if base in JD_CLEARED_ATTRIBUTE_LABELS:
+                cleared[page_label] = await self._clear_attribute_item(page_label, item)
+                if self.logger is not None:
+                    self.logger.info('京东商品属性“%s”按规则保持空白', page_label)
+                continue
             required = await self._is_required(item)
             assignment = assignments.get(key)
             if assignment is None:
@@ -1257,15 +3274,352 @@ class JdFormListing(YouzanFormListing):
                 skipped[page_label] = expected
             else:
                 applied[page_label] = actual
+                applied_bases.add(base)
         if missing_required:
             raise JdFormListingError("Excel 中缺少京东必填属性：" + "、".join(missing_required))
         return {
             "attributes": applied,
+            "cleared_fields": cleared,
+            "ignored_fields": tuple(ignored),
             "skipped_no_exact_candidate": skipped,
             "unmatched_page_fields": tuple(
-                page_label for key, (page_label, _item) in items.items() if key not in assignments
+                page_label
+                for key, (page_label, _item) in items.items()
+                if key not in assignments
+                and key.split("#", 1)[0] not in JD_CLEARED_ATTRIBUTE_LABELS
+                and key.split("#", 1)[0] not in JD_IGNORED_ATTRIBUTE_LABELS
             ),
         }
+
+    async def _color_spec_value_snapshot(self) -> Tuple[str, ...]:
+        return await self._spec_value_snapshot("颜色", "data-codex-jd-color-value")
+
+    async def _spec_value_snapshot(self, spec_name: str, marker: str) -> Tuple[str, ...]:
+        """Mark the echoed inputs in one exact specification group."""
+        if self.panel is None:
+            raise JdFormListingError("请先打开京东资料")
+        result = await self.panel.evaluate(
+            """(panel, {specName, marker}) => {
+              const clean = value => String(value || '')
+                .replace(/\s+/g, '')
+                .replace(/[\uff1a:]$/, '');
+              const visible = node => {
+                if (!(node instanceof Element)) return false;
+                const style = getComputedStyle(node);
+                const rect = node.getBoundingClientRect();
+                return style.display !== 'none'
+                  && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const hasExactText = (root, expected) =>
+                Array.from(root.querySelectorAll('*')).some(node =>
+                  visible(node) && clean(node.innerText) === expected
+                );
+
+              panel.querySelectorAll('[' + marker + ']').forEach(node =>
+                node.removeAttribute(marker)
+              );
+              const nameInputs = Array.from(panel.querySelectorAll('input'))
+                .filter(input => visible(input) && clean(input.value) === specName);
+              const groups = [];
+              for (const nameInput of nameInputs) {
+                let root = nameInput.parentElement;
+                while (root && root !== panel) {
+                  const inputs = Array.from(root.querySelectorAll('input')).filter(input => {
+                    const type = String(input.type || '').toLowerCase();
+                    return visible(input)
+                      && !['hidden', 'checkbox', 'radio'].includes(type)
+                      && clean(input.value);
+                  });
+                  const values = inputs.filter(input => input !== nameInput);
+                  if (hasExactText(root, '\u89c4\u683c\u503c') && values.length) {
+                    groups.push({root, nameInput, values});
+                    break;
+                  }
+                  root = root.parentElement;
+                }
+              }
+              if (groups.length !== 1) {
+                return {groupCount: groups.length, values: []};
+              }
+              const values = groups[0].values.map((input, index) => {
+                input.setAttribute(marker, String(index));
+                return String(input.value || '').trim();
+              });
+              return {groupCount: 1, values};
+            }""",
+            {"specName": spec_name, "marker": marker},
+        )
+        group_count = int(result.get("groupCount") or 0)
+        values = tuple(str(value).strip() for value in result.get("values", ()) if str(value).strip())
+        if group_count != 1:
+            raise JdFormListingError(
+                "京东规格名“{0}”分组不是唯一项：{1}".format(spec_name, group_count)
+            )
+        if not values:
+            raise JdFormListingError("京东规格名“{0}”下没有回显的规格值".format(spec_name))
+        if len({normalize_option(value) for value in values}) != len(values):
+            raise JdFormListingError("京东{0}规格值存在重复，无法唯一重填".format(spec_name))
+        return values
+
+    async def _visible_color_spec_dialog(self, timeout_seconds: float = 5, *, spec_name: str = "颜色") -> Any:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            dialogs = self.page.locator(".el-dialog:visible, [role=dialog]:visible")
+            matches = []
+            for index in range(await dialogs.count()):
+                dialog = dialogs.nth(index)
+                titles = dialog.locator(
+                    ".el-dialog__title:visible, [role=heading]:visible"
+                )
+                title_values = []
+                for title_index in range(await titles.count()):
+                    title_values.append(
+                        normalize_label(await titles.nth(title_index).inner_text())
+                    )
+                if normalize_label(spec_name) in title_values:
+                    matches.append(dialog)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise JdFormListingError(
+                    "京东{0}规格值弹窗不是唯一项：{1}".format(spec_name, len(matches))
+                )
+            await asyncio.sleep(0.05)
+        raise JdFormListingError("点击京东规格值后未出现“{0}”弹窗".format(spec_name))
+
+    async def _dialog_form_item_exact(self, dialog: Any, label: str) -> Any:
+        labels = dialog.get_by_text(
+            re.compile(r"^\s*\*?\s*{0}\s*[\uff1a:]?\s*$".format(re.escape(label)))
+        )
+        matches = []
+        for index in range(await labels.count()):
+            node = labels.nth(index)
+            if not await node.is_visible():
+                continue
+            item = node.locator(
+                "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]"
+            )
+            if await item.count() == 1:
+                matches.append(item)
+        if len(matches) != 1:
+            raise JdFormListingError(
+                "京东颜色规格弹窗字段{0}不是唯一项：{1}".format(label, len(matches))
+            )
+        return matches[0]
+
+    async def _reapply_color_dialog_value(self, dialog: Any, expected: str) -> str:
+        item = await self._dialog_form_item_exact(dialog, "颜色")
+        selects = item.locator(":scope > .el-form-item__content .el-select:visible")
+        if await selects.count():
+            if await selects.count() != 1:
+                raise JdFormListingError("京东颜色规格弹窗下拉框不唯一")
+            select = selects.first
+            chosen = await self._raise_as_jd(
+                self._choose_one_option(
+                    select,
+                    (expected,),
+                    label="颜色规格值",
+                    multi=False,
+                )
+            )
+            if chosen is None:
+                raise JdFormListingError(
+                    "京东颜色规格弹窗没有回显值“{0}”的精确候选".format(expected)
+                )
+            actual_values = await self._read_select_values(select, multi=False)
+            actual = actual_values[0] if actual_values else ""
+            await self._raise_as_jd(self._dismiss_select_dropdown(select))
+        else:
+            inputs = await self._editable_inputs(item)
+            if len(inputs) != 1:
+                raise JdFormListingError(
+                    "京东颜色规格弹窗可填输入框不是唯一项：{0}".format(len(inputs))
+                )
+            input_box = inputs[0]
+            await self._enter_as_user(input_box, expected)
+            # Some JD categories render the colour control as autocomplete
+            # rather than el-select.  When an exact suggestion appears, click
+            # it to restore the platform-side value binding; otherwise the
+            # editable value itself is retained and verified below.
+            exact = []
+            if await item.locator(".el-autocomplete").count():
+                options = self.page.locator(
+                    ".el-autocomplete-suggestion:visible li:visible, "
+                    "[role=listbox]:visible [role=option]:visible"
+                )
+                deadline = asyncio.get_running_loop().time() + 1
+                while asyncio.get_running_loop().time() < deadline:
+                    exact = [
+                        options.nth(index)
+                        for index in range(await options.count())
+                        if normalize_option(await options.nth(index).inner_text())
+                        == normalize_option(expected)
+                    ]
+                    if exact:
+                        break
+                    await asyncio.sleep(0.05)
+            if len(exact) > 1:
+                raise JdFormListingError(
+                    "京东颜色规格弹窗候选“{0}”不唯一".format(expected)
+                )
+            if len(exact) == 1:
+                await exact[0].click(timeout=2_000)
+            actual = (await input_box.input_value()).strip()
+        if normalize_option(actual) != normalize_option(expected):
+            raise JdFormListingError(
+                "京东颜色规格弹窗重填回读失败：期望 {0!r}，页面为 {1!r}".format(
+                    expected, actual
+                )
+            )
+        return actual
+
+    async def reapply_echoed_color_spec_values(self) -> Mapping[str, Any]:
+        """Re-enter each value echoed under the JD colour specification."""
+        expected_values = await self._color_spec_value_snapshot()
+        applied = []
+        for expected in expected_values:
+            current_values = await self._color_spec_value_snapshot()
+            matching_indexes = [
+                index
+                for index, value in enumerate(current_values)
+                if normalize_option(value) == normalize_option(expected)
+            ]
+            if len(matching_indexes) != 1:
+                raise JdFormListingError(
+                    "京东颜色规格值“{0}”重新定位失败".format(expected)
+                )
+            value_input = self.panel.locator(
+                '[data-codex-jd-color-value="{0}"]'.format(matching_indexes[0])
+            )
+            if await value_input.count() != 1:
+                raise JdFormListingError(
+                    "京东颜色规格值“{0}”输入框不唯一".format(expected)
+                )
+            await value_input.click(force=True, timeout=4_000)
+            dialog = await self._visible_color_spec_dialog()
+            actual = await self._reapply_color_dialog_value(dialog, expected)
+            confirm = dialog.get_by_role(
+                "button", name=re.compile(r"^\s*\u786e\s*\u5b9a\s*$")
+            )
+            if await confirm.count() != 1:
+                raise JdFormListingError("京东颜色规格弹窗“确定”不是唯一项")
+            await confirm.click(timeout=4_000)
+            await dialog.wait_for(state="hidden", timeout=10_000)
+            after = await self._color_spec_value_snapshot()
+            if not any(
+                normalize_option(value) == normalize_option(expected) for value in after
+            ):
+                raise JdFormListingError(
+                    "京东颜色规格值“{0}”确定后外层回读失败".format(expected)
+                )
+            applied.append(actual)
+            if self.logger is not None:
+                self.logger.info("京东颜色规格值已按页面回显重填并确认：%s", actual)
+        return {"spec_name": "颜色", "values": tuple(applied)}
+
+    async def _size_spec_binding_snapshot(self) -> Sequence[Mapping[str, Any]]:
+        """Read required locked size bindings; never write Vue state directly."""
+        return await self.panel.evaluate(
+            """panel => {
+              let component = panel.querySelector('.block-specification-list')?.__vue__;
+              while (component && !Array.isArray(component.specifications))
+                component = component.$parent;
+              const groups = (component?.specifications || []).filter(s => s.name === '尺码');
+              if (groups.length !== 1) return [];
+              const group = groups[0];
+              const required = (group.valueItemRule?.items || []).filter(rule =>
+                Array.isArray(rule.required) && rule.required.length
+                && String(rule.features?.isLocked) === '1'
+              );
+              if (!required.length) return [];
+              return group.values.filter(value => value.checked).map(value => ({
+                spec_value_id: value.valueKey,
+                value: value.value,
+                bindings: required.map(rule => {
+                  const id = rule.properties?.id?.enum?.[0];
+                  const binding = value.extendValues?.[id] || {};
+                  return {
+                    label: rule.features?.text,
+                    value: binding.value || '',
+                    value_id: binding.valueId,
+                    valid: Boolean(binding.valueId)
+                      && rule.required.every(key => Boolean(binding[key]))
+                  };
+                })
+              }));
+            }"""
+        )
+
+    @staticmethod
+    def _size_spec_option(value: str) -> str:
+        # “38码” and the platform's “38” are the same shoe size.  Do not
+        # convert a foot-length range or infer another size system.
+        value = str(value).strip()
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*码", value)
+        return match.group(1) if match else value
+
+    async def reapply_required_size_spec_values(self) -> Mapping[str, Any]:
+        before = await self._size_spec_binding_snapshot()
+        applied = []
+        for value in before:
+            missing = [binding for binding in value["bindings"] if not binding["valid"]]
+            if not missing:
+                continue
+            if len(missing) != 1 or missing[0]["label"] != "通用尺码":
+                raise JdFormListingError("京东尺码存在尚未支持的必填规格绑定")
+            source = str(missing[0]["value"] or value["value"])
+            expected = self._size_spec_option(source)
+            current = await self._spec_value_snapshot("尺码", "data-codex-jd-size-value")
+            indexes = [i for i, text in enumerate(current) if text == value["value"]]
+            if len(indexes) != 1:
+                raise JdFormListingError("京东尺码规格值无法唯一定位：" + str(value["value"]))
+            await self.panel.locator(
+                '[data-codex-jd-size-value="{0}"]'.format(indexes[0])
+            ).click(force=True, timeout=4_000)
+            dialog = await self._visible_color_spec_dialog(spec_name="尺码")
+            item = await self._dialog_form_item_exact(dialog, "通用尺码")
+            reference = item.locator(".el-popover__reference")
+            if await reference.count() != 1:
+                raise JdFormListingError("京东通用尺码候选入口不是唯一项")
+            popover_id = await reference.get_attribute("aria-describedby")
+            if not popover_id or not re.fullmatch(r"[\w-]+", popover_id):
+                raise JdFormListingError("京东通用尺码候选入口缺少弹层标识")
+            await reference.locator("input").click(timeout=4_000)
+            popover = self.page.locator("#" + popover_id)
+            await popover.wait_for(state="visible", timeout=5_000)
+            option = popover.get_by_role("button", name=expected, exact=True)
+            if await option.count() != 1:
+                raise JdFormListingError("京东通用尺码没有唯一精确候选：" + source)
+            await option.click(timeout=4_000)
+            actual = (await reference.locator("input").input_value()).strip()
+            if actual != expected:
+                raise JdFormListingError("京东通用尺码候选回读不一致：" + actual)
+            # The large size popover can cover the dialog header.  The field
+            # label is left of its input/anchor, so a normal checked click
+            # dismisses it without accidentally choosing another size.
+            await item.locator(".el-form-item__label").click(timeout=4_000)
+            if (await reference.locator("input").input_value()).strip() != expected:
+                raise JdFormListingError("京东关闭尺码候选后选中值发生变化：" + source)
+            confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
+            await confirm.click(timeout=4_000)
+            await dialog.wait_for(state="hidden", timeout=10_000)
+            after = await self._size_spec_binding_snapshot()
+            if [item["spec_value_id"] for item in after] != [item["spec_value_id"] for item in before]:
+                raise JdFormListingError("京东尺码绑定后规格对应关系发生变化")
+            matches = [item for item in after if item["spec_value_id"] == value["spec_value_id"]]
+            if len(matches) != 1 or not all(item["valid"] for item in matches[0]["bindings"]):
+                raise JdFormListingError("京东通用尺码选项绑定未生效：" + source)
+            if self._size_spec_option(matches[0]["bindings"][0]["value"]) != expected:
+                raise JdFormListingError(
+                    "京东通用尺码保存弹窗后回读不一致：{0!r} -> {1!r}，绑定={2!r}".format(
+                        source, expected, matches[0]
+                    )
+                )
+            applied.append({"before": value["value"], "selected": actual})
+            if self.logger is not None:
+                self.logger.info("京东必填通用尺码已精确绑定：%s -> %s", value["value"], actual)
+        return {"spec_name": "尺码", "values": tuple(applied)}
 
     async def _batch_input(self, label: str) -> Any:
         if self.panel is None:
@@ -1290,7 +3644,9 @@ class JdFormListing(YouzanFormListing):
     @staticmethod
     def _expected_sku(fields: Mapping[str, str]) -> Mapping[str, str]:
         result = {
-            "京东价": _required_excel_value(fields, ("京东价", "价格", "基本售价", "商品价格"), "京东价"),
+            "京东价": _required_excel_value(
+                fields, ("京东价", "价格", "基本售价", "商品价格"), "京东价", money=True
+            ),
             "库存": _required_excel_value(fields, ("库存", "数量"), "库存"),
         }
         for label, value in result.items():
@@ -1386,9 +3742,76 @@ class JdFormListing(YouzanFormListing):
                 await asyncio.sleep(0.15)
         raise JdFormListingError(str(last_error or "京东批量设置超时"))
 
-    async def apply_sku_thickness(self) -> Mapping[str, str]:
+    async def _category_has_no_sku_attributes(self) -> bool:
+        """Confirm a loaded category omits the optional extra SKU column."""
+        if self.panel is None or getattr(self, '_api_http_failures', {}):
+            return False
+        observation = await self._active_api_observation()
+        category_id = str(observation.get('category_id') or '')
+        if (not category_id or not observation.get('attribute_fields')
+                or observation.get('http_status') != 200):
+            return False
+        return bool(await self.panel.evaluate("""(root, categoryId) => {
+            const block = root.querySelector('.block-specification-list');
+            let c = block?.__vue__;
+            while (c && !Object.prototype.hasOwnProperty.call(c.$data || {}, 'skuPropList')) c = c.$parent;
+            if (!c || c.requestedSaleAttrs !== true || !Array.isArray(c.saleAttrs)
+                || !c.saleAttrs.length || !Array.isArray(c.skuPropList) || c.skuPropList.length) return false;
+            if (!c.saleAttrs.every(attr => String(attr.catId) === categoryId)) return false;
+            if (Array.from(root.querySelectorAll('.el-loading-mask')).some(
+                node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden'
+            )) return false;
+            const headers = Array.from(block.querySelectorAll('th')).map(n => n.innerText);
+            return headers.some(v => v.includes('京东价')) && headers.some(v => v.includes('库存'))
+              && !headers.some(v => v.includes('SKU属性'))
+              && block.querySelectorAll('tbody tr').length > 0;
+        }""", category_id))
+
+    async def wait_for_sku_attributes_ready(self, *, timeout_seconds: float = 30.0) -> bool:
+        """Wait for the category's SKU form; return whether extra attributes exist."""
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        logged = False
+        refreshed = False
+        absent_since: Optional[float] = None
+        while asyncio.get_running_loop().time() < deadline:
+            actions = await self._header_actions("SKU属性", "批量设置")
+            if len(actions) == 1:
+                return True
+            if len(actions) > 1:
+                raise JdFormListingError("京东 SKU 属性批量设置不是唯一项：{0}".format(len(actions)))
+            if await self._category_has_no_sku_attributes():
+                now = asyncio.get_running_loop().time()
+                if absent_since is None:
+                    absent_since = now
+                elif now - absent_since >= self.attribute_stable_seconds:
+                    if self.logger is not None:
+                        self.logger.info('京东当前类目已加载且无额外 SKU 属性入口，跳过该项；继续填写并校验规格明细、价格和库存')
+                    return False
+            else:
+                absent_since = None
+            if not logged and self.logger is not None:
+                self.logger.info("京东资料尚未加载完整：等待 SKU属性批量入口，暂不填写商品属性")
+                logged = True
+            if not refreshed and self.panel is not None:
+                empty = "暂无属性" in await self.panel.inner_text()
+                refreshes = await self._innermost_visible_text(self.panel, "刷新数据")
+                if empty and len(refreshes) == 1:
+                    refreshed = True
+                    if self.logger is not None:
+                        self.logger.info("京东商品属性为空：尝试一次页面刷新数据，重新等待 SKU 属性入口")
+                    await refreshes[0].click(timeout=5_000)
+            await asyncio.sleep(.25)
+        failures = getattr(self, "_api_http_failures", {})
+        if failures:
+            detail = "；".join("HTTP {0} {1}".format(status, path) for path, status in sorted(failures.items()))
+            raise JdFormListingError("京东属性加载失败：{0}；等待或刷新后仍未恢复，已停止填写和保存".format(detail))
+        raise JdFormListingError("京东资料尚未加载完整：SKU属性批量设置入口未出现，已停止填写和保存")
+
+    async def apply_sku_thickness(self, fields: Optional[Mapping[str, str]] = None) -> Mapping[str, str]:
         if self.panel is None:
             raise JdFormListingError("请先打开京东资料")
+        if not await self.wait_for_sku_attributes_ready():
+            return {}
         triggers = await self._header_actions("SKU属性", "批量设置")
         if len(triggers) == 0:
             raise JdFormListingError('京东 SKU 属性没有可定位的"批量设置"按钮')
@@ -1415,6 +3838,41 @@ class JdFormListing(YouzanFormListing):
             await asyncio.sleep(0.1)
         if dialog is None:
             raise JdFormListingError("京东 SKU 属性批量弹窗未出现")
+
+        if fields and any("男鞋" in hint for hint in _jd_category_hints(fields)):
+            report = {}
+            items = dialog.locator('.el-form-item:visible')
+            if not await items.count():
+                refreshes = await self._innermost_visible_text(dialog, "刷新数据")
+                if len(refreshes) == 1:
+                    await refreshes[0].click()
+                await items.first.wait_for(state="visible", timeout=30_000)
+            for index in range(await items.count()):
+                item = items.nth(index)
+                label = item.locator(':scope > .el-form-item__label')
+                if not await label.count():
+                    continue
+                name = (await label.inner_text()).strip().strip('*：: ')
+                aliases = (name, "鞋面内里材质", "鞋里材质") if name == "内里材质" else (name,)
+                desired = _first_excel_value(fields, aliases)
+                if not desired:
+                    if await self._is_required(item):
+                        raise JdFormListingError(f"Excel 中缺少京东鞋类 SKU 属性：{name}")
+                    continue
+                actual = await self._raise_as_jd(self._fill_attribute(name, item, desired, required=True))
+                if actual is None and name == "内里材质":
+                    actual = await self._raise_as_jd(self._fill_attribute(name, item, "其他/其它", required=True))
+                if actual is None:
+                    raise JdFormListingError(f"京东鞋类 SKU 属性没有匹配候选：{name}={desired}")
+                report[name] = "/".join(actual)
+            if not report:
+                raise JdFormListingError("京东鞋类 SKU 属性尚未加载")
+            confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
+            await confirm.click()
+            await dialog.wait_for(state="hidden", timeout=10_000)
+            if self.logger is not None:
+                self.logger.info("京东鞋类 SKU 属性已填写：%s", report)
+            return report
 
         async def visible_thickness_labels() -> List[Any]:
             labels = dialog.get_by_text(re.compile(r"^\s*厚度\s*[：:]?\s*$"))
@@ -1534,8 +3992,12 @@ class JdFormListing(YouzanFormListing):
         return matches
 
     async def fill_summary_prices(self, fields: Mapping[str, str]) -> Mapping[str, str]:
-        jd_price = _required_excel_value(fields, ("京东价", "价格", "基本售价", "商品价格"), "京东价")
-        market = _required_excel_value(fields, ("市场价", "价格", "吊牌价", "商品价格"), "市场价")
+        jd_price = _required_excel_value(
+            fields, ("京东价", "价格", "基本售价", "商品价格"), "京东价", money=True
+        )
+        market = _required_excel_value(
+            fields, ("市场价", "价格", "吊牌价", "商品价格"), "市场价", money=True
+        )
         return {
             "京东价": await self._fill_input_item("京东价（元）", jd_price, numeric=True),
             "市场价": await self._fill_input_item("市场价（元）", market, numeric=True),
@@ -1821,13 +4283,26 @@ class JdFormListing(YouzanFormListing):
         initial_groups = await self._sku_color_image_groups()
         public = self.panel.locator('[data-codex-jd-public-display="true"]')
         public_before = await public.locator(".file-img").count()
-        if image_indices_by_color is None and (square_paths or portrait_paths or sku_paths):
+        # 追加商品的多颜色 SKU 已由页面“一键追加到所有 SKU 图/长图”
+        # 生成完整图片。此场景不再用视觉识别强行区分颜色，避免颜色
+        # 图片无法建立锚点时阻断铺货；各颜色保留页面追加后的图片即可。
+        if (
+            image_indices_by_color is None
+            and len(initial_groups) <= 1
+            and (square_paths or portrait_paths or sku_paths)
+        ):
             image_indices_by_color = classify_image_indices_by_color(
                 square_paths,
                 portrait_paths,
                 sku_paths,
                 len(initial_groups),
             )
+        elif image_indices_by_color is None and len(initial_groups) > 1:
+            if self.logger is not None:
+                self.logger.info(
+                    "京东检测到 %s 个颜色规格，按追加后的页面图片直接铺货，跳过颜色图片识别",
+                    len(initial_groups),
+                )
         if image_indices_by_color is not None and len(image_indices_by_color) != len(initial_groups):
             raise JdFormListingError(
                 "京东图片颜色分类数与页面颜色数不一致：{0}/{1}".format(
@@ -1892,9 +4367,21 @@ class JdFormListing(YouzanFormListing):
         await self._raise_as_jd(super()._wait_for_loading_masks())
         await self._click_section_action("商品长图", "一键追加到所有sku长图")
         await self._raise_as_jd(super()._wait_for_loading_masks())
-        deadline = asyncio.get_running_loop().time() + 20
+        # 整包追加两色各 5 张图时，慢网络下上传解码可能超过 20 秒
+        # （2026-09-21 18:00 线上偶发失败），放宽到 60 秒。
+        # 首次填写时展示组含色块图（display == long+1）；重开已保存商品时
+        # 色块图不在组内，展示组与长图组同为 5/5（2026-09-21 18:05 线上），
+        # 两种稳定状态都接受。
+        deadline = asyncio.get_running_loop().time() + 60
         groups = initial_groups
         counts: List[Tuple[int, int]] = []
+
+        def counts_settled() -> bool:
+            return bool(counts) and all(
+                display in (long_count, long_count + 1) and long_count >= 1
+                for display, long_count in counts
+            )
+
         while asyncio.get_running_loop().time() < deadline:
             groups = await self._sku_color_image_groups()
             counts = [
@@ -1904,13 +4391,10 @@ class JdFormListing(YouzanFormListing):
                 )
                 for group in groups
             ]
-            if counts and all(display == long_count + 1 and long_count >= 1 for display, long_count in counts):
+            if counts_settled():
                 break
             await asyncio.sleep(0.1)
-        if not counts or not all(
-            display == long_count + 1 and long_count >= 1
-            for display, long_count in counts
-        ):
+        if not counts_settled():
             if self.logger is not None:
                 self.logger.info(
                     "京东颜色图片追加未完成时的上传区 DOM 摘要：%s",
@@ -1923,6 +4407,50 @@ class JdFormListing(YouzanFormListing):
 
         reports: List[Mapping[str, Any]] = []
         source_count = counts[0][1]
+        if self.logger is not None:
+            self.logger.info(
+                "京东图片追加计数：公共图=%s，追加前颜色图=%s，追加后颜色图=%s，目标分类=%s",
+                public_before,
+                initial_counts,
+                counts,
+                tuple(len(indices) for indices in requested_indices)
+                if requested_indices is not None else None,
+            )
+        # 单色商品可精确知道本次追加的商品图数量。页面可能在展示图和
+        # 长图两组都预置一张颜色图；先清除各组原有的前缀，再校验新增图。
+        if requested_indices is not None and len(groups) == 1 and requested_indices[0]:
+            expected_added = max(requested_indices[0]) + 1
+            display_before_append, long_before_append = initial_counts[0]
+            display_after_append, long_after_append = counts[0]
+            if (
+                display_after_append == display_before_append + expected_added
+                and long_after_append == long_before_append + expected_added
+            ):
+                for _ in range(display_before_append):
+                    await self._delete_first_uploaded_image(groups[0]["display"])
+                for _ in range(long_before_append):
+                    await self._delete_first_uploaded_image(groups[0]["long"])
+                counts = [
+                    (
+                        await groups[0]["display"].locator(".file-img").count(),
+                        await groups[0]["long"].locator(".file-img").count(),
+                    )
+                ]
+                if counts[0] != (expected_added, expected_added):
+                    raise JdFormListingError(
+                        "京东单色图片清理旧图后数量不一致：{0}/{1}".format(*counts[0])
+                    )
+                source_count = expected_added
+            elif counts[0] != (expected_added, expected_added):
+                raise JdFormListingError(
+                    "京东单色图片追加后数量异常：原有 {0}/{1}，当前 {2}/{3}，预期新增 {4}".format(
+                        display_before_append,
+                        long_before_append,
+                        display_after_append,
+                        long_after_append,
+                        expected_added,
+                    )
+                )
         if any(long_count != source_count for _display, long_count in counts):
             raise JdFormListingError("京东各颜色规格长图数量不一致")
         if requested_indices is None:
@@ -1944,7 +4472,10 @@ class JdFormListing(YouzanFormListing):
                 raise JdFormListingError("京东图片颜色分类不完整，未归类顺序：{0}".format(missing))
 
         for group, (display_before, long_before), keep in zip(groups, counts, normalized_indices):
-            await self._delete_first_uploaded_image(group["display"])
+            if display_before == long_before + 1:
+                # 首次填写时展示组第一位是色块图，需要删除让商品图从 1 开始；
+                # 重开已保存商品时展示组没有色块图，直接删除会误删真实商品图。
+                await self._delete_first_uploaded_image(group["display"])
             rejected = sorted(set(range(source_count)).difference(keep), reverse=True)
             for index in rejected:
                 await self._delete_uploaded_image_at(group["display"], index)
@@ -2004,11 +4535,19 @@ class JdFormListing(YouzanFormListing):
         portrait_paths: Sequence[Path] = (),
         sku_paths: Sequence[Path] = (),
     ) -> Mapping[str, Any]:
-        category = await self.apply_category()
+        category = await self.apply_category(fields.fields)
+        await self.wait_for_sku_attributes_ready()
+        # Category confirmation returns before all dependent JD controls have
+        # necessarily finished replacing their previous values.  Wait for the
+        # attribute section to settle so identity fields cannot read a stale
+        # brand that is cleared moments later by the category re-render.
+        await self._attribute_items()
         identity = await self.fill_identity_and_parameters(fields.fields, style_code=style_code)
         attributes = await self.fill_attributes(fields)
+        color_spec_values = await self.reapply_echoed_color_spec_values()
+        size_spec_values = await self.reapply_required_size_spec_values()
         sku = await self.fill_sku_batch(fields.fields)
-        sku_attributes = await self.apply_sku_thickness()
+        sku_attributes = await self.apply_sku_thickness(fields.fields)
         prices = await self.fill_summary_prices(fields.fields)
         delivery = await self.fill_delivery_template()
         images = await self.append_sku_images(
@@ -2017,24 +4556,43 @@ class JdFormListing(YouzanFormListing):
             sku_paths=sku_paths,
         )
         errors = await self._visible_validation_errors()
-        if errors:
+        if (
+            errors
+            and not (
+                self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+            )
+        ):
             raise JdFormListingError("京东页面校验错误：" + "；".join(errors))
         return {
             "category": category,
             "identity_and_parameters": identity,
             "attributes": attributes,
+            "color_spec_values": color_spec_values,
+            "size_spec_values": size_spec_values,
             "sku_batch": sku,
             "sku_attributes": sku_attributes,
             "summary_prices": prices,
             "delivery_template": delivery,
             "images": images,
+            "deferred_validation_errors": (
+                errors
+                if self.attribute_runtime is not None
+                and getattr(
+                    self.attribute_runtime, "has_deferred_reviews", False
+                )
+                else ()
+            ),
         }
 
     async def verify_persisted_values(
-        self, fields: JdFields, *, style_code: str
+        self, fields: JdFields, *, style_code: str, expected_attributes=None
     ) -> Mapping[str, Any]:
         category = await self._category_text()
-        if _category_parts(category)[-1:] != (normalize_label(JD_CATEGORY_PATH[-1]),):
+        _category_hints, category_target = jd_category_target(fields.fields)
+        if not _jd_category_matches(category, _category_hints, category_target):
             raise JdFormListingError("京东保存后类目回读失败：{0!r}".format(category))
         brand_item = await self._form_item_exact("品牌")
         brand, brand_values = await self._read_brand_value(brand_item)
@@ -2044,18 +4602,37 @@ class JdFormListing(YouzanFormListing):
             )
         expected = self._expected_sku(fields.fields)
         rows = self._validate_sku(await self._sku_table_snapshot(), expected)
-        prices = await self.fill_summary_prices(fields.fields)
-        delivery = await self.fill_delivery_template()
-        # The verifier only writes when a value is unexpectedly missing; all values
-        # are still read back and compared before reporting success.
+        size_bindings = await self._size_spec_binding_snapshot()
+        if any(not binding["valid"] for value in size_bindings for binding in value["bindings"]):
+            raise JdFormListingError("京东保存后必填尺码选项绑定缺失")
+        material = await self._verify_single_material(fields, expected_attributes)
+        attributes = await self._verify_persisted_attributes(
+            expected_attributes, material
+        )
+        expected_jd = _required_excel_value(
+            fields.fields, ("京东价", "价格", "基本售价", "商品价格"), "京东价", money=True
+        )
+        expected_market = _required_excel_value(
+            fields.fields, ("市场价", "价格", "吊牌价", "商品价格"), "市场价", money=True
+        )
+        prices = {
+            "京东价": await self._read_input_item("京东价（元）", numeric=True),
+            "市场价": await self._read_input_item("市场价（元）", numeric=True),
+        }
+        if not _numeric_equal(prices["京东价"], expected_jd) or not _numeric_equal(prices["市场价"], expected_market):
+            raise JdFormListingError("京东保存后价格不一致：{0}".format(prices))
+        delivery = await self._read_delivery_template()
         return {
             "category": category,
             "brand": brand,
             "style_code": style_code,
             "sku_values": expected,
             "row_count": len(rows),
+            "size_spec_bindings": size_bindings,
             "summary_prices": prices,
             "delivery_template": delivery,
+            "material": material,
+            "attributes": attributes,
         }
 
 
@@ -2064,7 +4641,9 @@ __all__ = [
     "JD_BRAND",
     "JD_CATEGORY_PATH",
     "JD_DELIVERY_TEMPLATE",
+    "JD_GROSS_WEIGHT",
     "JD_SKU_THICKNESS",
     "JdFormListing",
     "JdFormListingError",
+    "jd_category_target",
 ]

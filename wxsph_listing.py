@@ -19,8 +19,10 @@ from platform_schema import (
     CategoryResolution,
     FieldSchema,
     SectionSchema,
+    field_options,
     option_summary,
 )
+from category_profile import choose_category_object
 
 
 _DETAIL = EndpointSpec(
@@ -162,8 +164,20 @@ def _recommended_category(
 
 
 def _control(value: Mapping[str, Any]) -> str:
-    kind = str(value.get("inputType") or value.get("type") or "").lower()
-    if value.get("multiple") is True or "multi" in kind:
+    kind = " ".join(
+        str(part)
+        for part in (
+            value.get("inputType"),
+            value.get("type"),
+            value.get("typeV2"),
+        )
+        if part not in (None, "")
+    ).lower()
+    if (
+        value.get("multiple") is True
+        or "multi" in kind
+        or "select_many" in kind
+    ):
         return "select_many"
     if value.get("values") or "select" in kind:
         return "select_one"
@@ -233,11 +247,103 @@ def _fields(
                     if isinstance(value.get("multiple"), bool)
                     else True if control_type == "select_many" else False if control_type == "select_one" else None
                 ),
+                custom_allowed=_bool_value(value.get("appendAllowed")),
                 option_summary=option_summary(options, source="api") if options else None,
+                option_values=field_options(options, source="api"),
                 api_paths=(path,),
             )
         )
     return tuple(result)
+
+
+def unwrap_wxsph_payload(payload: Any) -> Any:
+    """Return the business payload from FastMai's common JSON envelopes."""
+    current = payload
+    for _attempt in range(4):
+        if isinstance(current, str):
+            text = current.strip()
+            if not text.startswith(("{", "[")):
+                break
+            try:
+                import json
+
+                current = json.loads(text)
+                continue
+            except (TypeError, ValueError):
+                break
+        if not isinstance(current, Mapping):
+            break
+        if "result" in current and "data" in current:
+            if current.get("result") is True or str(current.get("result")) == "1":
+                current = current.get("data")
+                continue
+            return {}
+        if isinstance(current.get("success"), bool) and "data" in current:
+            if current.get("success"):
+                current = current.get("data")
+                continue
+            return {}
+        if "code" in current and "data" in current:
+            if str(current.get("code")).upper() in {"0", "1", "200", "OK", "SUCCESS"}:
+                current = current.get("data")
+                continue
+            return {}
+        break
+    return current
+
+
+def parse_wxsph_attribute_fields(payload: Any) -> Tuple[FieldSchema, ...]:
+    """Parse authoritative category-attribute candidates from captured JSON."""
+    body = _mapping(unwrap_wxsph_payload(payload))
+    attr = body.get("attr")
+    if isinstance(attr, Mapping):
+        values = _items(attr.get("productAttrList"))
+    else:
+        values = _items(attr)
+
+    normalized = []
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        item = dict(value)
+        kind = " ".join(
+            str(part)
+            for part in (
+                item.get("inputType"),
+                item.get("type"),
+                item.get("typeV2"),
+            )
+            if part not in (None, "")
+        ).lower()
+        raw_candidates = item.get("value")
+        if not _items(item.get("values")) and "select" in kind:
+            if isinstance(raw_candidates, str):
+                candidates = tuple(
+                    candidate.strip()
+                    for candidate in re.split(r"[;；]", raw_candidates)
+                    if candidate.strip()
+                )
+            else:
+                candidates = _items(raw_candidates)
+            # The current WeChat API can repeat a label (for example "棉").
+            # Preserve the server order while keeping reconciliation unique.
+            candidates = tuple(dict.fromkeys(candidates))
+            # This API shape exposes labels only. FastMai's bound select value
+            # uses that same string, so keep the label as the authoritative
+            # value ID and verify it against both the live DOM ID and label.
+            item["values"] = tuple(
+                {"id": candidate, "name": candidate}
+                if isinstance(candidate, str)
+                else candidate
+                for candidate in candidates
+            )
+        normalized.append(item)
+    return _fields(
+        normalized,
+        section="attributes",
+        prefix="wxsph:attribute",
+        path=_PROPERTIES.path,
+    )
 
 
 async def _activate(panel: Any, candidate: CategoryCandidate) -> None:
@@ -358,6 +464,7 @@ class WxsphListing:
             section="fixed",
             control_type="select_one",
             option_summary=option_summary(template_values, source="shop"),
+            option_values=field_options(template_values, source="shop"),
             api_paths=(_TEMPLATES.path,),
         )
         fixed_fields = _fields(
@@ -523,30 +630,27 @@ class WxsphListing:
             )
             if candidate is not None
         )
-        hints = _hint_leaves(context)
-        recommendation_exact = tuple(
-            candidate
-            for candidate in prediction_candidates
-            if hints and normalize_label(candidate.path[-1]) in hints
+        chosen, strategy = choose_category_object(
+            prediction_candidates, context.category_hints
         )
-        if len(recommendation_exact) == 1:
+        if chosen is not None:
             self._resolution_fragment = SchemaFragment(
                 endpoints=(prediction_observation,),
             )
             return CategoryResolution(
                 status="resolved",
                 source="recommendation",
-                selected=recommendation_exact[0],
+                selected=chosen,
                 candidates=prediction_candidates,
             )
-        if len(recommendation_exact) > 1:
+        if strategy.startswith("ambiguous"):
             self._resolution_fragment = SchemaFragment(
                 endpoints=(prediction_observation,),
             )
             return CategoryResolution(
                 status="review_required",
                 source="recommendation",
-                candidates=recommendation_exact,
+                candidates=prediction_candidates,
                 reason="ambiguous_exact_leaf",
             )
 
@@ -564,27 +668,25 @@ class WxsphListing:
             observations,
             state,
         )
-        exact = tuple(
-            candidate
-            for candidate in candidates
-            if hints and normalize_label(candidate.path[-1]) in hints
+        chosen_tree, tree_strategy = choose_category_object(
+            candidates, context.category_hints
         )
         self._resolution_fragment = SchemaFragment(
             endpoints=tuple(observations),
             issues=tuple(state["issues"]),
         )
-        if len(exact) == 1 and not state["issues"]:
+        if chosen_tree is not None and not state["issues"]:
             return CategoryResolution(
                 status="resolved",
                 source="tree",
-                selected=exact[0],
+                selected=chosen_tree,
                 candidates=candidates,
             )
         return CategoryResolution(
             status="review_required",
             source="tree",
-            candidates=exact or candidates or prediction_candidates,
-            reason="ambiguous_exact_leaf" if len(exact) > 1 else "no_exact_leaf",
+            candidates=candidates or prediction_candidates,
+            reason="ambiguous_exact_leaf" if tree_strategy.startswith("ambiguous") else "no_excel_match",
         )
 
     async def activate_category(
@@ -614,12 +716,7 @@ class WxsphListing:
             },
         )
         payload = _mapping(payload)
-        attributes = _fields(
-            _items(payload.get("attr")),
-            section="attributes",
-            prefix="wxsph:attribute",
-            path=_PROPERTIES.path,
-        )
+        attributes = parse_wxsph_attribute_fields(payload)
         services = _fields(
             _items(payload.get("extraServiceList")),
             section="services",
@@ -673,4 +770,8 @@ class WxsphListing:
         )
 
 
-__all__ = ["WxsphListing"]
+__all__ = [
+    "WxsphListing",
+    "parse_wxsph_attribute_fields",
+    "unwrap_wxsph_payload",
+]

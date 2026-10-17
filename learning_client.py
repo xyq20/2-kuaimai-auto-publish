@@ -1,0 +1,330 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta
+import json
+import os
+import re
+from typing import Any, Mapping, Optional, Tuple
+from urllib import error, parse, request
+
+from learning_models import canonical_json
+from learning_store import LearningStore
+
+
+DEVICE_EVENT_TYPES = frozenset(
+    {
+        "product.upsert",
+        "snapshot.created",
+        "checkpoint.updated",
+        "stage.completed",
+        "readback.recorded",
+        "review.created",
+        "review.superseded",
+        "text_facts.created",
+    }
+)
+
+
+class LearningClientError(RuntimeError):
+    pass
+
+
+class LearningClientConfigurationError(LearningClientError):
+    pass
+
+
+class RetryableCloudError(LearningClientError):
+    pass
+
+
+class PermanentCloudError(LearningClientError):
+    pass
+
+
+class CloudLearningClient:
+    """Small authenticated client whose exceptions never include request secrets."""
+
+    def __init__(
+        self,
+        base_url: str,
+        device_token: Optional[str] = None,
+        timeout: float = 15.0,
+    ) -> None:
+        token = device_token or os.environ.get("KUAIMAI_LEARNING_DEVICE_TOKEN", "")
+        if not base_url.strip():
+            raise LearningClientConfigurationError("learning API URL is required")
+        if not token:
+            raise LearningClientConfigurationError("learning device authentication is required")
+        self.base_url = base_url.rstrip("/")
+        self.device_token = token
+        self.timeout = timeout
+
+    def post_event(
+        self,
+        key: str,
+        event_type: str,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if event_type not in DEVICE_EVENT_TYPES:
+            raise ValueError("unsupported device event type")
+        status, body = self._request(
+            "POST",
+            "/api/device/events",
+            {
+                "idempotency_key": key,
+                "event_type": event_type,
+                "payload": payload,
+            },
+        )
+        return self._successful_json(status, body, event_duplicate=True)
+
+    def decide(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        status, body = self._request("POST", "/api/device/decide", payload)
+        return self._successful_json(status, body)
+
+    def review_learning(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        status, body = self._request("POST", "/api/device/review-learning", payload)
+        if status == 404:
+            return {"status": "review_required", "reason_code": "review_learning_unavailable"}
+        return self._successful_json(status, body)
+
+    def analyze(self, product_version: str) -> Mapping[str, Any]:
+        status, body = self._request(
+            "POST", "/api/device/analyze", {"product_version": product_version}
+        )
+        return self._successful_json(status, body)
+
+    def _judge(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        status, body = self._request("POST", path, payload, timeout=40)
+        if status in {401, 403, 404, 422}:
+            reason = body.get("error", "")
+            safe_reason = reason if isinstance(reason, str) and re.fullmatch(r"[a-z0-9_:-]{1,80}", reason) else "request_rejected"
+            return {"status": "unavailable", "api_called": False,
+                    "reason_code": "judgment_request_rejected",
+                    "reason": f"本地判断接口拒绝请求：HTTP {status}，{safe_reason}；未进入模型调用"}
+        return self._successful_json(status, body)
+
+    def ocr_judge(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self._judge("/api/device/ocr-judge", payload)
+
+    def semantic_judge(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self._judge("/api/device/semantic-judge", payload)
+
+    def poll_resume(
+        self,
+        device_id: str,
+        wait_seconds: int = 30,
+    ) -> Mapping[str, Any]:
+        bounded_wait = max(0, min(int(wait_seconds), 30))
+        query = parse.urlencode(
+            {"device_id": device_id, "wait_seconds": bounded_wait}
+        )
+        status, body = self._request(
+            "GET",
+            f"/api/device/resume?{query}",
+            None,
+            timeout=max(self.timeout, bounded_wait + 5.0),
+        )
+        return self._successful_json(status, body)
+
+    def get_resume_events(
+        self,
+        device_id: str,
+        wait_seconds: int = 30,
+    ) -> Mapping[str, Any]:
+        return self.poll_resume(device_id, wait_seconds=wait_seconds)
+
+    def acknowledge_resume(
+        self,
+        event_id: str,
+        *,
+        checkpoint_id: str,
+        device_id: str,
+    ) -> Mapping[str, Any]:
+        if not checkpoint_id or not device_id:
+            raise ValueError("durable checkpoint_id and device_id are required")
+        encoded_event_id = parse.quote(event_id, safe="")
+        status, body = self._request(
+            "POST",
+            f"/api/device/resume/{encoded_event_id}/ack",
+            {
+                "checkpoint_persisted": True,
+                "checkpoint_id": checkpoint_id,
+                "device_id": device_id,
+            },
+        )
+        return self._successful_json(status, body)
+
+    def upload_asset(
+        self,
+        product_version: str,
+        sha256: str,
+        kind: str,
+        content_type: str,
+        body: bytes,
+    ) -> Mapping[str, Any]:
+        encoded_sha = parse.quote(sha256, safe="")
+        status, response = self._request(
+            "PUT",
+            f"/api/device/assets/{encoded_sha}",
+            None,
+            body=body,
+            headers={
+                "Content-Type": content_type,
+                "X-Product-Version": product_version,
+                "X-Asset-Kind": kind,
+            },
+        )
+        return self._successful_json(status, response)
+
+    def _successful_json(
+        self,
+        status: int,
+        body: Mapping[str, Any],
+        *,
+        event_duplicate: bool = False,
+    ) -> Mapping[str, Any]:
+        successful = {200, 201}
+        if status in successful:
+            return body
+        if (
+            event_duplicate
+            and status == 409
+            and "event_id" in body
+            and "error" not in body
+        ):
+            return body
+        if status == 429 or status >= 500:
+            raise RetryableCloudError(f"cloud status {status}")
+        reason = body.get("error")
+        safe_reason = (
+            reason
+            if isinstance(reason, str)
+            and re.fullmatch(r"[a-z0-9_:-]{1,80}", reason)
+            else ""
+        )
+        suffix = f" ({safe_reason})" if safe_reason else ""
+        raise PermanentCloudError(f"cloud status {status}{suffix}")
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Mapping[str, Any]],
+        *,
+        body: Optional[bytes] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        timeout: Optional[float] = None,
+    ) -> Tuple[int, Mapping[str, Any]]:
+        request_headers = {
+            "Authorization": f"Device {self.device_token}",
+        }
+        request_headers.update(headers or {})
+        data = body
+        if payload is not None:
+            data = canonical_json(payload).encode("utf-8")
+            request_headers.setdefault("Content-Type", "application/json")
+        built_request = request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers=request_headers,
+            method=method,
+        )
+        try:
+            with request.urlopen(
+                built_request,
+                timeout=self.timeout if timeout is None else timeout,
+            ) as response:
+                return int(response.status), self._decode_response(response.read())
+        except error.HTTPError as caught:
+            return int(caught.code), self._decode_response(caught.read())
+        except (error.URLError, TimeoutError, OSError):
+            raise RetryableCloudError("cloud request failed") from None
+
+    @staticmethod
+    def _decode_response(raw: bytes) -> Mapping[str, Any]:
+        if not raw:
+            return {}
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+
+def flush_outbox(
+    store: LearningStore,
+    client: CloudLearningClient,
+    now: datetime,
+) -> int:
+    """Best-effort delivery; retryable cloud failures remain in the local outbox."""
+    delivered = 0
+    for event in store.pending_outbox(limit=50):
+        oldest_fn = getattr(store, "earliest_pending_outbox_id", None)
+        oldest = oldest_fn() if callable(oldest_fn) else None
+        if isinstance(oldest, int) and oldest != event.id:
+            if isinstance(oldest, int):
+                break
+            continue
+        try:
+            client.post_event(
+                event.idempotency_key,
+                event.event_type,
+                event.payload,
+            )
+        except RetryableCloudError as caught:
+            delay = min(300, 2 ** min(event.attempts, 8))
+            store.mark_retry(
+                event.id,
+                str(caught),
+                (now + timedelta(seconds=delay)).isoformat(),
+            )
+            if isinstance(oldest, int):
+                break
+            continue
+        except PermanentCloudError as caught:
+            if "checkpoint_mismatch" in str(caught):
+                store.mark_discarded(event.id, str(caught))
+                continue
+            raise
+        store.mark_delivered(event.id)
+        delivered += 1
+    return delivered
+
+
+async def flush_outbox_async(
+    store: LearningStore,
+    client: CloudLearningClient,
+    now: datetime,
+) -> int:
+    """Deliver network requests off-thread while keeping SQLite on its owner thread."""
+    delivered = 0
+    for event in store.pending_outbox(limit=50):
+        oldest_fn = getattr(store, "earliest_pending_outbox_id", None)
+        oldest = oldest_fn() if callable(oldest_fn) else None
+        if isinstance(oldest, int) and oldest != event.id:
+            break
+        try:
+            await asyncio.to_thread(
+                client.post_event,
+                event.idempotency_key,
+                event.event_type,
+                event.payload,
+            )
+        except RetryableCloudError as caught:
+            delay = min(300, 2 ** min(event.attempts, 8))
+            store.mark_retry(
+                event.id,
+                str(caught),
+                (now + timedelta(seconds=delay)).isoformat(),
+            )
+            break
+        except PermanentCloudError as caught:
+            if "checkpoint_mismatch" in str(caught):
+                store.mark_discarded(event.id, str(caught))
+                continue
+            raise
+        store.mark_delivered(event.id)
+        delivered += 1
+    return delivered

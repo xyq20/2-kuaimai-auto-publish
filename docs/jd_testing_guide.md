@@ -5,7 +5,7 @@
 ### 1. 测试商品
 - 商品货号：`NGBL-10588`
 - 商品类目：`服饰内衣 > 男装 > 男士休闲裤 > 男士休闰直筒裤`
-- Excel 位置：`smb://gongxiang/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx`
+- Excel 位置：`smb://192.168.0.39/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx`
 
 ### 2. 环境要求
 - Python 3.9+
@@ -21,7 +21,7 @@
 python3 kuaimai_erp.py \
   --platform jd \
   --no-save \
-  --excel-url "smb://gongxiang/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx"
+  --excel-url "smb://192.168.0.39/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx"
 ```
 
 ### 保存模式（推荐）
@@ -31,7 +31,7 @@ python3 kuaimai_erp.py \
 python3 kuaimai_erp.py \
   --platform jd \
   --save-only \
-  --excel-url "smb://gongxiang/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx"
+  --excel-url "smb://192.168.0.39/共享文件/谭/products/绿巨人+NGBL-10588/产品信息.xlsx"
 ```
 
 ## 验证检查点
