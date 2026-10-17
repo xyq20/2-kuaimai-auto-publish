@@ -25,6 +25,7 @@ from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from platform_candidate_source import (
+    select_supports_multiple,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -244,23 +245,7 @@ class WxsphFormListing(YouzanFormListing):
         multi: bool,
         category_hints: Sequence[str] = (),
     ) -> Tuple[Tuple[str, ...], ...]:
-        """Build groups using the control's actual cardinality.
-
-        微信小店鞋类的“适用场景”是单选。历史 Excel/审核记录里可能保留
-        “日常，休闲”，但不能把整段文本当成一个自造值写入单选框；按
-        Excel 左到右取第一个页面候选。其它字段继续使用公共分隔规则。
-        """
-        if (
-            category_profile(category_hints).garment_kind == "footwear"
-            and
-            not multi
-            and normalize_label(page_label) == normalize_label("适用场景")
-        ):
-            return tuple(
-                group
-                for part in re.split(r"[,，、;；/／]", str(value or ""))
-                if (group := value_candidates(page_label, part.strip()))
-            )
+        """Use the same ordered plans and final single-choice fallback globally."""
         return selection_value_groups_for_control(page_label, value, multi=multi)
 
     def _start_api_capture(self) -> None:
@@ -543,7 +528,7 @@ class WxsphFormListing(YouzanFormListing):
                 "微信小店属性“{0}”下拉框不唯一".format(page_label)
             )
         select = selects.first
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         await self._open_select(select, multi=multi)
         try:
             _dropdown, options = await self._visible_dom_options(select)
@@ -589,7 +574,7 @@ class WxsphFormListing(YouzanFormListing):
         api_is_usable = api_is_usable and len(api_labels) == len(set(api_labels))
         api_is_usable = api_is_usable and bool(set(api_labels).intersection(dom_labels))
         candidates = api_candidates if api_is_usable else visible_candidates
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         if normalize_label(page_label) == normalize_label("适用对象"):
             universal = preferred_exact_candidate_label(
                 tuple(value.label for value in candidates), ("通用",)
@@ -934,7 +919,7 @@ class WxsphFormListing(YouzanFormListing):
         if await selects.count() != 1:
             return None
         select = selects.first
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         actual = await self._read_select_values(select, multi=multi)
         if tuple(map(normalize_option, actual)) == tuple(map(normalize_option, expected)):
             return actual
@@ -1053,7 +1038,7 @@ class WxsphFormListing(YouzanFormListing):
         select = item.locator(
             ":scope > .el-form-item__content .el-select:visible"
         ).first
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         # Exhaust the custom input path before asking an operator.
         try:
             actual = await self._set_select_values_directly(
@@ -1361,6 +1346,7 @@ class WxsphFormListing(YouzanFormListing):
             raise WxsphFormListingError("微信小店类目与 Excel 不匹配，未找到唯一可用候选，停止填写")
         expected, row = selected
         await row.click()
+        expected = await self._complete_category_leaf(dialog, expected)
         deadline = asyncio.get_running_loop().time() + 10
         while asyncio.get_running_loop().time() < deadline:
             lines = (await dialog.inner_text()).splitlines()
@@ -1685,17 +1671,13 @@ class WxsphFormListing(YouzanFormListing):
                 ).first
                 multi = bool(
                     await select.count()
-                    and await select.locator(".el-select__tags").count() > 0
+                    and await select_supports_multiple(select)
                 )
                 groups = (
                     tuple((str(candidate),) for candidate in exact_values)
                     if exact_values is not None
-                    else self._selection_groups_for_control(
-                        page_label,
-                        value,
-                        multi=multi,
-                        category_hints=self.category_hints,
-                    )
+                    else await self._excel_groups_for_select(
+                        select, page_label, value, multi=multi)
                 )
                 resolved_values = await self._resolve_learning_select_groups(
                     page_label,
@@ -1721,7 +1703,7 @@ class WxsphFormListing(YouzanFormListing):
                                 "微信小店属性“{0}”下拉控件不唯一，无法清空".format(page_label)
                             )
                         select = selects.first
-                        multi = await select.locator(".el-select__tags").count() > 0
+                        multi = await select_supports_multiple(select)
                         if multi:
                             await self._clear_multi_select(select)
                         else:
@@ -2112,13 +2094,32 @@ class WxsphFormListing(YouzanFormListing):
                 )
             )
         await buttons.first.click()
-        dialogs = self.page.locator(
-            '.el-dialog:visible, [role="dialog"]:visible'
-        ).filter(has_text="发货方式")
-        try:
-            await dialogs.first.wait_for(state="visible", timeout=15_000)
-        except Exception as exc:
-            raise WxsphFormListingError("微信小店“发货方式”弹窗未打开") from exc
+        # The production modal can lack Element's dialog class/ARIA role.
+        # Locate the smallest visible container owning the title, radio inputs
+        # and confirmation button, excluding the underlying SKU table.
+        dialogs = self.page.locator('[data-kuaimai-delivery-dialog="true"]:visible')
+        deadline = asyncio.get_running_loop().time() + 15
+        while asyncio.get_running_loop().time() < deadline:
+            await self.page.get_by_text('发货方式', exact=True).evaluate_all("""titles => {
+              document.querySelectorAll('[data-kuaimai-delivery-dialog]').forEach(
+                node => node.removeAttribute('data-kuaimai-delivery-dialog'));
+              for (const title of titles) {
+                if (!title.getClientRects().length) continue;
+                for (let node = title.parentElement; node && node !== document.body; node = node.parentElement) {
+                  if (node.querySelector('table, .el-table')) break;
+                  const confirms = [...node.querySelectorAll('button')].filter(
+                    button => button.textContent.trim() === '确定');
+                  if (confirms.length === 1 && node.querySelector('input[type="radio"]')) {
+                    node.setAttribute('data-kuaimai-delivery-dialog', 'true'); break;
+                  }
+                }
+              }
+            }""")
+            if await dialogs.count():
+                break
+            await asyncio.sleep(.1)
+        else:
+            raise WxsphFormListingError("微信小店“发货方式”弹窗未打开或缺少可识别控件")
         if await dialogs.count() != 1:
             raise WxsphFormListingError(
                 "微信小店“发货方式”弹窗不是唯一项：{0}".format(
@@ -2273,7 +2274,7 @@ class WxsphFormListing(YouzanFormListing):
                         errors.append("{0}=下拉控件不唯一".format(page_label))
                         continue
                     select = selects.first
-                    multi = await select.locator(".el-select__tags").count() > 0
+                    multi = await select_supports_multiple(select)
                     actual = await self._read_select_values(select, multi=multi)
                     if any(str(value).strip() for value in actual):
                         errors.append(
@@ -2352,7 +2353,7 @@ class WxsphFormListing(YouzanFormListing):
                     errors.append("{0}=下拉控件不唯一".format(page_label))
                     continue
                 select = selects.first
-                multi = await select.locator(".el-select__tags").count() > 0
+                multi = await select_supports_multiple(select)
                 actual = await self._read_select_values(select, multi=multi)
                 if expected_attributes is not None and page_label in expected_attributes:
                     # Carry the successfully written decision across the new
@@ -2362,11 +2363,10 @@ class WxsphFormListing(YouzanFormListing):
                 groups = (
                     tuple((str(candidate),) for candidate in exact_values)
                     if exact_values is not None
-                    else self._selection_groups_for_control(
-                        page_label,
+                    else await self._excel_groups_for_select(
+                        select, page_label,
                         str(value),
                         multi=multi,
-                        category_hints=self.category_hints,
                     )
                 )
                 matches = bool(groups) and all(
@@ -2468,6 +2468,9 @@ class WxsphFormListing(YouzanFormListing):
     async def apply_excel_fields(self, fields: WxsphFields) -> Mapping[str, Any]:
         try:
             attributes = await self.fill_category_attributes(fields)
+            raise_reviews = getattr(self.attribute_runtime, 'raise_deferred_reviews', None)
+            if callable(raise_reviews):
+                raise_reviews()
             sku_batch = await self.fill_sku_batch(fields.fields)
             delivery = await self.apply_batch_delivery()
             weight = await self.fill_weight()

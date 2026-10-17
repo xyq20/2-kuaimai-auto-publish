@@ -135,6 +135,7 @@ async def persist_resume_and_ack(
         pass
     if store.connection.execute(
         "SELECT 1 FROM sync_outbox WHERE delivered_at IS NULL "
+        "AND discarded_at IS NULL "
         "AND event_type='checkpoint.updated' "
         "AND json_extract(payload_json, '$.run_id')=? LIMIT 1",
         (checkpoint.run_id,),

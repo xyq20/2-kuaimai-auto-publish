@@ -13,6 +13,12 @@ from xhs_form_listing import XhsFormListing, title_without_neigborl
 
 
 class XhsDataTests(unittest.TestCase):
+    def test_first_exact_sweatshirt_alternative_is_not_replaced_by_last_alias(self):
+        self.assertEqual(XhsFormListing._choose_category_text(
+            ('男装 > 卫衣',), ('卫衣/打底衫/男士套头卫衣/套头卫衣',)),
+            ('男装 > 卫衣', 'full_ordered_path'))
+        self.assertTrue(XhsFormListing._category_selection_matches(
+            '男装 > 卫衣', ('卫衣/打底衫/男士套头卫衣/套头卫衣',)))
     def test_shoe_category_rejects_root_only_search_result(self):
         from xhs_form_listing import XhsFormListingError
         path = ('流行男鞋', '时尚单鞋', '休闲皮鞋', '正装皮鞋', '男士德比鞋', '皮鞋')
@@ -488,6 +494,17 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         )
         listing = XhsFormListing(self.page, self.page.locator("body"), None)
         await listing.open()
+        await self.page.evaluate("""() => {
+          const chosen=document.getElementById('chosen');
+          if (!chosen) return;
+          const menus=document.createElement('div');chosen.after(menus);
+          new MutationObserver(()=>{
+            const parts=chosen.textContent.replace(/^已选[：:]\s*/, '').split(' > ').filter(Boolean);
+            menus.innerHTML=parts.map((name,i)=>
+              '<div class="el-cascader-menu"><div class="el-cascader-node" '+
+              (i<parts.length-1?'aria-haspopup="true"':'')+'><span class="el-cascader-node__label">'+name+'</span></div></div>').join('');
+          }).observe(chosen, {childList:true, characterData:true, subtree:true});
+        }""")
         return listing
 
     async def _ordered_category_listing(self, records_by_term):
@@ -528,7 +545,7 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         }""")
         return listing
 
-    async def test_category_search_prefers_specific_final_leaf(self):
+    async def test_category_search_respects_first_available_slash_alternative(self):
         listing = await self._ordered_category_listing({
             "休闲裤": [["男装", "休闲裤", "休闲裤"]],
             "男士休闲直筒裤": [["男装", "休闲裤", "男士休闲直筒裤"]],
@@ -537,9 +554,9 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         report = await listing.apply_category(("休闲裤/男士休闲直筒裤/工装休闲裤",))
         self.assertEqual(
             self.searches,
-            ["休闲裤", "男士休闲直筒裤", "工装休闲裤"],
+            ["休闲裤"],
         )
-        self.assertEqual(report["selected"], "男装 > 休闲裤 > 工装休闲裤")
+        self.assertEqual(report["selected"], "男装 > 休闲裤 > 休闲裤")
 
     async def test_category_validation_mismatch_uses_model_to_choose_real_full_path(self):
         listing = await self._ordered_category_listing({
@@ -569,7 +586,8 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(report['selected'], '服装 > 男装 > 羊毛开衫')
                 trace = listing.attribute_runtime.model_decisions[0]
                 self.assertEqual(trace['status'], 'adopted')
-                self.assertIn('validation_error', trace['input_evidence'])
+                self.assertEqual(trace['input_evidence']['category_source'], 'excel_search_ambiguous')
+                self.assertIn('全新奢侈品 > 贸易男装/男士精品 > 针织衫/毛衣', trace['input_evidence']['candidate_paths'])
                 self.assertEqual(self.searches[:2], ['针织衫','毛衣'])
             finally:
                 store.close()
@@ -586,11 +604,11 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(
-            report["selected"], "男装 > 休闲裤 > 工装休闲裤"
+            report["selected"], "男装 > 休闲裤 > 男士休闲直筒裤"
         )
         self.assertEqual(
             self.searches,
-            ["休闲裤", "男士休闲直筒裤", "工装休闲裤"],
+            ["休闲裤", "男士休闲直筒裤"],
         )
 
     async def test_category_fallback_uses_xhs_learning_review(self):
@@ -613,7 +631,7 @@ class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
 
         listing.attribute_runtime = Runtime()
 
-        report = await listing.apply_category(("休闲裤/男士休闲直筒裤/工装休闲裤",))
+        report = await listing.apply_category(("休闲裤/直筒裤/工装休闲裤",))
 
         self.assertEqual(report["strategy"], "review_learning")
         self.assertEqual(requests[0].platform_id, "xhs")

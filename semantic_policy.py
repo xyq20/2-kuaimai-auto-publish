@@ -2,7 +2,7 @@
 
 import re
 
-POLICY_VERSION = "semantic-evidence-v2"
+POLICY_VERSION = "semantic-evidence-v3"
 STYLE_JUDGMENT_FIELDS = frozenset({'风格', '细分风格', '基础风格'})
 
 
@@ -12,29 +12,12 @@ def is_style_judgment_field(field_label):
 
 
 def exact_multiselect_groups(answer, request):
-    groups = request.evidence.get("requested_groups")
-    if request.control_type not in {"multi_select", "multi-select", "multiselect"} or not isinstance(groups, list) or len(groups) < 2:
-        return False
-    if request.evidence.get("full_excel_value") != request.excel_value:
-        return False
+    from attribute_runtime import _matched_excel_variants
     if (answer.get("assessment") or {}).get("conflicts"):
         return False
-    expected = []
-    for group in groups:
-        if not isinstance(group, list) or not group:
-            return False
-        chosen = None
-        for text in group:
-            matches = [c.value_id for c in request.candidates if c.label == text]
-            if len(matches) > 1:
-                return False
-            if matches:
-                chosen = matches[0]
-                break
-        if chosen is None:
-            return False
-        expected.append(chosen)
-    return set(expected) == set(answer.get("value_ids", []))
+    variants = _matched_excel_variants(request.excel_value, tuple(getattr(request, 'candidates', ())),
+        control_type=request.control_type, field_label=getattr(request, 'field_label', ''))
+    return bool(variants) and {c.value_id for c in variants[0]} == set(answer.get('value_ids', []))
 
 
 def adoption_policy(answer, request, *, allow_auto=True):
@@ -52,13 +35,19 @@ def adoption_policy(answer, request, *, allow_auto=True):
     if preference and isinstance(competing, list) and isinstance(acceptable, list):
         competing = [ident for ident in competing if ident not in acceptable]
     reason = ""
+    from attribute_runtime import _matched_excel_variants
+    variants = _matched_excel_variants(request.excel_value, tuple(getattr(request, 'candidates', ())),
+        control_type=request.control_type, field_label=getattr(request, 'field_label', '')) if request.control_type != 'category' else ()
+    human_choice = request.evidence.get('failed_selection_source') in {'human_override', 'cross_product_human', 'review_learning'}
     if not allow_auto or (request.evidence.get("selection_only") and not request.evidence.get("bounded_write_retry")):
         reason = "已有审核冲突或页面操作失败，需要人工确认"
     elif (request.evidence.get('bounded_write_retry')
           and request.evidence.get('failed_selection_source') in {'human_override', 'cross_product_human', 'review_learning'}
           and set(answer.get('value_ids', [])) != set(request.evidence.get('failed_selection_value_ids', []))):
         reason = "模型建议与已有人工选择不同，需要人工确认"
-    elif exact_multiselect_groups(answer, request):
+    elif variants and not human_choice and set(answer.get('value_ids', [])) != {c.value_id for c in variants[0]}:
+        reason = "模型选择不符合 Excel 的首个完整可用备选方案"
+    elif variants and not human_choice and exact_multiselect_groups(answer, request):
         return {"version": POLICY_VERSION, "relation": "equivalent", "threshold": None,
                 "auto_adopt": True, "acceptable_value_ids": answer["value_ids"],
                 "reason": "模型组合逐组符合 Excel 顺序精确候选，程序复核通过，自动采用；仍须页面回读"}

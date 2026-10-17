@@ -13,7 +13,7 @@ import uuid
 
 from attribute_decision import DecisionInput, DecisionStatus, validate_decision
 from canonical_fields import FieldMappingError, map_platform_field
-from field_policies import match_style_option_candidates
+from field_policies import heel_height_option_matches, match_style_option_candidates, season_option_aliases
 from historical_readbacks import (
     VerifiedAttributeHistory,
     normalize_history_field_label,
@@ -86,6 +86,25 @@ def excel_alternative_set(excel_value: object) -> frozenset:
     )
 
 
+def excel_selection_plans(excel_value: object, *, multi: bool) -> Tuple[Tuple[str, ...], ...]:
+    """Try complete slash-separated plans before a single-control comma fallback."""
+    plans = tuple(
+        tuple(part.strip() for part in re.split(MULTI_CHOICE_SEPARATORS, alternative)
+              if part.strip()) if multi else (alternative.strip(),)
+        for alternative in re.split(r"[/／]", str(excel_value or ""))
+        if alternative.strip()
+    )
+    if not multi:
+        # 单选先保留平台上可能存在的完整组合标签，及 / 后的备用方案。
+        # 都无法匹配时，才依次尝试逗号项，不能让它们抢先于备用方案。
+        fallback = tuple(
+            (part,) for plan in plans for part in split_multi_choice(plan[0])
+            if len(split_multi_choice(plan[0])) > 1
+        )
+        plans = tuple(dict.fromkeys((*plans, *fallback)))
+    return plans
+
+
 def _matched_excel_variants(
     excel_value: object,
     candidates: Tuple[CandidateValue, ...],
@@ -105,22 +124,8 @@ def _matched_excel_variants(
     text = str(excel_value or "").strip()
     if not text:
         return ()
-    if str(control_type).casefold() in MULTI_SELECT_CONTROL_TYPES:
-        raw_variants = tuple(
-            tuple(
-                part.strip()
-                for part in re.split(MULTI_CHOICE_SEPARATORS, alternative)
-                if part.strip()
-            )
-            for alternative in re.split(r"[/／]", text)
-            if alternative.strip()
-        )
-    else:
-        raw_variants = tuple(
-            (part.strip(),)
-            for part in re.split(r"[/／]", text)
-            if part.strip()
-        )
+    raw_variants = excel_selection_plans(
+        text, multi=str(control_type).casefold() in MULTI_SELECT_CONTROL_TYPES)
 
     matched_variants = []
     for variant in raw_variants:
@@ -132,10 +137,18 @@ def _matched_excel_variants(
                 if part in {candidate.value_id, candidate.label}
             )
             if not found:
+                aliases = season_option_aliases(field_label, part)
+                found = tuple(candidate for candidate in candidates if candidate.label in aliases)
+            if not found:
                 style_matches = match_style_option_candidates(
                     field_label, part, tuple(candidate.label for candidate in candidates)
                 )
                 found = tuple(candidates[index] for index in style_matches)
+            if not found:
+                height_matches = heel_height_option_matches(
+                    field_label, part, tuple(candidate.label for candidate in candidates)
+                )
+                found = tuple(candidates[index] for index in height_matches)
             if len(found) != 1 or found[0] in matched:
                 matched = []
                 break
@@ -246,6 +259,33 @@ class AttributeRuntime:
         if self._deferred_reviews:
             raise ReviewBatchRequired(self.deferred_reviews)
 
+    def unrestored_run_reviews(self, platform_id: str) -> Tuple[ReviewRequired, ...]:
+        """Recover the durable batch after the browser process has exited."""
+        reviews = {}
+        superseded = {json.loads(row['payload_json'])['review_id'] for row in self.store.connection.execute(
+            "SELECT payload_json FROM sync_outbox WHERE event_type='review.superseded' AND delivered_at IS NOT NULL "
+            "AND json_extract(payload_json,'$.run_id')=?", (self.run_id,))}
+        rows = self.store.connection.execute(
+            "SELECT payload_json FROM sync_outbox WHERE event_type='review.created' "
+            "AND json_extract(payload_json,'$.run_id')=? ORDER BY rowid DESC", (self.run_id,))
+        for row in rows:
+            payload = json.loads(row['payload_json'])
+            if payload['id'] in superseded:
+                continue
+            if payload.get('product_version') != self.product_version or canonical_platform_name(payload['platform_id']) != canonical_platform_name(platform_id):
+                continue
+            key = (payload['field_id'], payload['snapshot_version'])
+            if key in reviews or self.store.load_review_resolution(product_version=self.product_version,
+                    platform_id=canonical_platform_name(platform_id), snapshot_version=payload['snapshot_version']) is not None:
+                continue
+            evidence = payload.get('evidence_json') or {}
+            request = AttributeRequest(platform_id=payload['platform_id'],
+                category_leaf_id=payload['category_leaf_id'], field_id=payload['field_id'],
+                field_label=payload['field_label'], candidates=(), excel_value='', evidence=evidence,
+                custom_allowed=False, schema_version='')
+            reviews[key] = ReviewRequired(payload['id'], request, payload['reason_code'], payload['snapshot_version'])
+        return tuple(reversed(tuple(reviews.values())))
+
     def intentionally_omitted(self, platform_id: str, field_label: str) -> bool:
         """Only an explicit review decision may exempt a visible Excel field."""
         key = (
@@ -311,10 +351,27 @@ class AttributeRuntime:
         except FieldMappingError:
             canonical_field = None
         self._queue_candidate_snapshot(snapshot, canonical_field, request.control_type)
+        if not force_review:
+            approved = self.confirmed_choice(request)
+            if approved is not None:
+                return self._remember_resolved(request, approved)
+            if previous.source in {'human_override', 'cross_product_human', 'review_learning'} and previous.value_id and all(
+                    ident in {c.value_id for c in request.candidates} for ident in split_multi_choice(previous.value_id)):
+                return self._remember_resolved(request, previous)
+            variants = _matched_excel_variants(request.excel_value, request.candidates,
+                control_type=request.control_type, field_label=request.field_label)
+            if variants and previous.source not in {'human_override', 'cross_product_human', 'review_learning'}:
+                chosen = variants[0]
+                logging.getLogger('kuaimai_erp').info(
+                    '属性“%s”候选已确定，重试页面写入：%s', field_label,
+                    ','.join(value.label for value in chosen))
+                return self._remember_resolved(request, ResolvedAttribute(
+                    ','.join(value.value_id for value in chosen),
+                    ','.join(value.label for value in chosen), 'explicit_text', snapshot.snapshot_version))
         logging.getLogger('kuaimai_erp').warning(
             '属性“%s”填写失败：%s；%s', field_label, error,
-            '模型重试仍失败，转人工审核' if force_review else '进入大模型判断流程')
-        resolved = await self._semantic_choice(request, snapshot, allow_auto=not force_review)
+            '页面重试仍失败，转人工处理写入异常' if force_review else '进入大模型判断流程')
+        resolved = (previous if previous.value_id else None) if force_review else await self._semantic_choice(request, snapshot, allow_auto=True)
         if resolved is not None and not force_review:
             return resolved
         traces = [row for row in self.model_decisions
@@ -328,7 +385,7 @@ class AttributeRuntime:
             if trace and trace['status'] != 'rejected' else None)
         if force_review and trace is not None:
             trace.update(status='review_required', readback_status='write_failed',
-                         write_error=str(error), treatment_reason='模型选择重试仍未写入，转人工审核')
+                         write_error=str(error), treatment_reason='已确定候选，页面重试仍未写入，需要处理写入异常')
             if self.model_decision_sink is not None:
                 self.model_decision_sink()
         review_request = replace(request, evidence={

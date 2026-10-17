@@ -553,7 +553,9 @@ class MainErrorHandlingTests(unittest.TestCase):
         logger = Mock()
         with patch.object(kuaimai_erp, "setup_logging", return_value=logger), patch.object(
             kuaimai_erp, "resolve_excel_path", return_value=Path("/input/产品信息.xlsx")
-        ), patch.object(kuaimai_erp, "read_product_data", side_effect=DouyinDataError("抖音资料不完整")), patch(
+        ), patch.object(kuaimai_erp, "read_product_data", side_effect=DouyinDataError("抖音资料不完整")), patch.object(
+            kuaimai_erp, "diagnose_failure"
+        ), patch(
             "sys.argv", ["kuaimai_erp", "--dry-run"]
         ):
             self.assertEqual(kuaimai_erp.main(), 2)

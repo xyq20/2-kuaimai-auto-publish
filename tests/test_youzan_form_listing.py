@@ -198,6 +198,14 @@ class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
               document.querySelectorAll('.category-result').forEach(row => row.onclick = () => {{
                 document.querySelectorAll('.category-result').forEach(other => other.classList.remove('is-selected'));
                 row.classList.add('is-selected');
+                const dialog=document.querySelector('.el-dialog');
+                dialog.querySelector('#guard-menus')?.remove();
+                const menus=document.createElement('div');menus.id='guard-menus';
+                const parts=row.textContent.trim().split(' > ');
+                menus.innerHTML='<div>已选：'+parts.join(' > ')+'</div>'+parts.map((name,i)=>
+                  '<div class="el-cascader-menu"><div class="el-cascader-node" '+
+                  (i<parts.length-1?'aria-haspopup="true"':'')+'><span class="el-cascader-node__label">'+name+'</span></div></div>').join('');
+                dialog.appendChild(menus);
               }});
               function confirmCategory() {{
                 const selected = document.querySelector('.category-result.is-selected');

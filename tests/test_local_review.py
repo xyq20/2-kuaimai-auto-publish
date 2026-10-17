@@ -16,6 +16,25 @@ from local_review.service import analyze_product
 
 
 class LocalReviewApiTests(unittest.TestCase):
+    def test_device_can_supersede_only_its_unclaimed_review_without_human_learning(self):
+        self.product_and_snapshot()
+        self.event('obsolete', 'review.created', {
+            'id': 'obsolete', 'run_id': 'run', 'device_id': 'mac', 'product_version': 'pv-1',
+            'platform_id': 'jd', 'category_leaf_id': 'straight-pants', 'field_id': 'length',
+            'field_label': '裤长', 'canonical_field': 'pant_length', 'snapshot_version': 'sv-1',
+            'reason_code': 'candidate_missing', 'evidence_json': {}})
+        payload = {'run_id':'run', 'device_id':'mac', 'product_version':'pv-1',
+            'platform_id':'jd', 'review_id':'obsolete', 'snapshot_version':'sv-1',
+            'reason':'匹配缺陷已修复，重新读取页面候选'}
+        for attempt in range(2):
+            response = self.client.post('/api/device/events', headers=self.device_headers,
+                json={'idempotency_key':'supersede', 'event_type':'review.superseded', 'payload':payload})
+            self.assertIn(response.status_code, (201,409), response.text)
+        with connect(self.settings) as connection:
+            self.assertEqual(connection.execute("SELECT status FROM review_tasks WHERE id='obsolete'").fetchone()[0], 'invalidated')
+            self.assertEqual(connection.execute('SELECT count(*) FROM review_actions').fetchone()[0], 0)
+            self.assertEqual(connection.execute('SELECT count(*) FROM attribute_decisions').fetchone()[0], 0)
+
     def test_ocr_review_shows_only_its_source_chart_and_never_a_product_photo(self):
         self.product_and_snapshot()
         digests = {}
@@ -1081,6 +1100,47 @@ class LocalReviewApiTests(unittest.TestCase):
             json={"version": claimed["version"], "final_value_id": "long"},
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
+
+    def test_changed_ai_suggestion_accepts_optional_note_and_records_decision(self):
+        self.product_and_snapshot()
+        self.event(
+            "review-no-suggestion",
+            "review.created",
+            {
+                "id": "review-no-suggestion",
+                "run_id": "run-no-suggestion",
+                "device_id": "mac-1",
+                "product_version": "pv-1",
+                "platform_id": "jd",
+                "category_leaf_id": "straight-pants",
+                "field_id": "length",
+                "field_label": "裤长",
+                "canonical_field": "pant_length",
+                "snapshot_version": "sv-1",
+                "suggested_value_id": "short",
+                "reason_code": "insufficient_evidence",
+                "evidence_json": {},
+            },
+        )
+        self.login()
+        task = self.client.get("/api/reviews").json()["tasks"][0]
+        claimed = self.client.post(
+            "/api/reviews/review-no-suggestion/claim",
+            headers={"Origin": "http://testserver"},
+            json={"version": task["version"]},
+        ).json()
+        confirmed = self.client.post(
+            "/api/reviews/review-no-suggestion/confirm",
+            headers={"Origin": "http://testserver"},
+            json={"version": claimed["version"], "final_value_id": "long"},
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+
+        with transaction(self.settings) as connection:
+            row = connection.execute("SELECT suggested_value_id,final_value_id,correction_reason FROM review_actions WHERE review_id='review-no-suggestion'").fetchone()
+            self.assertEqual(row['suggested_value_id'], 'short')
+            self.assertEqual(row['final_value_id'], 'long')
+            self.assertIsNone(row['correction_reason'])
 
 
 if __name__ == "__main__":

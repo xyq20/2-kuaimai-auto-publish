@@ -41,6 +41,18 @@ class ReviewLearningTests(unittest.TestCase):
         self.assertEqual(result['support_count'], 3)
         self.assertEqual(result['value_labels'], ['青年','中年'])
 
+    def test_category_or_storage_formats_reuse_same_human_combination(self):
+        hints = ['卫衣', '打底衫', '男士套头卫衣', '套头卫衣']
+        request = self.request(category={'hints': ['／'.join(hints)]})
+        records = [self.record(str(i), category={'hints': hints},
+                               control_type='multi_select') for i in range(3)]
+        result = choose_review_learning(request, records)
+        self.assertEqual(result['support_count'], 3)
+        self.assertEqual(result['value_labels'], ['青年', '中年'])
+        for different in (['裤子', *hints[1:]], list(reversed(hints))):
+            self.assertNotIn('value_ids', choose_review_learning(
+                self.request(category={'hints': ['/'.join(different)]}), records))
+
     def test_repeated_reviews_of_one_product_do_not_raise_confidence(self):
         result = choose_review_learning(self.request(), [self.record() for _ in range(4)])
         self.assertNotIn('value_ids', result)

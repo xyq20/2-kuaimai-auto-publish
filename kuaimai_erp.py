@@ -24,8 +24,9 @@ import sys
 import tempfile
 import time
 import uuid
+import fcntl
 from collections.abc import Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -35,6 +36,7 @@ from urllib.parse import unquote, unquote_to_bytes, urljoin, urlsplit
 from zipfile import BadZipFile
 
 from category_profile import category_profile
+from product_materials import MaterialPathError, default_materials_root, resolve_product_materials
 from douyin_data import DouyinAssets, DouyinDataError, DouyinFields, field_lookup, parse_douyin_fields, read_douyin_assets
 from douyin_listing import DouyinListing, DouyinListingError
 from jd_data import JdFields, parse_jd_fields
@@ -126,6 +128,22 @@ def shared_runtime_root(script_dir: Path) -> Path:
         if parent.name == ".worktrees":
             return parent.parent
     return script_dir
+
+
+@contextmanager
+def automation_run_lock(profile_dir: Path):
+    """Serialize all runners sharing one Chrome profile."""
+    lock_path = profile_dir.expanduser().resolve().parent / (profile_dir.name + ".run.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise AutomationError("同一 Chrome 配置已有任务运行，请等待上一任务结束") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -395,7 +413,11 @@ def create_learning_context(
         facts = {"product_version": fingerprint.product_version, "source": "product_info",
                  "payload_json": {"product_info": descriptive}}
         store.enqueue("text_facts.created:product_info:" + canonical_sha256(facts), "text_facts.created", facts)
-    run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
+    run_id = (
+        getattr(args, "resume_run_id", None)
+        or getattr(args, "run_id", None)
+        or uuid.uuid4().hex
+    )
     client = CloudLearningClient(args.learning_api_url)
     runtime = AttributeRuntime(
         store,
@@ -522,7 +544,9 @@ def parse_category_hints(value: Any) -> Tuple[str, ...]:
     # expression intact here so downstream matchers can preserve that
     # distinction instead of receiving a fake ordered route.
     text = normalize_cell(value)
-    return (text,) if text else ()
+    # 供应商也会用 / 分隔多条完整路径：A > B > C / D > E > F。
+    # 只有后一个片段自身含层级分隔符时才拆路径，保留同层候选语法。
+    return tuple(part.strip() for part in re.split(r"[/／](?=[^/／]*[>＞])", text) if part.strip())
 
 
 def parse_spec_values(value: Any) -> Tuple[str, ...]:
@@ -701,6 +725,7 @@ def read_product_data(
     *,
     include_douyin: bool = True,
     identity_only: bool = False,
+    materials_root: Optional[Path] = None,
 ) -> ProductData:
     try:
         from openpyxl import load_workbook
@@ -730,9 +755,17 @@ def read_product_data(
     if price_value is None or normalize_cell(price_value) == "":
         raise AutomationError("Excel 中找不到“吊牌价/价格/基本售价”")
 
-    product_dir = excel_path.parent
     category_hints = parse_category_hints(field_value("商品分类"))
     colors = parse_spec_values(field_value("颜色"))
+    product_dir = excel_path.parent
+    if materials_root is not None:
+        try:
+            product_dir = resolve_product_materials(
+                materials_root, excel_path, title=title, style_code=style_code, colors=colors,
+                nickname=normalize_cell(field_value("商品简称", "产品简称", "款名")),
+            )
+        except MaterialPathError as exc:
+            raise AutomationError(str(exc)) from exc
     profile = category_profile(category_hints, title)
     descriptive_prefixes = ("商品分类", "颜色", "尺码", "面料", "材质", "成分", "风格", "款式", "版型",
                             "裤型", "袖型", "领型", "适用", "季节", "上市", "厚薄", "长度", "衣长",
@@ -768,7 +801,9 @@ def read_product_data(
         ("3：4主图", "3:4主图", "主图/3：4", "主图/3:4"),
         "3:4 主图",
     )
-    detail_dir = find_image_dir(product_dir, ("详情页图", "商品详情图"), "商品详情图")
+    detail_dir = find_image_dir(
+        product_dir, ("详情页图/images", "详情页图", "商品详情图/images", "商品详情图"), "商品详情图"
+    )
     sku_dir = find_image_dir(product_dir, ("SKU图", "sku图", "Sku图"), "SKU 图")
     has_douyin_signals = field_lookup(fields, "导购短标题") is not None or any(
         (product_dir / directory_name).is_dir()
@@ -821,7 +856,7 @@ def read_product_data(
     )
 
 
-def read_new_product_seed(excel_path: Path) -> ProductData:
+def read_new_product_seed(excel_path: Path, *, materials_root: Optional[Path] = None) -> ProductData:
     """只建基础链接：名称 1、一张主图、Excel 颜色、固定尺码、价格 0。"""
     from openpyxl import load_workbook
 
@@ -838,11 +873,24 @@ def read_new_product_seed(excel_path: Path) -> ProductData:
     colors = parse_spec_values(color_field[1] if color_field else None)
     if not colors:
         raise AutomationError("新增链接需要 Excel 中的颜色规格")
+    product_dir = excel_path.parent
+    if materials_root is not None:
+        title_field = field_lookup(fields, "商品标题", "商品名称", "宝贝标题")
+        nickname_field = field_lookup(fields, "商品简称", "产品简称", "款名")
+        try:
+            product_dir = resolve_product_materials(
+                materials_root, excel_path,
+                title=normalize_cell(title_field[1] if title_field else None),
+                style_code=style_code, colors=colors,
+                nickname=normalize_cell(nickname_field[1] if nickname_field else None),
+            )
+        except MaterialPathError as exc:
+            raise AutomationError(str(exc)) from exc
     directory = find_image_dir(
-        excel_path.parent, ("1：1主图", "1:1主图", "主图/1：1", "主图/1:1", "主图"), "主图"
+        product_dir, ("1：1主图", "1:1主图", "主图/1：1", "主图/1:1", "主图"), "主图"
     )
     return ProductData(
-        excel_path, excel_path.parent, "1", style_code, "0",
+        excel_path, product_dir, "1", style_code, "0",
         list_images(directory, "主图")[:1], [], [], [], colors=colors,
     )
 
@@ -5070,6 +5118,7 @@ async def run_browser_automation(
                     product.detail_images,
                     "商品详情图",
                     args.upload_timeout,
+                    force_replace=getattr(args, "replace_base_detail_images", False),
                 )
                 color_report: Optional[Dict[str, Any]] = None
                 if product.colors:
@@ -5764,6 +5813,9 @@ async def run_browser_automation(
                         # 蓝色“发布”生成下半页表单。底部保存/铺货仍完全由
                         # args.save 和 args.publish 门禁控制。
                         tmall_stage = "initial_product_publish"
+                        tmall_report["initial_footwear_attributes"] = (
+                            await tmall.fill_initial_footwear_attributes(product.tmall_fields)
+                        )
                         tmall_report["initial_listing_date"] = (
                             await tmall.fill_leather_shoe_listing_date(category)
                         )
@@ -6387,6 +6439,9 @@ async def run_browser_automation(
                 )
         except Exception:
             await safe_screenshot(page, artifact_dir / "error.png")
+            if attribute_runtime is not None and attribute_runtime.has_deferred_reviews:
+                logger.warning("后续页面步骤失败，先等待已提交的属性审核；确认后重跑当前平台")
+                attribute_runtime.raise_deferred_reviews()
             raise
         finally:
             if shared_session is not None:
@@ -6402,8 +6457,20 @@ async def run_browser_automation(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="从 Excel 和产品素材自动填写快麦基础/平台资料")
     parser.add_argument("--run-id", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--resume-run-id",
+        help="从本地学习检查点恢复；当前平台会重新执行并重新回读",
+    )
     parser.add_argument("--output-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--excel-url", default=DEFAULT_EXCEL_URL, help="产品信息.xlsx 的 smb:// 或本地路径")
+    parser.add_argument(
+        "--replace-base-detail-images", action="store_true",
+        help="素材更新后强制替换基础资料详情图，即使图片数量未变",
+    )
+    parser.add_argument(
+        "--materials-root", type=Path, default=default_materials_root(),
+        help="图片素材根目录；按北京时间选择当月文件夹，再按商品简称/货号及颜色匹配",
+    )
     parser.add_argument("--create-product", action="store_true", help="手工新增商品链接；与 --platform base 搭配，仅创建快麦商品，不铺货")
     parser.add_argument(
         "--platform",
@@ -6603,10 +6670,14 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_execution_mode(args: argparse.Namespace) -> Tuple[PlatformSpec, ...]:
     if getattr(args, "run_id", None) and not re.fullmatch(r"[0-9a-f]{32}", args.run_id):
         raise SystemExit("run-id 必须是 32 位十六进制任务标识")
+    if getattr(args, "resume_run_id", None) and not re.fullmatch(r"[0-9a-f]{32}", args.resume_run_id):
+        raise SystemExit("resume-run-id 必须是 32 位十六进制任务标识")
     try:
         args.platform = normalize_platform_selection(args.platform)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    if getattr(args, "resume_run_id", None) and args.platform != "all":
+        raise SystemExit("resume-run-id 仅支持从全平台检查点恢复")
     if getattr(args, "wash_label_upload_test", False) and (
         args.platform != "douyin"
         or args.save
@@ -6941,7 +7012,8 @@ async def read_product_with_ocr_review(excel_path, args, context, session, error
     while True:
         await recover_ocr_with_learning(context, args, session, error, logger)
         try:
-            return read_product_data(excel_path, include_douyin=include_douyin)
+            return read_product_data(excel_path, include_douyin=include_douyin,
+                                     materials_root=getattr(args, "materials_root", None))
         except OCRJudgmentRequired as failure:
             error = failure
 
@@ -7201,22 +7273,42 @@ async def run_all_implemented_platforms(
 ) -> None:
     """在同一编辑页内依次运行全平台或用户指定的平台组合。"""
     stages = platform_execution_stages(args, product)
+    resume_checkpoint: Optional[RunCheckpoint] = None
+    resume_index = 0
+    if learning_context is not None and getattr(args, "resume_run_id", None):
+        resume_checkpoint = learning_context.store.load_checkpoint(learning_context.run_id)
+        if resume_checkpoint is None:
+            raise AutomationError("找不到要恢复的本地审核检查点")
+        if resume_checkpoint.status in {"completed", "cancelled"}:
+            raise AutomationError("该审核任务已经结束，不能重复恢复")
+        stages = resume_checkpoint.platform_order
+        resume_index = resume_checkpoint.current_index
+        if not 0 <= resume_index < len(stages):
+            raise AutomationError("审核检查点的平台位置无效")
     logger.info("本次平台执行顺序：%s", " → ".join(stages))
     stage_results: List[Dict[str, Any]] = []
     shared_session: Dict[str, Any] = {}
 
     if learning_context is not None:
         await initialize_learning_run(learning_context, product, logger)
-        save_learning_checkpoint(
-            learning_context,
-            args,
-            stages,
-            0,
-            "running",
-        )
+        if resume_checkpoint is not None:
+            reviews = learning_context.attribute_runtime.unrestored_run_reviews(stages[resume_index])
+            if reviews:
+                logger.info("恢复原任务的 %s 项审核结果；已完成平台不重跑", len(reviews))
+                await wait_for_platform_review_batch(learning_context, args, stages, resume_index, reviews, logger)
+            else:
+                save_learning_checkpoint(learning_context, args, stages, resume_index, 'running')
+        if resume_checkpoint is None:
+            save_learning_checkpoint(
+                learning_context,
+                args,
+                stages,
+                0,
+                "running",
+            )
 
     try:
-        stage_index = 0
+        stage_index = resume_index
         while stage_index < len(stages):
             platform_name = stages[stage_index]
             stage_dir = artifact_dir / platform_name
@@ -7392,14 +7484,15 @@ def main() -> int:
     ocr_scope.__enter__()
     try:
         if args.create_product:
-            product = read_new_product_seed(resolve_excel_path(args.excel_url))
+            product = read_new_product_seed(resolve_excel_path(args.excel_url), materials_root=args.materials_root)
         else:
             excel_path = resolve_excel_path(args.excel_url)
             include_douyin = any(spec.cli_name in {"douyin", "taobao"} for spec in selected_platforms)
             try:
-                product = read_product_data(excel_path, include_douyin=include_douyin)
+                product = read_product_data(excel_path, include_douyin=include_douyin, materials_root=args.materials_root)
             except OCRJudgmentRequired as error:
-                identity = read_product_data(excel_path, include_douyin=include_douyin, identity_only=True)
+                identity = read_product_data(excel_path, include_douyin=include_douyin, identity_only=True,
+                                             materials_root=args.materials_root)
                 learning_context = create_learning_context(args, identity)
                 if learning_context is None:
                     raise RecognitionError(str(error)) from error
@@ -7435,6 +7528,7 @@ def main() -> int:
             (artifact_dir / "input-summary.json").write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+            logger.info("图片素材目录：%s", product.product_dir)
             logger.info(
                 "输入校验通过：%s | 售价 %s | 1:1 %s 张 | 3:4 %s 张 | 详情 %s 张 | SKU %s 张",
                 product.style_code,
@@ -7451,17 +7545,29 @@ def main() -> int:
             model_run_status = "completed"
             return 0
         if redactor is None:
-            if args.platform == "all" or len(selected_platforms) > 1:
-                asyncio.run(
-                    run_all_implemented_platforms(
-                        args,
-                        product,
-                        artifact_dir,
-                        logger,
-                        learning_context=learning_context,
+            with automation_run_lock(Path(args.user_data_dir)):
+                if args.platform == "all" or len(selected_platforms) > 1:
+                    asyncio.run(
+                        run_all_implemented_platforms(
+                            args,
+                            product,
+                            artifact_dir,
+                            logger,
+                            learning_context=learning_context,
+                        )
                     )
-                )
-            else:
+                else:
+                    asyncio.run(
+                        run_single_platform_with_learning(
+                            args,
+                            product,
+                            artifact_dir,
+                            logger,
+                            learning_context=learning_context,
+                        )
+                    )
+        else:
+            with automation_run_lock(Path(args.user_data_dir)):
                 asyncio.run(
                     run_single_platform_with_learning(
                         args,
@@ -7469,19 +7575,9 @@ def main() -> int:
                         artifact_dir,
                         logger,
                         learning_context=learning_context,
+                        redactor=redactor,
                     )
                 )
-        else:
-            asyncio.run(
-                run_single_platform_with_learning(
-                    args,
-                    product,
-                    artifact_dir,
-                    logger,
-                    learning_context=learning_context,
-                    redactor=redactor,
-                )
-            )
         model_run_status = "completed"
         return 0
     except KeyboardInterrupt:

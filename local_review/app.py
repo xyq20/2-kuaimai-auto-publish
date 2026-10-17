@@ -271,14 +271,6 @@ def _mutate_review(
             422,
             "candidate_not_unique",
         )
-        require(
-            no_fill
-            or task["suggested_value_id"] is None
-            or set(parts) == set(split_multi_choice(task["suggested_value_id"]))
-            or bool(reason),
-            422,
-            "correction_reason_required",
-        )
         action_id = uuid.uuid4().hex
         event_id = uuid.uuid4().hex
         next_version = version + 1

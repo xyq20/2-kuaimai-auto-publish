@@ -1,12 +1,17 @@
 #!/bin/zsh
 set -e
 
-SCRIPT_DIR="${0:A:h}"
+SCRIPT_DIR="${KUAIMAI_REVIEW_PROJECT_DIR:-${0:h}}"
 cd "$SCRIPT_DIR"
 REVIEW_PORT="${KUAIMAI_REVIEW_PORT:-8787}"
 CLOUDFLARED="$SCRIPT_DIR/.local-state/bin/cloudflared"
+LAUNCHD_MODE="${KUAIMAI_REVIEW_LAUNCHD:-0}"
 
-if ! curl --fail --silent --max-time 3 "http://127.0.0.1:${REVIEW_PORT}/health" >/dev/null; then
+if [[ "$LAUNCHD_MODE" == "1" ]]; then
+  until curl --fail --silent --max-time 3 "http://127.0.0.1:${REVIEW_PORT}/health" >/dev/null; do
+    sleep 2
+  done
+elif ! curl --fail --silent --max-time 3 "http://127.0.0.1:${REVIEW_PORT}/health" >/dev/null; then
   echo "审核中心尚未运行。请先双击 run-review-center.command，并保持那个窗口开启。"
   read "reply?按回车关闭窗口……"
   exit 1
@@ -33,5 +38,9 @@ if [[ ! -x "$CLOUDFLARED" ]]; then
 fi
 
 echo "正在创建临时 HTTPS 运营入口……"
-echo "登录仍由审核中心控制；关闭本窗口后，临时网址立即失效。"
+if [[ "$LAUNCHD_MODE" == "1" ]]; then
+  echo "登录仍由审核中心控制；launchd 会在异常退出后自动重启 Tunnel。"
+else
+  echo "登录仍由审核中心控制；关闭本窗口后，临时网址立即失效。"
+fi
 exec "$CLOUDFLARED" tunnel --no-autoupdate --url "http://127.0.0.1:${REVIEW_PORT}"

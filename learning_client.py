@@ -20,6 +20,7 @@ DEVICE_EVENT_TYPES = frozenset(
         "stage.completed",
         "readback.recorded",
         "review.created",
+        "review.superseded",
         "text_facts.created",
     }
 )

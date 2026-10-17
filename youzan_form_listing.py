@@ -28,6 +28,7 @@ from category_search import CategorySearchCapture
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from platform_candidate_source import (
+    select_supports_multiple,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -596,6 +597,7 @@ class YouzanFormListing(TaobaoListing):
 
     async def apply_category(self, category_path: Sequence[str]) -> Mapping[str, Any]:
         path = tuple(str(value).strip() for value in category_path if str(value).strip())
+        self.category_hints = (" > ".join(path),)
         if not path:
             raise YouzanFormListingError("Excel 中缺少有赞商品分类")
         if self.panel is None:
@@ -615,6 +617,7 @@ class YouzanFormListing(TaobaoListing):
         candidates: List[Tuple[str, Any]] = []
         api_matches: List[str] = []
         matched_hint = ""
+        observed_paths: Dict[str, str] = {}
         async with CategorySearchCapture(self.page, self._category_paths_from_json) as capture:
             for search_term in search_terms:
                 capture.start(search_term)
@@ -627,6 +630,8 @@ class YouzanFormListing(TaobaoListing):
                 while asyncio.get_running_loop().time() < deadline:
                     if capture.error:
                         raise YouzanFormListingError("有赞类目搜索接口失败：" + capture.error)
+                    for observed_path in capture.paths:
+                        observed_paths.setdefault(observed_path, search_term)
                     rows = await self._visible_category_rows()
                     api_hint, api_group = matching_youzan_category_texts(
                         capture.paths, path, leaf_hints=leaf_hints
@@ -663,6 +668,22 @@ class YouzanFormListing(TaobaoListing):
                     raise YouzanFormListingError("有赞类目搜索接口在 30 秒内未响应：" + search_term)
                 if api_group:
                     raise YouzanFormListingError("有赞类目 JSON 已定位，但对应 DOM 行未出现：" + search_term)
+        if not candidates and observed_paths:
+            reviewed = await self._resolve_category_review(
+                tuple(observed_paths), source="youzan_category_search_unmatched",
+                evidence={"api_category_search": True, "terminal_required": True},
+            )
+            if reviewed:
+                await search.fill(observed_paths[reviewed])
+                deadline = asyncio.get_running_loop().time() + 10
+                while asyncio.get_running_loop().time() < deadline:
+                    candidates = [(text, node) for text, node in await self._visible_category_rows()
+                                  if self._normalize_category_path(text) == self._normalize_category_path(reviewed)]
+                    if len(candidates) == 1:
+                        break
+                    await asyncio.sleep(.1)
+                api_matches = [reviewed]
+                api_urls = ["/category/base/queryCategoryList"]
         candidate_paths = tuple(_category_parts(text) for text, _node in candidates)
         if len(set(candidate_paths)) != len(candidate_paths):
             raise YouzanFormListingError(
@@ -717,6 +738,7 @@ class YouzanFormListing(TaobaoListing):
             )
         selected_text, selected_node = candidates[0]
         await selected_node.click()
+        selected_text = await self._complete_category_leaf(dialog, selected_text)
         confirms = dialog.get_by_role(
             "button", name=re.compile(r"^\s*确\s*定\s*$")
         )
@@ -880,7 +902,7 @@ class YouzanFormListing(TaobaoListing):
         managed = is_learning_managed_field("yz", page_label)
         if runtime is None:
             raise YouzanFormListingError("有赞属性学习运行器未启用")
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         try:
             field = await self._captured_youzan_field(page_label)
         except YouzanFormListingError as exc:
@@ -1000,12 +1022,12 @@ class YouzanFormListing(TaobaoListing):
             if await selects.count() != 1:
                 raise YouzanFormListingError("有赞属性“{0}”下拉框不唯一".format(page_label))
             select = selects.first
-            multi = await select.locator(".el-select__tags").count() > 0
+            multi = await select_supports_multiple(select)
             groups = (
                 material_value_groups(page_label, exact_values)
                 if exact_values is not None
-                else selection_value_groups_for_control(
-                    page_label, expected, multi=multi
+                else await self._excel_groups_for_select(
+                    select, page_label, expected, multi=multi
                 )
             )
             if not groups:
@@ -1062,7 +1084,7 @@ class YouzanFormListing(TaobaoListing):
                 )
             try:
                 actual = await self._select_values(
-                    select, groups, label=page_label, multi=multi
+                    select, groups, label=page_label, multi=multi, excel_value=expected
                 )
             except TaobaoListingError as exc:
                 if "未找到可见选项" in str(exc):
@@ -1346,7 +1368,7 @@ class YouzanFormListing(TaobaoListing):
         if await selects.count() != 1:
             raise YouzanFormListingError(f"有赞不填写字段“{label}”控件不唯一")
         select = selects.first
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         if not any(await self._read_select_values(select, multi=multi)):
             return
         if multi:
@@ -1790,7 +1812,7 @@ class YouzanFormListing(TaobaoListing):
             if clear_category_field("yz", label):
                 select = item.locator(".el-select:visible")
                 if await select.count() != 1 or any(await self._read_select_values(
-                    select.first, multi=await select.locator(".el-select__tags").count() > 0
+                    select.first, multi=await select_supports_multiple(select)
                 )):
                     raise YouzanFormListingError(f"有赞字段“{label}”保存后仍有误填值")
 
@@ -1872,8 +1894,12 @@ class YouzanFormListing(TaobaoListing):
             selects = item.locator(":scope > .el-form-item__content .el-select:visible")
             if await selects.count() == 1:
                 select = selects.first
-                multi = await select.locator(".el-select__tags").count() > 0
+                multi = await select_supports_multiple(select)
                 actual = await self._read_select_values(select, multi=multi)
+                if special is None:
+                    groups = await self._excel_groups_for_select(
+                        select, page_label, expected, multi=multi
+                    )
             else:
                 inputs = item.locator(
                     ':scope > .el-form-item__content input:not([readonly]):not([type="hidden"]):visible'

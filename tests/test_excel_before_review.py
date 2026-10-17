@@ -61,6 +61,7 @@ class ExcelBeforeReviewTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_candidate_attempts_input_and_records_verified_value(self):
         listing = object.__new__(TaobaoListing)
         select = MagicMock()
+        select.evaluate = AsyncMock(return_value=False)
         select.locator.return_value.count = AsyncMock(return_value=0)
         with patch.object(TaobaoListing, '_select_values', new_callable=AsyncMock,
                           return_value=('棉',)) as writer:
@@ -72,7 +73,11 @@ class ExcelBeforeReviewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_input_preserves_missing_value_for_review(self):
         listing = object.__new__(TaobaoListing)
+        listing.logger = None
+        listing._search_select = AsyncMock()
+        listing._dismiss_select_dropdown = AsyncMock()
         select = MagicMock()
+        select.evaluate = AsyncMock(return_value=False)
         select.locator.return_value.count = AsyncMock(return_value=0)
         with patch.object(TaobaoListing, '_select_values', new_callable=AsyncMock,
                           side_effect=TaobaoListingError('readback failed')):

@@ -36,6 +36,7 @@ from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from platform_discovery import ApiClient, EndpointSpec, PlatformDiscoveryError
 from platform_candidate_source import (
+    select_supports_multiple,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -707,22 +708,9 @@ class XhsFormListing(TaobaoListing):
             for root in category_gender_roots(category_input_hints(expression))
         }
 
-        # Some workbooks flatten a real category route into one slash-delimited
-        # cell (for example ``休闲裤/男士休闲直筒裤/工装休闲裤``).  Slash still
-        # means an authored alternative in general, but when the first leaf is
-        # contained by the final leaf it is a broad alias for the same family.
-        # Do not stop at that broad alias; wait for the concrete final leaf so
-        # a search result from an unrelated branch cannot win early.
-        preferred_flat_leaf = None
-        if len(expected_levels) == 1 and len(expected_levels[0]) > 1:
-            first_leaf = normalize_label(expected_levels[0][0])
-            final_leaf = normalize_label(expected_levels[0][-1])
-            if first_leaf and final_leaf != first_leaf and first_leaf in final_leaf:
-                preferred_flat_leaf = final_leaf
-
         def has_gender(levels):
             return not gender_roots or any(
-                root in option
+                root == option
                 for level in levels
                 for option in level
                 for root in gender_roots
@@ -734,10 +722,6 @@ class XhsFormListing(TaobaoListing):
                 if has_gender(candidate_levels(text))
                 and candidate_levels(text)
                 and expected[-1] in candidate_levels(text)[-1]
-                and (
-                    preferred_flat_leaf is None
-                    or expected[-1] == preferred_flat_leaf
-                )
                 and contains_ordered(candidate_levels(text), expected)
             ]
             if len(complete) == 1:
@@ -757,10 +741,6 @@ class XhsFormListing(TaobaoListing):
                     for text in result_texts
                     if candidate_levels(text)
                     and has_gender(candidate_levels(text))
-                    and (
-                        preferred_flat_leaf is None
-                        or normalize_label(leaf) == preferred_flat_leaf
-                    )
                     and any(
                         normalize_label(option) in candidate_level
                         for candidate_level in candidate_levels(text)
@@ -806,10 +786,6 @@ class XhsFormListing(TaobaoListing):
                 for text in result_texts
                 if candidate_levels(text)
                 and has_gender(candidate_levels(text))
-                and (
-                    preferred_flat_leaf is None
-                    or wanted == preferred_flat_leaf
-                )
                 and wanted in candidate_levels(text)[-1]
             ]
             # Excel 类目有时携带“男士/女士”等供应商层级，而平台结果
@@ -1036,16 +1012,14 @@ class XhsFormListing(TaobaoListing):
                     raise XhsFormListingError("小红书类目树 JSON 对应的菜单节点未出现：" + label)
                 await asyncio.sleep(.15)
 
+    def _category_node_label(self, value: str) -> str:
+        return re.sub(r"\s*[(（]灰度[)）]\s*$", "", super()._category_node_label(value))
+
     async def _confirm_category_path(self, dialog: Any, expected: str) -> str:
-        deadline = asyncio.get_running_loop().time() + 10
-        selected = ""
-        while asyncio.get_running_loop().time() < deadline:
-            selected = self._selected_category_text(await dialog.inner_text())
-            if self._normalize_category_path(selected) == self._normalize_category_path(expected):
-                break
-            await asyncio.sleep(.1)
-        else:
-            raise XhsFormListingError("小红书类目确认前 JSON+DOM 路径不匹配：目标 {0}，页面为 {1!r}".format(expected, selected))
+        try:
+            selected = await self._validate_category_leaf(dialog, expected, timeout=10)
+        except TaobaoListingError as exc:
+            raise XhsFormListingError(str(exc)) from exc
         confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
         if await confirm.count() != 1:
             raise XhsFormListingError("小红书修改类目弹窗找不到唯一“确定”按钮")
@@ -1124,6 +1098,7 @@ class XhsFormListing(TaobaoListing):
         if self.panel is None:
             raise XhsFormListingError("请先调用 open() 打开小红书资料")
         path = tuple(str(item).strip() for item in category_path if str(item).strip())
+        self.category_hints = (" > ".join(path),)
         if not path:
             raise XhsFormListingError("Excel 小红书商品分类没有可选择的层级")
         modify = self.panel.get_by_role("button", name="修改类目", exact=True)
@@ -1401,7 +1376,7 @@ class XhsFormListing(TaobaoListing):
         managed = is_learning_managed_field("xhs", page_label)
         if runtime is None:
             raise XhsFormListingError("小红书属性学习运行器未启用")
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         control_type = "multi_select" if multi else "select"
         await self._open_select(select, multi=multi)
         try:
@@ -1544,12 +1519,12 @@ class XhsFormListing(TaobaoListing):
                 )
             )
         select = selects.first
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         groups = (
             material_value_groups(page_label, exact_values)
             if exact_values is not None
-            else selection_value_groups_for_control(
-                page_label, expected, multi=multi
+            else await self._excel_groups_for_select(
+                select, page_label, expected, multi=multi
             )
         )
         if not groups:
@@ -2343,7 +2318,7 @@ class XhsFormListing(TaobaoListing):
                 errors.append("{0}=下拉控件不唯一".format(page_label))
                 continue
             select = selects.first
-            multi = await select.locator(".el-select__tags").count() > 0
+            multi = await select_supports_multiple(select)
             actual = await self._read_select_values(select, multi=multi)
             expected_counter = Counter(
                 normalize_option(value)

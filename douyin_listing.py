@@ -22,13 +22,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
-from attribute_runtime import AttributeRequest, split_multi_choice
+from attribute_runtime import AttributeRequest, excel_selection_plans, _matched_excel_variants, split_multi_choice
 from playwright.async_api import Error as PlaywrightError
 from field_policies import listing_date_text_value, positional_listing_date_value
-from category_profile import choose_category_candidate, is_leather_shoe_category
+from category_profile import choose_category_candidate, is_footwear_category, is_leather_shoe_category
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from platform_candidate_source import (
+    select_supports_multiple,
+    select_multiple_limit,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -913,9 +915,13 @@ class DouyinListing:
                     (current,), self.category_hints
                 )
                 if not chosen:
-                    raise DouyinListingError(
-                        f"抖音已选类目与 Excel 不匹配：{current!r}"
+                    reviewed = await self._resolve_category_review(
+                        (current,), source="current_category_mismatch",
                     )
+                    if reviewed != current:
+                        raise DouyinListingError(
+                            f"抖音已选类目与 Excel 不匹配，待确认：{current!r}"
+                        )
             if self.logger is not None:
                 self.logger.info("抖音页面无预测候选，沿用已选商品分类：%s", current)
             return current
@@ -1279,14 +1285,14 @@ class DouyinListing:
         async def review_visible_options() -> Optional[Tuple[str, Sequence[Mapping[str, str]]]]:
             options = tuple(fallback_options)
             if not options:
-                multi = await select.locator(".el-select__tags").count() > 0
+                multi = await select_supports_multiple(select)
                 await self._open_select(select, multi=multi)
                 try:
                     _dropdown, options = await self._visible_dom_options(select)
                 finally:
                     await self._dismiss_select_dropdown(select)
             else:
-                multi = await select.locator(".el-select__tags").count() > 0
+                multi = await select_supports_multiple(select)
             try:
                 resolved = await runtime.resolve_unmatched_page_options(
                     platform_id="douyin",
@@ -1345,7 +1351,7 @@ class DouyinListing:
             for position, option in enumerate(api_options)
         )
 
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         try:
             if observed_values:
                 candidates = validate_observed_selection(
@@ -1390,15 +1396,24 @@ class DouyinListing:
                 f"抖音属性“{label}”接口候选与页面候选不一致：{exc.reason_code}"
             ) from exc
 
-        existing = {
-            normalize_option(candidate.label): candidate.label
-            for candidate in candidates
-        }
-        exact_alternatives = [
-            existing[normalize_option(value)]
-            for value in alternatives
-            if normalize_option(value) in existing
-        ]
+        excel_value = "/".join(str(value) for value in alternatives)
+        exact_alternatives = _matched_excel_variants(
+            excel_value, tuple(CandidateValue(v.value_id, v.label) for v in candidates),
+            control_type="multi_select" if multi else "select", field_label=label,
+        )
+        if not exact_alternatives:
+            for plan in excel_selection_plans(excel_value, multi=multi):
+                chosen = []
+                for member in plan:
+                    match = next((c for alias in value_candidates(label, member)
+                                  for c in candidates if normalize_option(c.label) == normalize_option(alias)), None)
+                    if match is None or match in chosen:
+                        break
+                    chosen.append(match)
+                if len(chosen) == len(plan):
+                    excel_value = ','.join(c.label for c in chosen)
+                    exact_alternatives = (tuple(chosen),)
+                    break
         preflight_schema = canonical_sha256({
             "platform_id": "douyin", "category_leaf_id": category_id,
             "field_id": field_id,
@@ -1429,11 +1444,6 @@ class DouyinListing:
                     alternatives[0],
                 )
             return alternatives[0], api_options
-        excel_value = (
-            exact_alternatives[0]
-            if exact_alternatives
-            else "/".join(str(value) for value in alternatives)
-        )
         schema_version = canonical_sha256(
             {
                 "platform_id": "douyin",
@@ -1936,19 +1946,33 @@ class DouyinListing:
         require_committed_direct_value: bool = False,
     ) -> Optional[Tuple[str, ...]]:
         failure = None
-        try:
-            actual = await self._write_select_values_once(
-                select, expected_values, label=label, multi=multi, api_options=api_options,
-                review_alternatives=review_alternatives,
-                allow_operational_review=allow_operational_review,
-                allow_empty_options=allow_empty_options,
-                require_committed_direct_value=require_committed_direct_value)
-            if actual is not None or not allow_operational_review:
-                return actual
-        except (DouyinListingError, PlaywrightError) as exc:
-            if not allow_operational_review:
-                raise
-            failure = exc
+        plans = (tuple(expected_values),)
+        if review_alternatives and len(review_alternatives) > 1:
+            raw_plans = excel_selection_plans('/'.join(review_alternatives), multi=multi)
+            remembered = getattr(self.attribute_runtime, '_resolved_attributes', {}).get(('douyin', _normalize_label(label)))
+            approved = remembered and remembered[1].source in {'human_override', 'cross_product_human', 'review_learning'}
+            if not approved and tuple(expected_values) in raw_plans:
+                start = raw_plans.index(tuple(expected_values))
+                limit = await select_multiple_limit(select) if multi else 1
+                plans = tuple(p for p in raw_plans[start:] if not limit or len(p) <= limit) or plans
+        for plan in plans:
+            try:
+                actual = await self._write_select_values_once(
+                    select, plan, label=label, multi=multi, api_options=api_options,
+                    review_alternatives=review_alternatives,
+                    allow_operational_review=allow_operational_review and len(plans) == 1,
+                    allow_empty_options=allow_empty_options,
+                    require_committed_direct_value=require_committed_direct_value)
+                if actual is not None:
+                    return actual
+            except (DouyinListingError, PlaywrightError) as exc:
+                failure = exc
+            if multi and len(plans) > 1:
+                await self._clear_multi_select(select)
+        if not allow_operational_review:
+            if failure is not None:
+                raise failure
+            return None
         recover = getattr(self.attribute_runtime, 'recover_failed_write', None)
         if not callable(recover):
             if failure is not None:
@@ -2319,23 +2343,15 @@ class DouyinListing:
 
         if await selects.count():
             select = selects.first
-            multi = await select.locator(".el-select__tags").count() > 0
-            alternatives = value_candidates(label, expected)
+            multi = await select_supports_multiple(select)
+            plans = excel_selection_plans(expected, multi=multi)
+            alternatives = tuple(",".join(plan) for plan in plans)
             if not alternatives:
                 raise DouyinListingError(f"属性“{label}”期望值为空")
 
-            # 保存后的页面值已满足 Excel 任一 OR 候选时直接复用。
-            # 此时无需重新比较可能分批加载的整份 API/DOM 候选列表，
-            # 也不应重复触发学习审核。
+            # 当前值符合第一套完整方案时复用；备用方案先核对实际候选优先级。
             current = await self._read_select_values(select, multi=multi)
-            date_pair_is_preferred = (
-                listing_date_text_value(label, expected) != str(expected).strip()
-            )
-            if matches_any(
-                current,
-                alternatives[:1] if date_pair_is_preferred else alternatives,
-                normalize_option,
-            ):
+            if plans and sequences_match(current, plans[0], normalize_option):
                 if self.attribute_runtime is not None:
                     await self._resolve_learning_select_value(
                         label,
@@ -2411,15 +2427,15 @@ class DouyinListing:
                     await self._dismiss_select_dropdown(select)
 
             existing_alternatives = [
-                value
-                for value in alternatives
-                if normalize_option(value) in existing_names
+                plan for plan in plans
+                if all(any(normalize_option(alias) in existing_names
+                           for alias in value_candidates(label, member)) for member in plan)
             ]
 
             chosen_expected = (
                 existing_alternatives[0]
                 if existing_alternatives
-                else alternatives[0]
+                else plans[0]
             )
             if existing_alternatives and self.logger is not None:
                 self.logger.info(
@@ -2429,7 +2445,7 @@ class DouyinListing:
                 )
             return await self._select_values(
                 select,
-                (chosen_expected,),
+                chosen_expected,
                 label=label,
                 multi=multi,
                 api_options=api_options,
@@ -2566,7 +2582,7 @@ class DouyinListing:
             return (f"{number}{unit[0]}",)
         if len(visible_selects) == 1:
             select = visible_selects[0]
-            multi = await select.locator(".el-select__tags").count() > 0
+            multi = await select_supports_multiple(select)
             return await self._read_select_values(select, multi=multi)
         if len(visible_selects) > 1:
             raise DouyinListingError(
@@ -2692,14 +2708,33 @@ class DouyinListing:
             keys = "、".join(str(key) for key, _value in goods_code_sources)
             raise DouyinListingError(f"抖音货号匹配到多个 Excel 字段：{keys}")
         goods_code = None
+        unavailable_goods_code = None
         if goods_code_sources:
-            _key, goods_code_value = goods_code_sources[0]
-            if self.logger is not None:
-                self.logger.info("抖音开始校验货号：%s", goods_code_value)
-            goods_code = await self.fill_text_field("货号", goods_code_value)
+            source_key, goods_code_value = goods_code_sources[0]
+            rendered_labels = {
+                _normalize_label(label)
+                for label in await self.panel.locator(".el-form-item__label").all_text_contents()
+            }
+            # Some categories (e.g. 打底衫) have no product-level goods-code
+            # field. Only skip when the fresh category schema AND the rendered
+            # form agree; an expected field that failed to render still errors.
+            goods_code_absent = (
+                self._category_properties_generation is not None
+                and bool(self._category_properties)
+                and _normalize_label("货号") not in self._category_properties
+                and _normalize_label("货号") not in rendered_labels
+            )
+            if goods_code_absent:
+                unavailable_goods_code = str(source_key)
+                if self.logger is not None:
+                    self.logger.info("当前抖音类目的实时接口和页面均无货号字段，已跳过：%s", source_key)
+            else:
+                if self.logger is not None:
+                    self.logger.info("抖音开始校验货号：%s", goods_code_value)
+                goods_code = await self.fill_text_field("货号", goods_code_value)
 
         target_sources: Dict[str, List[Tuple[object, object]]] = {}
-        unmatched: List[str] = []
+        unmatched: List[str] = [unavailable_goods_code] if unavailable_goods_code else []
         for key, value in excel_attributes:
             if goods_code_sources and key == goods_code_sources[0][0]:
                 continue
@@ -3493,6 +3528,37 @@ class DouyinListing:
         if not by_size:
             raise DouyinListingError("尺码推荐识别结果为空")
 
+        # The platform only checks mandatory measurements by default. Enable
+        # optional columns that are present in the recognized size chart before
+        # requiring the full schema (e.g. sleeve length for a long-sleeve top).
+        first = next(iter(by_size.values()))
+        schema = (CLOTHING_SIZE_FIELD_LABELS if hasattr(first, "chest")
+                  else PANTS_SIZE_FIELD_LABELS)
+        for label in schema:
+            for item in by_size.values():
+                self._size_field_value(item, label)
+        for label in schema:
+            choices = self.panel.locator(".el-checkbox").filter(
+                has_text=re.compile(rf"^\s*{re.escape(label)}\s*$")
+            )
+            visible = [choices.nth(i) for i in range(await choices.count())
+                       if await choices.nth(i).is_visible()]
+            if len(visible) != 1:
+                continue
+            checkbox = visible[0].locator('input[type="checkbox"]')
+            if await checkbox.count() != 1 or await checkbox.is_checked():
+                continue
+            if await checkbox.is_disabled():
+                raise DouyinListingError(f"尺码列“{label}”未勾选且不可启用")
+            await visible[0].click()
+            if not await checkbox.is_checked():
+                raise DouyinListingError(f"尺码列“{label}”勾选后回读失败")
+            await self.panel.locator(".el-table__header-wrapper th").filter(
+                has_text=re.compile(re.escape(label))
+            ).first.wait_for(state="visible", timeout=3_000)
+            if self.logger is not None:
+                self.logger.info("抖音尺码表已启用尺码图中的测量列：%s", label)
+
         table = await self._size_table()
         await table.scroll_into_view_if_needed()
         rows = await self._size_rows(table)
@@ -3673,10 +3739,15 @@ class DouyinListing:
         return values
 
     async def apply_leather_shoe_warranty(self, category: str) -> Optional[str]:
-        if not is_leather_shoe_category(category):
+        if not is_footwear_category(category):
             return None
         if self.panel is None:
             raise DouyinListingError("请先调用 open() 打开抖音资料")
+        controls = self.panel.get_by_text(re.compile(r"保修期内提供维修[（(]寄修[）)]"))
+        if not is_leather_shoe_category(category) and not any(
+            [await controls.nth(index).is_visible() for index in range(await controls.count())]
+        ):
+            return None
         await self._ensure_toggle_checked(self.panel, "保修期内提供维修（寄修）")
 
         labels = self.panel.locator(".el-form-item > .el-form-item__label")
@@ -3689,16 +3760,16 @@ class DouyinListing:
                 matches.append(label.locator("xpath=.."))
         if len(matches) != 1:
             raise DouyinListingError(
-                f"抖音皮鞋“选择保修天数”字段匹配数为 {len(matches)}"
+                f"抖音鞋靴“选择保修天数”字段匹配数为 {len(matches)}"
             )
         selects = matches[0].locator(".el-select")
         if await selects.count() != 1:
-            raise DouyinListingError("抖音皮鞋保修天数下拉框不唯一")
+            raise DouyinListingError("抖音鞋靴保修天数下拉框不唯一")
         actual = await self._select_values(
             selects.first, ("90天",), label="选择保修天数", multi=False
         )
         if actual != ("90天",):
-            raise DouyinListingError(f"抖音皮鞋保修天数回读失败：{actual!r}")
+            raise DouyinListingError(f"抖音鞋靴保修天数回读失败：{actual!r}")
         return actual[0]
 
     async def _sku_header_label(self, header: Any) -> str:

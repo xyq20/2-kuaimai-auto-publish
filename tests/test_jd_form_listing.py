@@ -588,6 +588,75 @@ CATEGORY_POPOVER_FIXTURE = """
 <div class="el-cascader__suggestion-item">服饰内衣 &gt; 男装 &gt; 男士休闲裤 &gt; 男士休闲直筒裤</div>
 """
 
+REQUIRED_SIZE_SPEC_FIXTURE = """
+<button role="tab" aria-selected="false" onclick="
+  this.setAttribute('aria-selected','true');
+  document.querySelector('[role=tabpanel]').style.display='block';
+">京东资料</button>
+<div role="tabpanel" aria-label="京东资料" style="display:none">
+  <div class="spec-group">
+    <div><span>规格名：</span><input readonly value="尺码"></div>
+    <div><span>规格值：</span>
+      <input class="size-value" readonly value="38码" onclick="openSize(0)">
+      <input class="size-value" readonly value="39码" onclick="openSize(1)">
+    </div>
+  </div>
+  <div class="block-specification-list"></div>
+</div>
+<div class="el-dialog" style="display:none">
+  <div class="el-dialog__header" onclick="pickSize('24',1134482)">
+    <span class="el-dialog__title">尺码</span>
+  </div>
+  <div class="el-form-item is-required">
+    <label class="el-form-item__label" onclick="hidePopovers()">通用尺码</label>
+    <div class="el-form-item__content">
+      <div class="el-popover__reference" aria-describedby="size-popover">
+        <input readonly onclick="document.getElementById('size-popover').style.display='block'">
+      </div>
+    </div>
+  </div>
+  <div class="el-form-item"><label>品牌尺码</label><input id="optional-brand" value=""></div>
+  <button onclick="confirmSize()">确定</button>
+</div>
+<div id="size-popover" class="el-popover" style="display:none">
+  <button onclick="pickSize('38',1134531)">38</button>
+  <button onclick="pickSize('39',1134539)">39</button>
+</div>
+<div id="brand-popover" style="display:none">品牌尺码候选</div>
+<script>
+  window.specifications = [{name:'尺码', valueItemRule:{items:[{
+    features:{text:'通用尺码',isLocked:'1'},required:['id','value'],
+    properties:{id:{enum:[17602]}}
+  }]},values:['38码','39码'].map((v,i)=>({
+    value:v,valueKey:'size-'+i,checked:true,
+    extendValues:{17602:{id:17602,value:v,valueId:null}}
+  }))}];
+  document.querySelector('.block-specification-list').__vue__ = {specifications};
+  window.confirmedSizes = [];
+  function hidePopovers() {
+    document.getElementById('size-popover').style.display='none';
+    document.getElementById('brand-popover').style.display='none';
+  }
+  function openSize(index) {
+    window.sizeIndex=index;window.selection=null;
+    document.querySelector('.el-popover__reference input').value=specifications[0].values[index].value;
+    document.querySelector('.el-dialog').style.display='block';
+  }
+  function pickSize(value,id) {
+    window.selection={id:17602,value,valueId:id};
+    document.querySelector('.el-popover__reference input').value=value;
+    hidePopovers();document.getElementById('brand-popover').style.display='block';
+  }
+  function confirmSize() {
+    const spec=specifications[0].values[window.sizeIndex];
+    spec.value=selection.value;spec.extendValues[17602]=selection;
+    document.querySelectorAll('.size-value')[window.sizeIndex].value=spec.value;
+    confirmedSizes.push({value:spec.value,key:spec.valueKey,brand:document.getElementById('optional-brand').value});
+    document.querySelector('.el-dialog').style.display='none';
+  }
+</script>
+"""
+
 
 class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_heel_height_uses_first_matching_excel_alternative(self):
@@ -2219,6 +2288,49 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         await listing.wait_for_sku_attributes_ready(timeout_seconds=3)
         self.assertEqual(len(await listing._header_actions("SKU属性", "批量设置")), 1)
 
+    async def _loaded_category_without_extra_sku_attributes(self, category_id):
+        listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE)
+        await self.page.set_content('''<div role="tabpanel"><div class="block-specification-list">
+          <table><thead><tr><th>京东价</th><th>库存</th></tr></thead>
+          <tbody><tr><td>965</td><td>100</td></tr></tbody></table></div></div>''')
+        listing.panel = self.page.locator('[role=tabpanel]')
+        listing._active_api_observation = AsyncMock(return_value={
+            'http_status': 200, 'category_id': category_id, 'attribute_fields': ('款式',),
+        })
+        await listing.panel.evaluate('''(e, categoryId) => {
+          e.querySelector('.block-specification-list').__vue__={
+            $data:{skuPropList:[]},skuPropList:[],requestedSaleAttrs:true,
+            saleAttrs:[{name:'颜色',catId:categoryId},{name:'尺码',catId:categoryId}]
+          };
+        }''', category_id)
+        return listing
+
+    async def test_loaded_categories_without_extra_sku_attributes_continue(self):
+        for category_id in ('30888', '14950'):
+            with self.subTest(category_id=category_id):
+                listing = await self._loaded_category_without_extra_sku_attributes(category_id)
+                self.assertFalse(await listing.wait_for_sku_attributes_ready(timeout_seconds=2))
+                self.assertEqual(await listing.apply_sku_thickness({}), {})
+                self.assertEqual(await listing.panel.locator('tbody').inner_text(), '965\t100')
+
+    async def test_missing_sku_entry_does_not_skip_incomplete_or_stale_category(self):
+        listing = await self._loaded_category_without_extra_sku_attributes('30888')
+        for update in (
+            'c.requestedSaleAttrs=false',
+            'c.saleAttrs[0].catId="14950"',
+            'c.skuPropList=[{name:"内里材质"}]',
+        ):
+            with self.subTest(update=update):
+                await listing.panel.evaluate('''(e, update) => {
+                  const c=e.querySelector('.block-specification-list').__vue__;
+                  c.requestedSaleAttrs=true;c.saleAttrs[0].catId='30888';c.skuPropList=[];
+                  if (update.includes('requestedSaleAttrs')) c.requestedSaleAttrs=false;
+                  else if (update.includes('catId')) c.saleAttrs[0].catId='14950';
+                  else c.skuPropList=[{name:'内里材质'}];
+                }''', update)
+                with self.assertRaises(JdFormListingError):
+                    await listing.wait_for_sku_attributes_ready(timeout_seconds=.1)
+
     async def test_records_jd_http_failure_and_clears_it_after_success(self):
         listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE)
         endpoint = "/jd/getProductSchemas.json"
@@ -2291,6 +2403,35 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await self.page.evaluate("window.sizeOpened"), 0)
 
+    async def test_binds_required_platform_sizes_without_changing_sku_keys(self):
+        listing = await self._open(REQUIRED_SIZE_SPEC_FIXTURE)
+        report = await listing.reapply_required_size_spec_values()
+        self.assertEqual(report["values"], (
+            {"before": "38码", "selected": "38"},
+            {"before": "39码", "selected": "39"},
+        ))
+        self.assertEqual(await self.page.evaluate("window.confirmedSizes"), [
+            {"value": "38", "key": "size-0", "brand": ""},
+            {"value": "39", "key": "size-1", "brand": ""},
+        ])
+        self.assertTrue(all(
+            binding["valid"]
+            for value in await listing._size_spec_binding_snapshot()
+            for binding in value["bindings"]
+        ))
+        from learning_store import reject_sensitive_fields
+        reject_sensitive_fields({"size_spec_bindings": await listing._size_spec_binding_snapshot()})
+        self.assertEqual((await listing.reapply_required_size_spec_values())["values"], ())
+
+    async def test_size_binding_rejects_missing_candidate_and_skips_optional_rules(self):
+        listing = await self._open(REQUIRED_SIZE_SPEC_FIXTURE)
+        await self.page.locator("#size-popover button").first.evaluate("e=>e.remove()")
+        with self.assertRaisesRegex(JdFormListingError, "没有唯一精确候选.*38码"):
+            await listing.reapply_required_size_spec_values()
+        self.assertEqual(await self.page.evaluate("window.confirmedSizes"), [])
+        await self.page.evaluate("specifications[0].valueItemRule.items[0].required=[]")
+        self.assertEqual((await listing.reapply_required_size_spec_values())["values"], ())
+
     async def test_refreshes_empty_sku_attribute_dialog_and_sets_thickness(self):
         listing = await self._open(SKU_ATTRIBUTE_HEADER_FIXTURE)
         report = await listing.apply_sku_thickness()
@@ -2342,7 +2483,7 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
           </div>
           <div role="dialog" aria-label="修改类目" style="display:none">
             <input placeholder="请输入类目关键词，支持模糊查询" oninput="searchCategory(this.value)">
-            <ul id="results"></ul><div id="chosen">已选：</div>
+            <ul id="results"></ul><div id="chosen">已选：</div><div id="menus"></div>
             <button onclick="document.getElementById('current').textContent=document.getElementById('chosen').textContent.replace('已选：','');this.parentElement.style.display='none'">确定</button>
           </div>
           <script>
@@ -2354,7 +2495,10 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
               for (const record of payload.data.records) {
                 const row=document.createElement('li'); row.className='el-cascader-node';
                 row.textContent=record.categoryNameList.at(-1);
-                row.onclick=()=>{row.classList.add('is-active');document.getElementById('chosen').textContent='已选：'+record.categoryNameList.join(' > ');};
+                row.onclick=()=>{row.classList.add('is-active');document.getElementById('chosen').textContent='已选：'+record.categoryNameList.join(' > ');
+                  document.querySelector('#menus').innerHTML=record.categoryNameList.map((name,i)=>
+                    '<div class="el-cascader-menu"><div class="el-cascader-node" '+
+                    (i<record.categoryNameList.length-1?'aria-haspopup="true"':'')+'><span class="el-cascader-node__label">'+name+'</span></div></div>').join('');};
                 document.getElementById('results').appendChild(row);
               }
             }

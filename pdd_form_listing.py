@@ -22,6 +22,7 @@ from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from pdd_listing import parse_pdd_attribute_fields
 from platform_candidate_source import (
+    select_supports_multiple,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -345,7 +346,7 @@ class PddFormListing(TaobaoListing):
                     )
                 return normalized_groups
         else:
-            multi = await select.locator(".el-select__tags").count() > 0
+            multi = await select_supports_multiple(select)
             await self._open_select(select, multi=multi)
             try:
                 _dropdown, options = await self._visible_dom_options(select)
@@ -393,7 +394,7 @@ class PddFormListing(TaobaoListing):
                         page_label, exc.reason_code
                     )
                 ) from exc
-        multi = await select.locator(".el-select__tags").count() > 0
+        multi = await select_supports_multiple(select)
         schema_version = canonical_sha256(
             {
                 "platform_id": "pdd",
@@ -788,7 +789,7 @@ class PddFormListing(TaobaoListing):
             raise PddFormListingError(
                 f"拼多多类目末级回读不一致：期望 {expected_path!r}，页面为 {selected_path!r}"
             )
-        selected_text = selected_path
+        selected_text = await self._validate_category_leaf(dialog, selected_path)
         confirm = dialog.get_by_role("button", name=re.compile(r"确\s*定"))
         if await confirm.count() != 1:
             raise PddFormListingError("拼多多修改类目弹窗找不到唯一“确定”按钮")
@@ -980,12 +981,12 @@ class PddFormListing(TaobaoListing):
             if await selects.count() != 1:
                 raise PddFormListingError("拼多多属性“{0}”下拉框不唯一".format(page_label))
             select = selects.first
-            multi = await select.locator(".el-select__tags").count() > 0
+            multi = await select_supports_multiple(select)
             groups = (
                 material_value_groups(page_label, exact_values)
                 if exact_values is not None
-                else selection_value_groups_for_control(
-                    page_label, expected, multi=multi
+                else await self._excel_groups_for_select(
+                    select, page_label, expected, multi=multi
                 )
             )
             if not groups:

@@ -66,6 +66,8 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             store = LearningStore(Path(directory) / 'state.sqlite3')
             store.migrate()
             waiting = store.save_checkpoint(CHECKPOINT)
+            obsolete = store.enqueue('obsolete-waiting', 'checkpoint.updated', checkpoint_event_payload(waiting))
+            store.mark_discarded(obsolete, 'obsolete checkpoint identity')
             store.enqueue('waiting', 'checkpoint.updated', checkpoint_event_payload(waiting))
             client = FakeClient(())
             decision = validate_resume(waiting, EVENT, 'product-1', 'images-1', 'save_only')

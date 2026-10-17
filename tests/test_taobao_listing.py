@@ -345,7 +345,7 @@ function openTaobao() {
     <div role="dialog" aria-label="修改类目" style="display:none">
       <input placeholder="请输入类目关键词，支持模糊查询" oninput="searchCategory(this)">
       <div id="category-tree" style="display:none">
-        <div class="el-cascader-menu"><div class="el-cascader-node menswear" onclick="chooseCategoryNode(this, 'in-active-path')"><span class="el-cascader-node__label">男装</span></div></div>
+        <div class="el-cascader-menu"><div class="el-cascader-node menswear" aria-haspopup="true" onclick="chooseCategoryNode(this, 'in-active-path')"><span class="el-cascader-node__label">男装</span></div></div>
         <div class="el-cascader-menu"><div class="el-cascader-node casual-pants" onclick="chooseCategoryNode(this, 'is-active')"><span class="el-cascader-node__label">休闲裤</span></div></div>
       </div>
       <div id="selected-category"></div>
@@ -434,7 +434,7 @@ class TaobaoPureFunctionTests(unittest.TestCase):
     def test_single_select_preserves_comma_inside_one_candidate(self):
         self.assertEqual(
             selection_value_groups_for_control("功能", "防风，保暖", multi=False),
-            (("防风，保暖",),),
+            (("防风，保暖", "防风", "保暖"),),
         )
         self.assertEqual(
             selection_value_groups_for_control("功能", "防风，保暖", multi=True),
@@ -594,6 +594,29 @@ class TaobaoPureFunctionTests(unittest.TestCase):
 
 
 class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_vue_multiselect_and_complete_plan_fallback(self):
+        from platform_candidate_source import select_supports_multiple
+        await self.page.set_content('<div id="scene" class="el-select"></div>')
+        select = self.page.locator('#scene')
+        await select.evaluate("e => {e.__vue__={multiple:true, multipleLimit:0, cachedOptions:['日常','休闲','运动'].map(v=>({value:v,label:v}))};}")
+        self.assertTrue(await select_supports_multiple(select))
+        groups = await self.listing._excel_groups_for_select(
+            select, '适用场景', '日常，休闲/运动', multi=True)
+        self.assertEqual(groups, (('日常',), ('休闲',)))
+        self.listing._write_select_values_once = AsyncMock(side_effect=[None, ('运动',)])
+        self.listing._clear_multi_select = AsyncMock()
+        self.assertEqual(await self.listing._select_values(
+            select, groups, label='适用场景', multi=True), ('运动',))
+        self.listing._clear_multi_select.assert_awaited_once()
+        await select.evaluate('e => {e.__vue__.multipleLimit=1;}')
+        self.assertEqual(await self.listing._excel_groups_for_select(
+            select, '适用场景', '日常，休闲/运动', multi=True), (('运动',),))
+        await select.evaluate('e => {e.__vue__.multiple=false;}')
+        self.assertEqual(await self.listing._excel_groups_for_select(
+            select, '适用场景', '日常，休闲/运动', multi=False), (('运动',),))
+        self.assertEqual(await self.listing._excel_groups_for_select(
+            select, '适用场景', '日常，休闲/不存在', multi=False), (('日常',),))
+
     async def test_open_multiselect_keeps_existing_dropdown_open(self):
         await self.page.set_content("""<div class="el-select" id="audience">
           <div class="el-select__tags"><input class="el-select__input" onclick="toggle()"></div>
@@ -658,21 +681,21 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertEqual(actual, ('直筒',))
             self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 0)
             self.assertFalse(runtime.deferred_reviews)
-            self.assertEqual(runtime.model_decisions[0]['status'], 'adopted')
+            self.assertFalse(runtime.model_decisions)
         finally:
             await runtime.drain()
 
-    async def test_select_readback_failure_with_uncertain_model_enters_review(self):
+    async def test_exact_candidate_does_not_need_uncertain_model(self):
         select, runtime, calls = await self._failed_write_fixture(confidence=.7)
         try:
             actual = await self.listing._select_values(
                 select, (('直筒',),), label='裤型', multi=False)
-            self.assertIsNone(actual)
-            self.assertEqual(await self.page.evaluate('window.writeCount'), 1)
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(len(runtime.deferred_reviews), 1)
+            self.assertEqual(actual, ('直筒',))
+            self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
+            self.assertEqual(len(calls), 0)
+            self.assertFalse(runtime.deferred_reviews)
         finally:
             await runtime.drain()
 
@@ -683,13 +706,13 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertIsNone(actual)
             self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 0)
             self.assertEqual(len(runtime.deferred_reviews), 1)
-            self.assertEqual(runtime.model_decisions[0]['readback_status'], 'write_failed')
+            self.assertFalse(runtime.model_decisions)
         finally:
             await runtime.drain()
 
-    async def test_failed_write_without_api_snapshot_judges_real_dom_candidates(self):
+    async def test_failed_write_without_api_snapshot_retries_exact_dom_candidate(self):
         select, runtime, calls = await self._failed_write_fixture(confidence=.7)
         # Some selectors have no API field entry; only live DOM candidates are
         # available. The failure must still reach judgment and human review.
@@ -697,11 +720,9 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         try:
             actual = await self.listing._select_values(
                 select, (('直筒',),), label='裤型', multi=False)
-            self.assertIsNone(actual)
-            self.assertEqual(len(calls), 1)
-            self.assertEqual([v['label'] for v in calls[0]['options']], ['直筒', '宽松'])
-            self.assertEqual(len(runtime.deferred_reviews), 1)
-            self.assertTrue(runtime.deferred_reviews[0].request.evidence['live_dom'])
+            self.assertEqual(actual, ('直筒',))
+            self.assertEqual(len(calls), 0)
+            self.assertFalse(runtime.deferred_reviews)
         finally:
             await runtime.drain()
 
@@ -712,7 +733,7 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             actual = await self.listing._select_values(
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertEqual(actual, ('直筒',))
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 0)
             self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
             self.assertFalse(runtime.deferred_reviews)
         finally:
@@ -733,7 +754,7 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             actual = await self.listing._select_values(
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertEqual(actual, ('直筒',))
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 0)
         finally:
             await runtime.drain()
 
@@ -976,11 +997,108 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.playwright.stop()
 
+    async def _leaf_guard_fixture(self, children):
+        await self.page.set_content("""
+          <div role="dialog" aria-label="修改类目">
+            <div class="el-cascader-menu"><div class="el-cascader-node" aria-haspopup="true">
+              <span class="el-cascader-node__label">流行男鞋</span></div></div>
+            <div class="el-cascader-menu"><div class="el-cascader-node" aria-haspopup="true">
+              <span class="el-cascader-node__label">靴子</span></div></div>
+            <div class="el-cascader-menu" id="children"></div>
+            <div id="selected">已选：流行男鞋 &gt; 靴子</div>
+            <button onclick="window.confirmed=true">确定</button>
+          </div>""")
+        await self.page.evaluate("""labels => {
+          for (const label of labels) {
+            const node = document.createElement('div'); node.className='el-cascader-node';
+            node.innerHTML='<span class="el-cascader-node__label">'+label+'</span>';
+            node.onclick=()=>document.querySelector('#selected').textContent='已选：流行男鞋 > 靴子 > '+label;
+            document.querySelector('#children').appendChild(node);
+          }
+        }""", children)
+        self.listing.category_hints = ("鞋靴 > 男鞋 > 靴子", "流行男鞋 > 靴子 > 时装靴/工装靴")
+        return self.page.get_by_role('dialog', name='修改类目')
+
+    async def test_readonly_category_validation_never_reclicks_selected_path(self):
+        dialog = await self._leaf_guard_fixture(['时装靴'])
+        await self.page.evaluate("""() => {
+          document.querySelector('#selected').textContent='已选：流行男鞋 > 靴子 > 时装靴';
+          window.clicks=0;
+          document.querySelectorAll('.el-cascader-node').forEach(node=>node.onclick=()=>{
+            window.clicks++;document.querySelector('#selected').textContent='已选：流行男鞋 > 靴子';
+          });
+        }""")
+        expected = '流行男鞋 > 靴子 > 时装靴'
+        self.assertEqual(await self.listing._validate_category_leaf(dialog, expected), expected)
+        self.assertEqual(await self.listing._complete_category_leaf(dialog, expected), expected)
+        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+
+    async def test_readonly_category_validation_reports_actual_parent_without_clicking(self):
+        from taobao_listing import TaobaoListingError
+        dialog = await self._leaf_guard_fixture(['时装靴'])
+        await self.page.evaluate("""() => {
+          window.clicks=0;
+          document.querySelectorAll('.el-cascader-node').forEach(node=>node.onclick=()=>window.clicks++);
+        }""")
+        with self.assertRaisesRegex(TaobaoListingError, "实际='流行男鞋 > 靴子'"):
+            await self.listing._validate_category_leaf(dialog, '流行男鞋 > 靴子 > 时装靴', timeout=.1)
+        with self.assertRaisesRegex(TaobaoListingError, '末级=False'):
+            await self.listing._validate_category_leaf(dialog, '流行男鞋 > 靴子', timeout=.1)
+        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+
+    async def test_category_leaf_guard_continues_exact_parent_on_shared_platforms(self):
+        for platform in ('tb', 'tm', 'wxsph', 'jd', 'yz', 'xhs'):
+            dialog = await self._leaf_guard_fixture(['时装靴', '工装靴'])
+            self.listing.attribute_platform_id = platform
+            actual = await self.listing._complete_category_leaf(dialog, '流行男鞋 > 靴子')
+            self.assertEqual(actual, '流行男鞋 > 靴子 > 时装靴')
+            self.assertFalse(await self.page.evaluate('Boolean(window.confirmed)'))
+
+    async def test_category_leaf_guard_routes_uncertain_children_to_runtime(self):
+        from types import SimpleNamespace
+        calls = []
+        async def resolve(request):
+            calls.append(request)
+            return request.candidates[1]
+        dialog = await self._leaf_guard_fixture(['马丁鞋', '户外靴'])
+        self.listing.attribute_runtime = SimpleNamespace(resolve=resolve)
+        actual = await self.listing._complete_category_leaf(dialog, '流行男鞋 > 靴子')
+        self.assertEqual(actual, '流行男鞋 > 靴子 > 户外靴')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].control_type, 'category')
+        self.assertEqual(calls[0].evidence['parent_path'], ['流行男鞋', '靴子'])
+
+    async def test_category_leaf_guard_stops_for_deferred_review(self):
+        from types import SimpleNamespace
+        async def resolve(request):
+            return None
+        def deferred():
+            raise RuntimeError('waiting_for_category_review')
+        dialog = await self._leaf_guard_fixture(['马丁鞋', '户外靴'])
+        self.listing.attribute_runtime = SimpleNamespace(resolve=resolve, raise_deferred_reviews=deferred)
+        with self.assertRaisesRegex(RuntimeError, 'waiting_for_category_review'):
+            await self.listing._complete_category_leaf(dialog, '流行男鞋 > 靴子')
+        self.assertFalse(await self.page.evaluate('Boolean(window.confirmed)'))
+
     async def test_clicks_marker_recommendation_without_fixed_category_path(self):
         actual = await self.listing.apply_recommended_category()
 
         self.assertEqual(actual, "服饰 > 动态测试类目")
         self.assertTrue(self.listing.category_clicked)
+
+    async def test_boot_heel_height_writes_numeric_input_and_centimeter_unit(self):
+        await self.page.set_content('''<div id="panel"><div class="complex-item">
+          <div class="el-form-item"><label class="el-form-item__label">鞋跟高度</label>
+            <div class="el-form-item__content"><input id="heel-number">
+              <div class="el-select"><input readonly value="cm"></div>
+            </div></div></div></div>''')
+        self.listing.panel = self.page.locator('#panel')
+        self.listing._select_values = AsyncMock(return_value=("cm",))
+        actual = await self.listing.fill_attribute('鞋跟高度', '5/中跟/中跟（3cm-5cm）',
+                                                  item=self.page.locator('.complex-item'))
+        self.assertEqual(actual, ('5',))
+        self.assertEqual(await self.page.locator('#heel-number').input_value(), '5')
+        self.listing._select_values.assert_awaited_once()
 
     async def test_casual_pants_mode_searches_exact_flat_result(self):
         await self.page.set_content(
@@ -1005,6 +1123,8 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             <script>
               function selectCategory() {
                 document.querySelector('#selected').textContent = '已选：男装 > 休闲裤';
+                if (!document.querySelector('#guard-menus')) document.querySelector('#dialog').insertAdjacentHTML('beforeend',
+                  '<div id="guard-menus"><div class="el-cascader-menu"><div class="el-cascader-node" aria-haspopup="true">男装</div></div><div class="el-cascader-menu"><div class="el-cascader-node">休闲裤</div></div></div>');
                 document.querySelector('#suggestions').style.display = 'none';
               }
               function confirmCategory() {
@@ -1049,16 +1169,22 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
           </div><div class="conf"><div class="complex-wrap"></div></div></section>
           <div role="dialog" aria-label="修改类目" style="display:none">
             <input placeholder="请输入类目关键词，支持模糊查询" oninput="showCategory(this.value)">
-            <div id="chosen">已选：</div>
+            <div id="chosen">已选：</div><div id="menus"></div>
             <button onclick="document.querySelector('.platform-category-input').textContent='男装 > '+window.chosen;this.parentElement.style.display='none';document.querySelector('.complex-wrap').innerHTML='<div class=complex-item>属性</div>'">确定</button>
           </div>
           <div class="el-autocomplete-suggestion"><ul id="results"></ul></div>
           <script>
+            function renderMenus(path) {
+              const parts=path.split(' > ');
+              document.querySelector('#menus').innerHTML=parts.map((name,i)=>
+                '<div class="el-cascader-menu"><div class="el-cascader-node" '+
+                (i<parts.length-1?'aria-haspopup="true"':'')+'><span class="el-cascader-node__label">'+name+'</span></div></div>').join('');
+            }
             window.searches=[];
             function showCategory(value) {
               window.searches.push(value);
               const row=document.createElement('li');row.textContent='男装 > '+value;
-              row.onclick=()=>{window.chosen=value;document.getElementById('chosen').textContent='已选：'+row.textContent;};
+              row.onclick=()=>{window.chosen=value;document.getElementById('chosen').textContent='已选：'+row.textContent;renderMenus(row.textContent);};
               document.getElementById('results').replaceChildren(row);
             }
           </script>
@@ -1080,7 +1206,7 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             window.searches.push(value);
             const row=document.createElement('li');
             row.textContent=value==='牛仔裤' ? '男装 > 工装裤' : '男装 > 西裤';
-            row.onclick=()=>{window.chosen=row.textContent.slice(5);document.getElementById('chosen').textContent='已选：'+row.textContent;};
+            row.onclick=()=>{window.chosen=row.textContent.slice(5);document.getElementById('chosen').textContent='已选：'+row.textContent;renderMenus(row.textContent);};
             document.getElementById('results').replaceChildren(row);
           };
         }""")

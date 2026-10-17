@@ -41,14 +41,16 @@ class XhsCategoryTreeTests(unittest.IsolatedAsyncioTestCase):
             document.querySelector('.el-dialog').style.display='block';
             document.getElementById('chosen').textContent='已选：';
             const root=document.getElementById('nodes');root.innerHTML='<div class="el-cascader-panel"></div>';
-            window.selectedNames=[];
+            window.selectedNames=[];window.categoryClicks=[];
             window.drawMenu=(rows,level)=>{
               const panel=root.querySelector('.el-cascader-panel');
               [...panel.children].slice(level).forEach(node=>node.remove());
               const menu=document.createElement('div');menu.className='el-cascader-menu';
               for(const item of rows){
                 const node=document.createElement('div');node.className='el-cascader-node';node.textContent=item.name;
+                if(item.leaf!==1)node.setAttribute('aria-haspopup','true');
                 node.onclick=()=>{
+                  window.categoryClicks.push(item.name);
                   window.selectedNames=window.selectedNames.slice(0,level);window.selectedNames.push(item.name);
                   if(item.leaf===1)document.getElementById('chosen').textContent='已选：'+window.selectedNames.join(' > ');
                   else window.drawMenu(item.children,level+1);
@@ -65,6 +67,7 @@ class XhsCategoryTreeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report['selected'],'男装 > 针织衫/毛衣 > 毛针织开衫')
         self.assertEqual(report['category_tree_id'],'377117320')
         self.assertEqual(self.searches,[])
+        self.assertEqual(await self.page.evaluate('window.categoryClicks'), ['男装', '针织衫/毛衣', '毛针织开衫'])
 
     async def model_listing(self, directory, confidence):
         listing = await self.tree_listing()

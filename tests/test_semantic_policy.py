@@ -4,14 +4,45 @@ from semantic_policy import adoption_policy
 
 
 class SemanticPolicyTests(unittest.TestCase):
+    def test_slim_fit_and_ordered_season_plans_do_not_treat_fallbacks_as_conflicts(self):
+        from learning_models import CandidateValue
+        cases = (
+            ('版型', 'select', '修身型/常规',
+             (CandidateValue('slim', '修身'), CandidateValue('regular', '常规')),
+             ['slim'], ['regular']),
+            ('面料功能', 'select', '保温保暖',
+             (CandidateValue('warm', '保温保暖'), CandidateValue('wind', '防风')),
+             ['warm'], []),
+            ('适用季节', 'multi_select', '秋季，冬季/春秋冬/春秋',
+             (CandidateValue('autumn', '秋'), CandidateValue('winter', '冬'),
+              CandidateValue('three', '春秋冬'), CandidateValue('two', '春秋')),
+             ['autumn', 'winter'], ['three', 'two']),
+            ('适用季节', 'multi_select', '秋季，冬季/春秋冬/春秋',
+             (CandidateValue('three', '春秋冬'), CandidateValue('two', '春秋')),
+             ['three'], ['two']),
+            ('适用季节', 'multi_select', '秋季，冬季/春秋冬/春秋',
+             (CandidateValue('autumnwinter', '秋冬'), CandidateValue('two', '春秋')),
+             ['two'], ['autumnwinter']),
+        )
+        for field, control, excel, candidates, selected, competing in cases:
+            with self.subTest(field=field, selected=selected):
+                request = SimpleNamespace(field_label=field, control_type=control,
+                    excel_value=excel, evidence={}, candidates=candidates)
+                answer = {'value_ids': selected, 'confidence': .90,
+                    'evidence_kinds': ['excel'], 'assessment': {
+                        'relation': 'equivalent', 'source_text': excel,
+                        'conflicts': [], 'assumptions': [], 'competing_value_ids': competing}}
+                self.assertTrue(adoption_policy(answer, request)['auto_adopt'])
+
     def test_exact_multi_groups_use_excel_order_and_reject_extra_options(self):
         from learning_models import CandidateValue
         request = SimpleNamespace(control_type='multi_select', excel_value='通用/青年,中年',
             evidence={'full_excel_value':'通用/青年,中年','requested_groups':[['通用','青年'],['中年']]},
             candidates=(CandidateValue('all','通用'),CandidateValue('young','青年'),CandidateValue('middle','中年')))
-        answer = {'value_ids':['all','middle'], 'confidence':.72, 'assessment':{}, 'evidence_kinds':['excel']}
+        answer = {'value_ids':['all'], 'confidence':.72, 'assessment':{}, 'evidence_kinds':['excel']}
         self.assertTrue(adoption_policy(answer,request)['auto_adopt'])
         self.assertFalse(adoption_policy({**answer,'value_ids':['all','young','middle']},request)['auto_adopt'])
+        self.assertFalse(adoption_policy({**answer,'value_ids':['all','middle']},request)['auto_adopt'])
         self.assertFalse(adoption_policy(answer,request,allow_auto=False)['auto_adopt'])
         self.assertFalse(adoption_policy({**answer,'assessment':{'conflicts':['人工明确不填']}},request)['auto_adopt'])
 

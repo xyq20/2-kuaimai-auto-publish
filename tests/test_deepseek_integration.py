@@ -71,16 +71,17 @@ class DeepSeekIntegrationTests(unittest.TestCase):
                        {'value_id':'middle','label':'中年'}]}
         wrong = {'value_ids':['all','middle'],'confidence':.72,'reason':'误记历史回读为人工',
                  'evidence_kinds':['excel','human_learning']}
-        good = {**wrong,'reason':'每组首个真实候选：通用和中年','evidence_kinds':['excel'],
+        # The legacy requested_groups cannot override the first complete slash alternative.
+        good = {**wrong,'value_ids':['all'],'reason':'首个完整可用方案：通用','evidence_kinds':['excel'],
                 'assessment':{'relation':'equivalent','source_text':payload['excel_value'],
                               'assumptions':[],'conflicts':[],'competing_value_ids':[]}}
         with patch('local_review.semantic.request_json', side_effect=[wrong,good]) as call:
             result = judge_attribute(self.settings,payload)
         self.assertEqual(result['status'],'suggested')
-        self.assertEqual(result['value_ids'],['all','middle'])
+        self.assertEqual(result['value_ids'],['all'])
         self.assertEqual(call.call_count,2)
         sent=call.call_args.args[2]
-        self.assertEqual([o['value_id'] for o in sent['request']['options']],['all','middle'])
+        self.assertEqual([o['value_id'] for o in sent['request']['options']],['all'])
         self.assertNotIn('validation_error',sent['request']['evidence'])
         self.assertEqual(sent['execution_state']['validation_error'],'dropdown is hidden')
         self.assertIn('human_learning_without_records',sent['validation_feedback'])

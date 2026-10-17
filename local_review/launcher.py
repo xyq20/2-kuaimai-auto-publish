@@ -21,6 +21,7 @@ from .config import PROJECT_DIR, Settings
 from .database import connect, utc_now
 from .service import ApiError, require
 from platform_registry import PLATFORM_SPECS, canonical_platform_name
+from product_materials import MaterialPathError, current_month_directory, resolve_product_materials
 
 PLATFORMS = {s.cli_name: s.display_name.replace("资料", "") for s in PLATFORM_SPECS if s.enabled_in_all}
 ACTIVE = {"running", "waiting_review", "stopping"}
@@ -41,9 +42,10 @@ def read_json(path: Path, default=None):
 
 
 class ProductCatalog:
-    def __init__(self, root: Path, runs_root: Path = None):
+    def __init__(self, root: Path, runs_root: Path = None, *, materials_root: Path = None):
         self.root = root.resolve()
         self.runs_root = runs_root
+        self.materials_root = materials_root
         self._cache = {}
 
     @staticmethod
@@ -187,7 +189,7 @@ class ProductCatalog:
                 "style_code": value("货号", "商家外部编码", "款式编码") or path.parent.name,
                 "category": value("商品分类") or "以 Excel 类目为准",
                 "folder": path.parent.name,
-                "image": f"/api/launcher/products/{product_id}/image" if self.image(product_id) else None,
+                "image": f"/api/launcher/products/{product_id}/image" if self.image(product_id, fields=fields) else None,
             }
             # The workbook has already been read above. Calling listing() here
             # would rescan every historical run before returning one product,
@@ -198,14 +200,40 @@ class ProductCatalog:
         except (OSError, ValueError, KeyError, BadZipFile):
             raise ApiError(422, "product_unreadable") from None
 
-    def image(self, product_id: str):
-        folder = self.path(product_id).parent
+    def image(self, product_id: str, *, fields=None):
+        workbook_path = self.path(product_id)
+        folder = workbook_path.parent
+        if self.materials_root is not None:
+            from openpyxl import load_workbook
+            from kuaimai_erp import normalize_cell, parse_spec_values, read_excel_fields
+            from douyin_data import field_lookup
+            try:
+                if fields is None:
+                    workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+                    try:
+                        fields = read_excel_fields(workbook.worksheets[0].iter_rows(values_only=True))
+                    finally:
+                        workbook.close()
+                def value(*aliases):
+                    match = field_lookup(fields, *aliases)
+                    return normalize_cell(match[1]) if match else ""
+                folder = resolve_product_materials(
+                    self.materials_root, workbook_path,
+                    title=value("商品标题", "商品名称", "宝贝标题"),
+                    style_code=value("货号", "商家外部编码", "款式编码"),
+                    colors=parse_spec_values(value("颜色")),
+                    nickname=value("商品简称", "产品简称", "款名"),
+                )
+            except (MaterialPathError, OSError, ValueError, BadZipFile):
+                return None
+        def safe_image(path):
+            return path.resolve().is_relative_to(folder.resolve())
         for name in ("1：1主图", "1:1主图", "1：1 主图", "主图"):
             directory = folder / name
-            if not self._safe(directory) or not directory.is_dir():
+            if not safe_image(directory) or not directory.is_dir():
                 continue
             for path in sorted(directory.iterdir()):
-                if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and self._safe(path) and path.is_file():
+                if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and safe_image(path) and path.is_file():
                     return path
         return None
 
@@ -221,6 +249,177 @@ class ProductCatalog:
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             raise ApiError(503, "folder_open_failed") from None
         return {"opened": True}
+
+
+class MonthlyProductCatalog(ProductCatalog):
+    """Discover current-month artwork folders with a confirmed product workbook."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._field_cache = {}
+
+    def _fields(self, path):
+        from openpyxl import load_workbook
+        from kuaimai_erp import read_excel_fields
+        signature = (path.stat().st_mtime_ns, path.stat().st_size)
+        cached = self._field_cache.get(path)
+        if cached and cached[0] == signature:
+            return cached[1]
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        try:
+            fields = read_excel_fields(workbook.worksheets[0].iter_rows(values_only=True))
+        finally:
+            workbook.close()
+        self._field_cache[path] = (signature, fields)
+        return fields
+
+    def entries(self):
+        try:
+            month = current_month_directory(self.materials_root).resolve()
+            folders = [p for p in sorted(month.iterdir()) if p.is_dir() and not p.name.startswith('.')
+                       and p.resolve().is_relative_to(month)]
+            external = {}
+            # Excel beside the artwork wins. The old library remains a fallback.
+            try:
+                legacy_paths = super().paths().values() if self.root.is_dir() else ()
+            except ApiError:
+                legacy_paths = ()
+            for path in legacy_paths:
+                from douyin_data import field_lookup
+                from kuaimai_erp import normalize_cell, parse_spec_values, AutomationError
+                try:
+                    fields = self._fields(path)
+                    def value(*aliases):
+                        match = field_lookup(fields, *aliases)
+                        return normalize_cell(match[1]) if match else ''
+                    folder = resolve_product_materials(
+                        self.materials_root, path, title=value('商品标题', '商品名称', '宝贝标题'),
+                        style_code=value('货号', '商家外部编码', '款式编码'),
+                        colors=parse_spec_values(value('颜色')),
+                        nickname=value('商品简称', '产品简称', '款名'),
+                    )
+                    external.setdefault(folder, []).append(path)
+                except (MaterialPathError, OSError, ValueError, BadZipFile, AutomationError):
+                    continue
+            entries = {}
+            for folder in folders:
+                local = [p for p in folder.iterdir() if p.is_file()
+                         and re.sub(r'\s+', '', p.name).casefold() == '产品信息.xlsx'
+                         and p.resolve().is_relative_to(folder.resolve())]
+                local.sort(key=lambda p: (p.name != '产品信息.xlsx', p.name))
+                candidates = local[:1] or external.get(folder.resolve(), [])
+                entries[hashlib.sha256(str(folder.resolve()).encode()).hexdigest()[:32]] = {
+                    'folder': folder, 'excel': candidates[0] if len(candidates) == 1 else None,
+                    'excel_status': 'ready' if len(candidates) == 1 else 'ambiguous' if candidates else 'missing',
+                    'history_folders': [p.parent for p in external.get(folder.resolve(), [])]
+                                       if len(external.get(folder.resolve(), [])) == 1 else [],
+                }
+            return entries
+        except (MaterialPathError, OSError):
+            raise ApiError(503, 'products_unavailable') from None
+
+    def _entry(self, product_id):
+        require(isinstance(product_id, str) and IDENTIFIER.fullmatch(product_id), 404, 'product_not_found')
+        entry = self.entries().get(product_id)
+        require(entry is not None, 404, 'product_not_found')
+        return entry
+
+    def paths(self):
+        return {key: entry['excel'] for key, entry in self.entries().items() if entry['excel'] is not None}
+
+    def path(self, product_id):
+        entry = self._entry(product_id)
+        require(entry['excel_status'] != 'ambiguous', 422, 'product_excel_ambiguous')
+        require(entry['excel'] is not None, 422, 'product_excel_missing')
+        return entry['excel']
+
+    def _progress(self, entries):
+        progress = {key: {'base_saved': False, 'platforms': set()} for key in entries}
+        aliases = {}
+        for key, entry in entries.items():
+            aliases[self._folder_key(entry['folder'])] = key
+            if entry['excel']:
+                aliases[self._folder_key(entry['excel'].parent)] = key
+            for folder in entry['history_folders']:
+                aliases[self._folder_key(folder)] = key
+        if self.runs_root is None:
+            return progress
+        for summary_path in self.runs_root.glob('*/input-summary.json'):
+            summary = read_json(summary_path, {})
+            key = aliases.get(self._folder_key(Path(summary['product_dir']))) if summary.get('product_dir') else None
+            if key is None and summary.get('excel_path'):
+                key = aliases.get(self._folder_key(Path(summary['excel_path']).parent))
+            if key is None:
+                continue
+            run = summary_path.parent
+            receipts = [*run.glob('save-result.json'), *run.glob('publish-result.json'),
+                        *run.glob('*/save-result.json'), *run.glob('*/publish-result.json'),
+                        *run.glob('*/base-save-result.json')]
+            for receipt_path in receipts:
+                receipt = read_json(receipt_path, {})
+                if receipt.get('result') != 1:
+                    continue
+                platform = receipt_path.parent.name
+                if platform == 'base':
+                    progress[key]['base_saved'] = True
+                label = PLATFORMS.get(platform) or receipt.get('shop_publish', {}).get('platform')
+                if label is None:
+                    label = next((PLATFORMS.get(p.name.split('-after-save')[0])
+                                  for p in receipt_path.parent.glob('*-after-save-validation.json')
+                                  if p.name.split('-after-save')[0] in PLATFORMS), None)
+                progress[key]['platforms'].add(label or '商品资料')
+        return progress
+
+    def _base_saved_for(self, folder):
+        entries = self.entries()
+        key = next((key for key, e in entries.items()
+                    if folder == e['folder'] or (e['excel'] and folder == e['excel'].parent)), None)
+        return self._progress(entries)[key]['base_saved'] if key else False
+
+    def listing(self):
+        entries = self.entries()
+        progress = self._progress(entries)
+        return [{'id': key, 'title': e['folder'].name, 'folder': e['folder'].name,
+                 'image': f'/api/launcher/products/{key}/image',
+                 'excel_status': e['excel_status'], 'runnable': e['excel'] is not None,
+                 'processed': bool(progress[key]['platforms']), 'base_saved': progress[key]['base_saved'],
+                 'processed_platforms': sorted(progress[key]['platforms'])}
+                for key, e in entries.items() if e['excel'] is not None]
+
+    def detail(self, product_id):
+        entry = self._entry(product_id)
+        if entry['excel'] is not None:
+            detail = super().detail(product_id)
+        else:
+            detail = {'id': product_id, 'title': entry['folder'].name, 'style_code': '',
+                      'category': '找到多个 Excel，请确认产品资料' if entry['excel_status'] == 'ambiguous'
+                                  else '待补充产品信息.xlsx',
+                      'base_saved': self._base_saved_for(entry['folder']),
+                      'image': f'/api/launcher/products/{product_id}/image' if self.image(product_id) else None}
+        return {**detail, 'folder': entry['folder'].name,
+                'excel_status': entry['excel_status'], 'runnable': entry['excel'] is not None}
+
+    def image(self, product_id, *, fields=None):
+        folder = self._entry(product_id)['folder']
+        for name in ('1：1主图', '1:1主图', '1：1 主图', '主图'):
+            directory = folder / name
+            if not directory.is_dir() or not directory.resolve().is_relative_to(folder.resolve()):
+                continue
+            for path in sorted(directory.iterdir()):
+                if (path.suffix.lower() in {'.jpg', '.jpeg', '.png', '.webp'} and path.is_file()
+                        and path.resolve().is_relative_to(folder.resolve())):
+                    return path
+        return None
+
+    def open_folder(self, product_id):
+        folder = self._entry(product_id)['folder'].resolve()
+        require(sys.platform == 'darwin', 503, 'folder_open_unavailable')
+        try:
+            subprocess.run(['/usr/bin/open', str(folder)], check=True, timeout=10,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            raise ApiError(503, 'folder_open_failed') from None
+        return {'opened': True}
 
 
 def build_command(product: Path, config: dict, run_id: str, output_dir: Path, settings: Settings) -> list:
@@ -251,6 +450,8 @@ def build_command(product: Path, config: dict, run_id: str, output_dir: Path, se
                "--excel-url", str(product), "--platform", ",".join(command_platforms) if operation == "platforms" else "base",
                "--run-id", run_id, "--output-dir", str(output_dir),
                {"preview": "--no-save", "save": "--save-only", "publish": "--save"}[mode]]
+    if settings.materials_root is not None:
+        command += ["--materials-root", str(settings.materials_root)]
     if operation == "create":
         command.append("--create-product")
     if names == ["taobao"] and operation == "platforms" and mode != "preview" and not include_base:
@@ -280,7 +481,9 @@ def external_runner_active() -> bool:
 class Launcher:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.catalog = ProductCatalog(settings.products_root, PROJECT_DIR / "output/kuaimai/runs")
+        catalog_class = MonthlyProductCatalog if settings.materials_root is not None else ProductCatalog
+        self.catalog = catalog_class(settings.products_root, PROJECT_DIR / "output/kuaimai/runs",
+                                     materials_root=settings.materials_root)
         self.root = settings.data_dir.resolve() / "launcher"
         self.root.mkdir(parents=True, exist_ok=True)
         self._mutex = threading.Lock()

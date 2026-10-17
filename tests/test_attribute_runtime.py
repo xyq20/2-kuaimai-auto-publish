@@ -60,6 +60,20 @@ def make_length_request(**overrides):
 
 
 class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restart_recovers_existing_review_ids_without_creating_duplicates(self):
+        runtime = AttributeRuntime(self.store, FakeClient({'status': 'review_required'}), 'run', 'p')
+        runtime.begin_review_collection('wxsph')
+        await runtime.resolve(make_length_request())
+        await runtime.drain()
+        old = runtime.deferred_reviews[0]
+        resumed = AttributeRuntime(self.store, FakeClient(), 'run', 'p')
+        restored = resumed.unrestored_run_reviews('wxsph')
+        self.assertEqual([(r.review_id, r.request.field_label) for r in restored], [(old.review_id, '裤长')])
+        self.assertFalse(resumed.unrestored_run_reviews('jd'))
+        self.store.save_review_resolution(product_version='p', platform_id='wxsph',
+            snapshot_version=old.snapshot_version, review_id=old.review_id, final_value_id='long')
+        self.assertFalse(resumed.unrestored_run_reviews('wxsph'))
+
     async def test_confirmed_dom_selection_reused_without_new_review(self):
         runtime = AttributeRuntime(self.store, FakeClient(), 'run', 'p')
         runtime.begin_review_collection('pdd')
@@ -111,8 +125,11 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "snapshot_version": snapshot.snapshot_version, "status": "review_required",
                 "api_called": True, "confidence": .72, "selected_labels": ["短裤", "长裤"]})
         with patch.object(runtime, '_semantic_choice', side_effect=judge):
-            await runtime.recover_failed_write(platform_id='wxsph', field_label='裤长',
+            result = await runtime.recover_failed_write(platform_id='wxsph', field_label='裤长',
                 error='dropdown closed', fallback_request=request)
+            self.assertEqual(result.label, '短裤,长裤')
+            await runtime.recover_failed_write(platform_id='wxsph', field_label='裤长',
+                error='write still failed', force_review=True)
         await runtime.drain()
         reviews = [p for _, kind, p in client.events if kind == 'review.created']
         self.assertNotIn('model_judgment', reviews[-1]['evidence_json'])
@@ -504,7 +521,8 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # 审核确认兼容多选：final_value_id 用逗号分隔多个 valueId 或
         # label（如“short,long”或“短裤,长裤”），全部唯一命中候选后按
         # Excel 同款逗号语法组合返回，消费端 selection_value_groups 拆组全选。
-        request = make_length_request(excel_value="短裤,长裤", custom_allowed=False)
+        request = make_length_request(excel_value="短裤,长裤", custom_allowed=False,
+                                      control_type="multi_select")
         snapshot = CandidateSnapshot(request.platform_id, request.category_leaf_id,
             request.field_id, request.field_label, request.candidates,
             request.schema_version, request.custom_allowed)
@@ -536,7 +554,8 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.store, FakeClient(), "run", "product-1",
             verified_history={history_key: ("短裤", "长裤")},
         )
-        request = make_length_request(excel_value="短裤,长裤", custom_allowed=False)
+        request = make_length_request(excel_value="短裤,长裤", custom_allowed=False,
+                                      control_type="multi_select")
         reusable = runtime.reusable_choice(request)
         self.assertEqual(
             (reusable.value_id, reusable.label, reusable.source),
@@ -746,6 +765,54 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             (result.value_id, result.label, result.source),
             ("combined", "防风，保暖", "explicit_text"),
         )
+        self.assertEqual(client.decide_calls, [])
+
+    async def test_ordered_plans_skip_incomplete_group_and_defer_single_fallback(self):
+        cases = (
+            ("multi_select", "日常，休闲/运动", ("日常", "运动"), "运动"),
+            ("select", "日常，休闲/运动", ("日常", "运动"), "运动"),
+            ("select", "日常，休闲/运动", ("日常", "休闲"), "日常"),
+            ("select", "日常，休闲", ("日常", "休闲"), "日常"),
+        )
+        for index, (control, excel, labels, expected) in enumerate(cases):
+            with self.subTest(control=control, excel=excel, labels=labels):
+                client = FakeClient()
+                runtime = AttributeRuntime(self.store, client, f"ordered-run-{index}",
+                                           f"ordered-product-{index}", device_id="device-1")
+                result = await runtime.resolve(make_length_request(
+                    field_id=f"scene-{index}", field_label="适用场景",
+                    candidates=tuple(CandidateValue(label, label) for label in labels),
+                    excel_value=excel, control_type=control,
+                ))
+                await runtime.drain()
+                self.assertEqual(result.label, expected)
+                self.assertEqual(client.decide_calls, [])
+
+    async def test_heel_height_retains_explicit_slash_class_instead_of_numeric_inference(self):
+        client = FakeClient()
+        runtime = AttributeRuntime(self.store, client, 'heel-run', 'heel-product')
+        result = await runtime.resolve(make_length_request(
+            platform_id='xhs', field_id='heel', field_label='鞋跟高',
+            excel_value='5/中跟/中跟（3cm-5cm）', control_type='select',
+            candidates=(CandidateValue('medium', '中跟(3-5cm)'),
+                        CandidateValue('high', '高跟(5cm及以上)')),
+        ))
+        self.assertEqual(result.label, '中跟(3-5cm)')
+        await runtime.drain()
+        self.assertEqual(client.decide_calls, [])
+
+    async def test_boot_height_matches_unique_explicit_class_with_range(self):
+        client = FakeClient()
+        runtime = AttributeRuntime(self.store, client, 'boot-run', 'boot-product')
+        result = await runtime.resolve(make_length_request(
+            platform_id='xhs', field_id='boot-height', field_label='靴筒高度',
+            excel_value='中筒/中帮', control_type='select',
+            candidates=(CandidateValue('short', '短筒(筒高10-20cm)'),
+                        CandidateValue('medium', '中筒(筒高20-28cm)'),
+                        CandidateValue('high', '高筒（筒高28cm到及膝)')),
+        ))
+        self.assertEqual(result.label, '中筒(筒高20-28cm)')
+        await runtime.drain()
         self.assertEqual(client.decide_calls, [])
 
     async def test_same_product_snapshot_and_value_are_not_enqueued_again_on_rerun(self):

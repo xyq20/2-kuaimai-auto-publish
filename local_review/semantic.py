@@ -17,7 +17,7 @@ def _control_family(value):
 
 def judgment_context(settings, product_version, platform_id, field_label, control_type, excel_value="", category_leaf_id=""):
     select_types = {"select", "multi_select", "multi-select", "multiselect"}
-    control_types = sorted(select_types - {"select"}) if _control_family(control_type) == "multi_select" else [control_type]
+    control_types = sorted(select_types) if _control_family(control_type) == "multi_select" else [control_type]
     type_placeholders = ",".join("?" for _ in control_types)
     with connect(settings) as connection:
         product = connection.execute("SELECT title,style_code,category_json FROM products WHERE product_version=? AND deleting=0", (product_version,)).fetchone()
@@ -25,7 +25,10 @@ def judgment_context(settings, product_version, platform_id, field_label, contro
         info = connection.execute("SELECT payload_json FROM text_facts WHERE product_version=? AND source='product_info' ORDER BY created_at DESC,rowid DESC LIMIT 1", (product_version,)).fetchone()
         rows = connection.execute(
             "SELECT r.id,r.product_version,r.platform_id,r.field_label,r.evidence_json,"
-            "a.final_value_id,s.options_json,p.title,p.style_code,p.category_json,r.category_leaf_id,a.created_at "
+            "a.final_value_id,s.options_json,p.title,p.style_code,p.category_json,r.category_leaf_id,a.created_at,"
+            "(SELECT f.control_type FROM platform_fields f WHERE f.platform_id=s.platform_id "
+            "AND f.category_leaf_id=s.category_leaf_id AND f.source_field_id=s.field_id "
+            "AND f.schema_version=s.schema_version) AS snapshot_control_type "
             "FROM review_actions a JOIN review_tasks r ON r.id=a.review_id "
             "JOIN attribute_decisions d ON d.id=a.id JOIN option_snapshots s ON s.snapshot_version=a.snapshot_version "
             "JOIN products p ON p.product_version=r.product_version "
@@ -60,6 +63,8 @@ def judgment_context(settings, product_version, platform_id, field_label, contro
     for row in rows:
         evidence = json.loads(row["evidence_json"])
         context = evidence.get("reuse_context", {})
+        if context.get('control_type') == 'select' and _control_family(row['snapshot_control_type']) == 'multi_select':
+            context = {**context, 'control_type': row['snapshot_control_type']}
         if _control_family(context.get("control_type")) != _control_family(control_type):
             continue
         # Model suggestions/auto-fill results are never counted as human data.
@@ -198,18 +203,14 @@ def judge_attribute(settings, data):
         "assessment.relation为equivalent（纯同义、表达差异，未增加或删减含义）、inferred（结合商品资料推断）或uncertain；"
         "competing_value_ids列出仍可能适用的其他候选，不得隐去竞争候选来提高通过率。不得把推断伪装成同义。"
     )
-    groups = data["evidence"].get("requested_groups")
-    if isinstance(groups, list):
-        preferred = []
-        for group in groups:
-            if not isinstance(group, list):
-                continue
-            for label in group:
-                matches = [o for o in options if o["label"] == label]
-                if len(matches) == 1:
-                    preferred.append(matches[0])
-                    break
-        data = {**data, "evidence": {**data["evidence"], "excel_ordered_exact_matches": preferred}}
+    from attribute_runtime import excel_selection_plans, _matched_excel_variants
+    from learning_models import CandidateValue
+    variants = _matched_excel_variants(data['excel_value'],
+        tuple(CandidateValue(o['value_id'], o['label']) for o in options),
+        control_type=data['control_type'], field_label=data['field_label'])
+    data = {**data, 'evidence': {**data['evidence'],
+        'excel_ordered_plans': excel_selection_plans(data['excel_value'], multi=_control_family(data['control_type']) == 'multi_select'),
+        'excel_ordered_exact_matches': [{'value_id': c.value_id, 'label': c.label} for c in variants[0]] if variants else []}}
     allowed_kinds = ["product"] + (["excel"] if data["excel_value"].strip() else []) + (["human_learning"] if context["human_examples"] else [])
     operation_names = {"validation_error", "first_validation_error", "failed_selection", "failed_selection_value_ids", "failed_selection_source", "bounded_write_retry", "selection_only", "force_review"}
     execution_state = {k:v for k,v in data["evidence"].items() if k in operation_names}
@@ -227,9 +228,8 @@ def judge_attribute(settings, data):
                 model_data["evidence"]["authoritative_human_value_ids"] = sorted(authoritative_ids)
     elif (not any(e.get("same_category") and e.get("excel_candidates") == current_intent
                   for e in context["human_examples"])
-          and isinstance(groups, list) and len(preferred) == len(groups)
-          and all(isinstance(g,list) and g for g in groups)):
-        model_data["options"] = list({o["value_id"]:o for o in preferred}.values())
+          and variants):
+        model_data["options"] = [{'value_id': c.value_id, 'label': c.label} for c in variants[0]]
     model_input = {"request": model_data, "product_and_learning": context,
                    "execution_state": execution_state, "allowed_evidence_kinds": allowed_kinds}
     waiting["api_called"] = True

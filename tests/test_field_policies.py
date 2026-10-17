@@ -10,6 +10,11 @@ from field_policies import (
 
 
 class FieldPolicyTests(unittest.TestCase):
+    def test_strict_material_match_does_not_invent_surface_treatment(self):
+        self.assertEqual(match_option_candidates(('反绒皮',), ('高丝光反绒皮',), allow_component=False), ())
+        self.assertEqual(match_option_candidates(('反绒皮',), ('高丝光反绒皮', '反绒皮'), allow_component=False), (1,))
+        self.assertEqual(match_option_candidates(('氨纶',), ('氨纶(聚氨酯弹性纤维)',), allow_component=False), (0,))
+
     def test_freight_scope_is_explicit_not_all_publish_shops(self):
         self.assertEqual(FREIGHT_TEMPLATE_SHOPS['wxsph'], ('NEIGBORL钊叔制鞋服',))
         self.assertEqual(FREIGHT_TEMPLATE_SHOPS['xhs'],

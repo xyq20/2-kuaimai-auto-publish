@@ -155,6 +155,13 @@ STYLE_OPTION_FIELDS = frozenset({"款式", "裤型", "版型", "服饰版型", "
 STYLE_OPTION_SUFFIXES = ("裤型", "版型", "裤", "型")
 
 
+def season_option_aliases(field_label: object, value: object) -> Tuple[str, ...]:
+    if _normalize_option_text(field_label) not in {"适用季节", "季节"}:
+        return ()
+    text = str(value).strip()
+    return (text[:-1],) if text in {"春季", "夏季", "秋季", "冬季"} else ()
+
+
 def _style_stem(value: object) -> str:
     text = _normalize_option_text(value)
     for suffix in STYLE_OPTION_SUFFIXES:
@@ -197,9 +204,31 @@ def match_style_option_candidates(
                  and (stem != wanted or _style_stem(label) != label))
 
 
+def heel_height_option_matches(
+    field_label: str, desired: str, candidate_labels: Sequence[str]
+) -> Tuple[int, ...]:
+    """Match explicit shoe/boot height labels; never infer from a bare number."""
+    field = _normalize_option_text(field_label)
+    if field not in {"鞋跟高度", "鞋跟高", "靴筒高度", "筒高"}:
+        return ()
+    def height_text(value):
+        return re.sub(r"(?<=\d)cm(?=\d)", "", _normalize_option_text(value))
+    wanted = height_text(desired)
+    classes = ({"短筒", "中筒", "高筒"} if field in {"靴筒高度", "筒高"}
+               else {"平跟", "低跟", "中跟", "高跟", "超高跟"})
+    if wanted in classes:
+        return tuple(i for i, label in enumerate(candidate_labels)
+                     if re.split(r"[（(]", str(label), maxsplit=1)[0].strip() == wanted)
+    if not re.match(r"^(?:平跟|低跟|中跟|高跟|超高跟)", wanted):
+        return ()
+    return tuple(i for i, label in enumerate(candidate_labels)
+                 if height_text(label) == wanted)
+
+
 def match_option_candidates(
     desired_labels: Sequence[str],
     candidate_labels: Sequence[str],
+    *, allow_component: bool = True,
 ) -> Tuple[int, ...]:
     """Tiered Excel-to-platform option matching shared by form adapters.
 
@@ -264,6 +293,8 @@ def match_option_candidates(
     )
     if known_spellings:
         return known_spellings
+    if not allow_component:
+        return ()
     return tuple(
         index
         for index, (raw_label, text) in enumerate(zip(candidate_labels, normalized))

@@ -512,7 +512,7 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             actual = await self.listing._select_values(select, ('常规款',), label='厚度', multi=False)
             self.assertEqual(actual, ('常规款',))
             self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 0)
             self.assertFalse(runtime.deferred_reviews)
         finally:
             await runtime.drain()
@@ -563,7 +563,7 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         await self.playwright.stop()
         self.tempdir.cleanup()
 
-    async def test_leather_shoe_warranty_selects_90_days_only_for_leather_shoes(self):
+    async def test_shoe_warranty_selects_90_days_when_category_exposes_service(self):
         await self.listing.open()
         await self.listing.panel.evaluate("""panel => panel.insertAdjacentHTML('beforeend', `
           <div class="el-form-item">
@@ -579,13 +579,14 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         """)
         self.listing._select_values = AsyncMock(return_value=("90天",))
 
-        self.assertIsNone(await self.listing.apply_leather_shoe_warranty("男鞋 > 运动鞋"))
+        self.assertIsNone(await self.listing.apply_leather_shoe_warranty("男装 > 休闲裤"))
         self.assertFalse(await self.page.locator('input[name="warranty"]').is_checked())
         self.assertEqual(
             await self.listing.apply_leather_shoe_warranty("男鞋 > 休闲皮鞋"),
             "90天",
         )
         self.assertTrue(await self.page.locator('input[name="warranty"]').is_checked())
+        self.assertEqual(await self.listing.apply_leather_shoe_warranty("鞋靴 > 男鞋 > 靴子"), "90天")
         self.assertEqual(self.listing._select_values.await_args.args[1], ("90天",))
 
     async def test_delayed_tab_category_title_and_exact_select_controls(self):
@@ -1298,11 +1299,11 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         # Isolate the DOM control-kind observation; candidates stay identical.
         from unittest.mock import MagicMock
         control = MagicMock()
-        control.locator.return_value.count = AsyncMock(return_value=1)
+        control.evaluate = AsyncMock(return_value=True)
         await self.listing._resolve_learning_select_value(
             "厚度", control, ("常规款",), observed_values=("常规款",))
         multi = runtime.requests[-1]
-        control.locator.return_value.count = AsyncMock(return_value=0)
+        control.evaluate = AsyncMock(return_value=False)
         await self.listing._resolve_learning_select_value(
             "厚度", control, ("常规款",), observed_values=("常规款",))
         single = runtime.requests[-1]
@@ -1559,6 +1560,30 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             ),
             ["160-175", "55-70", "65", "129", "56.5", "57"],
         )
+
+    async def test_clothing_size_chart_enables_optional_sleeve_column_before_filling(self):
+        await self.test_clothing_size_recommendations_follow_live_clothing_headers()
+        await self.page.locator(".size-recommend-table").evaluate('''table => {
+          table.querySelector('.el-table__header-wrapper th:last-child').remove();
+          table.querySelectorAll('.el-table__body-wrapper tbody tr').forEach(row => row.lastElementChild.remove());
+          const choice = document.createElement('label');
+          choice.className = 'el-checkbox';
+          choice.innerHTML = '<input type="checkbox"><span>袖长(cm)</span>';
+          choice.querySelector('input').onchange = () => {
+            table.querySelector('.el-table__header-wrapper tr').insertAdjacentHTML('beforeend',
+              '<th><div class="cell"><p>袖长(cm)</p></div></th>');
+            table.querySelectorAll('.el-table__body-wrapper tbody tr').forEach(row =>
+              row.insertAdjacentHTML('beforeend', '<td><input></td>'));
+          };
+          table.before(choice);
+        }''')
+        result = await self.listing.fill_size_recommendations((
+            ClothingSkuRecommendation("S", 155, 160, 50, 55, 63.5, 125, 55, 56),
+            ClothingSkuRecommendation("M", 160, 175, 55, 70, 65, 129, 56.5, 57),
+        ))
+        self.assertTrue(await self.page.get_by_role('checkbox', name='袖长(cm)', exact=True).is_checked())
+        self.assertEqual(result['S'][-1], '56')
+        self.assertEqual(result['M'][-1], '57')
 
     async def test_size_preflight_rejects_duplicate_and_missing_unexpected_before_writes(self):
         await self.listing.open()
@@ -1891,6 +1916,31 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(applied["attributes"]["货号"], ("NGBL-10588",))
         self.assertEqual(persisted["attributes"]["货号"], ("NGBL-10588",))
         self.assertTrue(all(row["价格"] == "586" for row in persisted["sku"]))
+
+    async def test_goods_code_is_skipped_only_when_live_schema_and_form_omit_it(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.page.locator(
+            ".el-form-item:has(.el-form-item__label:text-is('货号'))"
+        ).evaluate("element => element.remove()")
+        self.listing._category_properties_generation = 1
+        self.listing._category_properties = {"厚度": ({"name": "厚度"},)}
+        self.listing.fill_text_field = AsyncMock()
+        fields = SimpleNamespace(
+            short_title="复古工装裤", attributes={"货号/商家外部编码": "NGBL-10588"}
+        )
+
+        applied = await self.listing.apply_category_and_fields(fields)
+
+        self.listing.fill_text_field.assert_not_awaited()
+        self.assertNotIn("货号", applied["attributes"])
+        self.assertIn("货号/商家外部编码", applied["skipped_attributes"])
+
+        self.listing._category_properties["货号"] = ({"name": "货号"},)
+        self.listing.fill_text_field.side_effect = DouyinListingError("货号未渲染")
+        with self.assertRaisesRegex(DouyinListingError, "货号未渲染"):
+            await self.listing.apply_category_and_fields(fields)
+        self.listing.fill_text_field.assert_awaited_once_with("货号", "NGBL-10588")
 
     async def test_saved_readback_checks_full_sku_model_not_only_visible_rows(self):
         await self.listing.open()

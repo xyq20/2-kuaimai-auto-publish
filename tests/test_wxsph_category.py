@@ -20,14 +20,21 @@ class WxsphCategoryTests(unittest.IsolatedAsyncioTestCase):
           </div>
           <div role="dialog" aria-label="修改类目" style="display:none">
             <input placeholder="请输入类目关键词，支持模糊查询" oninput="window.terms.push(this.value);document.querySelector('.el-autocomplete-suggestion').style.display='block'">
-            <div id="selected">已选：</div>
+            <div id="selected">已选：</div><div id="menus"></div>
             <button onclick="document.querySelector('.current').textContent=window.chosen;this.parentElement.style.display='none'">确定</button>
           </div>
           <div class="el-autocomplete-suggestion" style="display:none"><ul>
-            <li onclick="window.chosen=this.textContent;document.querySelector('#selected').textContent='已选：'+window.chosen">服饰内衣 &gt; 男装 &gt; 裤装 &gt; 牛仔裤</li>
+            <li onclick="window.chosen=this.textContent;document.querySelector('#selected').textContent='已选：'+window.chosen;renderMenus(window.chosen)">服饰内衣 &gt; 男装 &gt; 裤装 &gt; 牛仔裤</li>
             <li>服饰内衣 &gt; 女装 &gt; 裤子 &gt; 牛仔裤</li>
           </ul></div>
-          <script>window.terms=[];</script>
+          <script>window.terms=[];
+            function renderMenus(path) {
+              const parts=path.split(' > ');
+              document.querySelector('#menus').innerHTML=parts.map((name,i)=>
+                '<div class="el-cascader-menu"><div class="el-cascader-node" '+
+                (i<parts.length-1?'aria-haspopup="true"':'')+'><span class="el-cascader-node__label">'+name+'</span></div></div>').join('');
+            }
+          </script>
         ''')
         self.listing = WxsphFormListing(self.page, self.page.locator('body'), None,
                                        category_hints=('牛仔裤', '男士直筒牛仔裤'))

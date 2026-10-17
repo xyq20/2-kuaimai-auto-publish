@@ -7,6 +7,26 @@ from typing import Iterable, Tuple
 from platform_schema import FieldOption
 
 
+async def select_supports_multiple(select) -> bool:
+    """Read the live control, including multi-selects whose empty tags aren't mounted."""
+    return bool(await select.evaluate("""element => {
+        const component = element.__vue__;
+        if (typeof component?.multiple === 'boolean') return component.multiple;
+        if (typeof component?.$props?.multiple === 'boolean') return component.$props.multiple;
+        return element.hasAttribute('multiple')
+          || element.getAttribute('aria-multiselectable') === 'true'
+          || element.classList.contains('is-multiple')
+          || Boolean(element.querySelector('.el-select__tags'));
+    }"""))
+
+
+async def select_multiple_limit(select) -> int:
+    return int(await select.evaluate("""element => {
+        const c = element.__vue__;
+        return Number(c?.multipleLimit ?? c?.$props?.multipleLimit ?? 0) || 0;
+    }"""))
+
+
 class CandidateSourceError(RuntimeError):
     def __init__(self, reason_code: str) -> None:
         super().__init__(reason_code)

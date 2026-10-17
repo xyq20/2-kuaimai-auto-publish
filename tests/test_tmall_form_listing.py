@@ -77,7 +77,10 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         }''')
         with self.assertRaisesRegex(TmallFormListingError, '反复被清空'):
             await listing.restore_product_season(fields, confirmed=result)
+        await self.page.locator('#season li').evaluate('element => element.replaceWith(element.cloneNode(true))')
         listing._category_text.return_value = '男鞋 > 皮鞋'
+        self.assertEqual(await listing.restore_product_season(fields), result)
+        await self.page.locator('#season').evaluate('element => element.remove()')
         self.assertIsNone(await listing.restore_product_season({}))
 
     async def asyncSetUp(self):
@@ -134,7 +137,7 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         """)
         with patch("tmall_form_listing.shanghai_today", return_value=date(2026, 9, 29)):
             self.assertIsNone(
-                await listing.fill_leather_shoe_listing_date("男鞋 > 运动鞋")
+                await listing.fill_leather_shoe_listing_date("男装 > 休闲裤")
             )
             self.assertEqual(
                 await listing.fill_leather_shoe_listing_date("男鞋 > 休闲皮鞋"),
@@ -148,6 +151,46 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             await self.page.locator("#sku-date input").input_value(),
             "2026-08-01",
         )
+        with patch("tmall_form_listing.shanghai_today", return_value=date(2026, 10, 15)):
+            self.assertEqual(
+                await listing.fill_leather_shoe_listing_date("流行男鞋 > 靴子 > 时装靴"),
+                "2026-10-15",
+            )
+
+    async def test_boot_initial_attributes_use_current_controls_and_excel_alternatives(self):
+        controls = []
+        for label, option in (("靴筒高度", "中筒"), ("靴筒材质", "反牛皮"), ("款式", "工装靴")):
+            controls.append(f'''<div class="el-form-item is-required">
+              <label class="el-form-item__label">{label}</label>
+              <div class="el-select"><input class="el-input__inner" readonly onclick="this.parentElement.querySelector('ul').style.display='block'">
+                <ul class="el-select-dropdown" style="display:none"><li class="el-select-dropdown__item"
+                  onclick="this.closest('.el-select').querySelector('input').value=this.textContent;this.parentElement.style.display='none'">{option}</li></ul>
+              </div></div>''')
+        listing = await self._listing('<form class="product-form">货号与品牌</form>'
+                                      '<section class="boot-properties">' + ''.join(controls) + '</section>'
+                                      '<div class="useCategory-wrap"><div class="el-form-item"><label class="el-form-item__label">靴筒材质</label><input value="keep-sale-value"></div></div>')
+        listing._category_text = AsyncMock(return_value='流行男鞋 > 靴子 > 时装靴')
+        result = await listing.fill_initial_footwear_attributes({
+            '筒高/靴筒高度': '中筒/中帮', '靴筒材质/靴筒面材质': '牛反绒/反牛皮',
+            '商品类型/款式': '工装靴/户外靴',
+        })
+        self.assertEqual(result, {'靴筒高度': '中筒', '靴筒材质': '反牛皮', '款式': '工装靴'})
+        self.assertEqual(await self.page.locator('.boot-properties input').evaluate_all(
+            'nodes => nodes.map(node => node.value)'), ['中筒', '反牛皮', '工装靴'])
+
+    async def test_initial_heel_input_uses_numeric_alternative_only(self):
+        listing = await self._listing('<div id="heel"><input></div>')
+        self.assertEqual(await listing._fill_exact_form_item('鞋跟高度', self.page.locator('#heel'), '5/中跟/中跟（3cm-5cm）'), '5')
+
+    async def test_product_publish_reports_required_validation_without_timeout(self):
+        listing = await self._listing('''<section class="tm-product-info">
+          <div class="el-form-item"><label class="el-form-item__label">靴筒高度</label>
+            <div class="el-form-item__content"><input><div class="el-form-item__error" style="display:none">必填</div></div>
+          </div><button onclick="document.querySelector('.el-form-item__error').style.display='block'">发布</button>
+        </section>''')
+        listing.wait_for_initial_product_images = AsyncMock(return_value={'decoded': True})
+        with self.assertRaisesRegex(TmallFormListingError, '校验未通过.*靴筒高度.*必填'):
+            await listing.publish_product_information(timeout_seconds=1)
 
     async def test_api_field_id_locates_dom_control_before_label_scan(self):
         api_index = SimpleNamespace(
@@ -461,6 +504,8 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
                   document.querySelector('[role=dialog] .selected').textContent='已选：男装 > 牛仔裤'">男装 &gt; 牛仔裤</div>
               </div>
               <div class="selected"></div>
+              <div class="el-cascader-menu"><div class="el-cascader-node" aria-haspopup="true"><span class="el-cascader-node__label">男装</span></div></div>
+              <div class="el-cascader-menu"><div class="el-cascader-node"><span class="el-cascader-node__label">牛仔裤</span></div></div>
               <button onclick="this.closest('[role=dialog]').style.display='none'">确定</button>
             </div>
             """
@@ -714,7 +759,7 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["slot_count"], 5)
         self.assertFalse(state["decoded"])
 
-    async def test_clicks_product_information_publish_and_waits_for_form(self):
+    async def test_clicks_product_information_publish_and_waits_despite_lower_form_errors(self):
         listing = await self._listing(
             """
             <section class="tm-product-info">
@@ -723,15 +768,21 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
                 发布
               </button>
             </section>
+            <div class="el-form-item"><label class="el-form-item__label">风格</label>
+              <div class="el-form-item__error">必填</div>
+            </div>
             """
         )
-        listing.require_full_form = AsyncMock()
+        listing.require_full_form = AsyncMock(side_effect=[
+            TmallFormListingError("下方表单尚未渲染完成"), None,
+        ])
         listing.wait_for_initial_product_images = AsyncMock()
 
         report = await listing.publish_product_information(timeout_seconds=1)
 
         self.assertEqual(await self.page.evaluate("window.productPublishClicks || 0"), 1)
         listing.require_full_form.assert_awaited()
+        self.assertEqual(listing.require_full_form.await_count, 2)
         self.assertEqual(report["clicked"], True)
 
     async def test_wait_detects_api_confirmed_product_match_not_image_success(self):
@@ -2034,6 +2085,207 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             ),
             ["棉", "100"],
         )
+
+    async def test_material_percentage_waits_for_row_rerender_after_name_choice(self):
+        """选中材质名会重渲染当前行，含量输入框短暂消失后仍须写入成功。"""
+        listing = await self._listing(
+            """
+            <form class="step3-form">
+              <div class="title ft-12">售后及其他</div>
+              <div class="others-items">
+                <div class="el-form-item is-required" id="rerender-material">
+                  <label class="el-form-item__label">材质成分</label>
+                  <div class="el-form-item__content">
+                    <div class="multi-complex-items">
+                      <button type="button" onclick="addRerenderRow()">添加</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </form>
+            <script>
+              function addRerenderRow() {
+                const root = document.querySelector(
+                  '#rerender-material .multi-complex-items');
+                const row = document.createElement('div');
+                row.className = 'multi-complex-items_item';
+                row.innerHTML = `
+                  <div class="el-select">
+                    <input class="el-input__inner" readonly
+                      onclick="openRerenderSelect(this)">
+                    <div class="el-select-dropdown" style="display:none"><ul>
+                      <li class="el-select-dropdown__item"
+                        onclick="chooseRerenderMaterial(this)">棉</li>
+                    </ul></div>
+                  </div>
+                  <input class="percentage">`;
+                root.appendChild(row);
+              }
+              function openRerenderSelect(input) {
+                input.closest('.el-select')
+                  .querySelector('.el-select-dropdown').style.display = 'block';
+              }
+              function chooseRerenderMaterial(option) {
+                const select = option.closest('.el-select');
+                select.querySelector('input').value = '棉';
+                select.querySelector('.el-select-dropdown').style.display = 'none';
+                const row = select.closest('.multi-complex-items_item');
+                const percentage = row.querySelector('.percentage');
+                percentage.remove();
+                setTimeout(function () {
+                  const revived = document.createElement('input');
+                  revived.className = 'percentage';
+                  row.appendChild(revived);
+                }, 80);
+              }
+            </script>
+            """
+        )
+
+        report = await listing.fill_after_sales({"材质成分/材质": "棉/100%"})
+
+        self.assertEqual(report["materials"], (("棉", 100),))
+        self.assertEqual(
+            await self.page.locator("#rerender-material .percentage").input_value(),
+            "100",
+        )
+
+    async def test_material_row_without_percentage_column_is_not_silently_accepted(self):
+        """含量列始终缺失时必须报错，不能被等待逻辑吞掉。"""
+        listing = await self._listing(
+            """
+            <form class="step3-form">
+              <div class="title ft-12">售后及其他</div>
+              <div class="others-items">
+                <div class="el-form-item is-required" id="no-percentage-material">
+                  <label class="el-form-item__label">材质成分</label>
+                  <div class="el-form-item__content">
+                    <div class="multi-complex-items">
+                      <button type="button" onclick="addNoPercentageRow()">添加</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </form>
+            <script>
+              function addNoPercentageRow() {
+                const root = document.querySelector(
+                  '#no-percentage-material .multi-complex-items');
+                const row = document.createElement('div');
+                row.className = 'multi-complex-items_item';
+                row.innerHTML = `
+                  <div class="el-select">
+                    <input class="el-input__inner" readonly>
+                  </div>`;
+                root.appendChild(row);
+              }
+            </script>
+            """
+        )
+
+        with self.assertRaises(TmallFormListingError):
+            await listing.fill_after_sales({"材质成分/材质": "棉/100%"})
+
+    async def _conditional_material_listing(self):
+        return await self._listing(
+            """
+            <form class="step3-form">
+              <div class="title ft-12">售后及其他</div>
+              <div class="others-items">
+                <div class="el-form-item is-required" id="conditional-material">
+                  <label class="el-form-item__label">材质成分</label>
+                  <div class="el-form-item__content">
+                    <div class="multi-complex-items">
+                      <button type="button" onclick="addConditionalMaterial()">添加</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </form>
+            <script>
+              window.materialAdds = 0;
+              window.keepPercentageLabel = false;
+              function addConditionalMaterial() {
+                window.materialAdds++;
+                const row = document.createElement('div');
+                row.innerHTML = `
+                  <div class="multi-complex-items_item">
+                    <div class="el-form-item">
+                      <label class="el-form-item__label">材质</label>
+                      <div class="el-form-item__content"><div class="el-select">
+                        <input name="material_prop_name" class="el-input__inner" readonly
+                          onclick="this.parentElement.querySelector('.el-select-dropdown').style.display='block'">
+                        <div class="el-select-dropdown" style="display:none"><ul>
+                          <li class="el-select-dropdown__item" onclick="chooseConditionalMaterial(this)">羊皮</li>
+                          <li class="el-select-dropdown__item" onclick="chooseConditionalMaterial(this)">棉</li>
+                        </ul></div>
+                      </div></div>
+                    </div>
+                    <div class="el-form-item percentage-field">
+                      <label class="el-form-item__label">含量(%)</label>
+                      <div class="el-form-item__content"><input name="material_prop_content"></div>
+                    </div>
+                  </div>
+                  <div><a onclick="this.parentElement.parentElement.remove()">移 除</a></div>`;
+                document.querySelector('#conditional-material .multi-complex-items').appendChild(row);
+              }
+              function chooseConditionalMaterial(option) {
+                const select = option.closest('.el-select');
+                select.querySelector('input').value = option.textContent;
+                select.querySelector('.el-select-dropdown').style.display = 'none';
+                const percentage = select.closest('.multi-complex-items_item')
+                  .querySelector('.percentage-field');
+                if (window.keepPercentageLabel) {
+                  percentage.querySelector('input').remove();
+                } else if (option.textContent === '羊皮') {
+                  percentage.remove();
+                }
+              }
+            </script>
+            """
+        )
+
+    async def test_name_only_material_is_read_back_without_invented_percentage(self):
+        listing = await self._conditional_material_listing()
+
+        report = await listing.fill_after_sales({"材质成分/材质": "羊皮"})
+
+        self.assertEqual(report["materials"], (("羊皮", None),))
+        self.assertEqual(
+            await self.page.locator('#conditional-material input').input_value(), "羊皮"
+        )
+        self.assertEqual(listing.material_validation["rows"], (("羊皮", None),))
+        # A repeated pass must recognize the existing name-only row.
+        repeated = await listing.fill_after_sales({"材质成分/材质": "羊皮"})
+        self.assertEqual(repeated["materials"], (("羊皮", None),))
+        self.assertEqual(await self.page.evaluate('window.materialAdds'), 1)
+
+    async def test_name_only_material_cannot_discard_mixed_composition_percentages(self):
+        listing = await self._conditional_material_listing()
+
+        with self.assertRaisesRegex(TmallFormListingError, "混合材质比例"):
+            await listing.fill_after_sales({"材质成分/材质": "羊皮60%，棉40%"})
+
+    async def test_name_only_material_cannot_ignore_unrecognized_inputs(self):
+        listing = await self._conditional_material_listing()
+        await self.page.evaluate('''() => {
+          const original = window.chooseConditionalMaterial;
+          window.chooseConditionalMaterial = option => {
+            const row = option.closest('.multi-complex-items_item');
+            original(option);
+            row.insertAdjacentHTML('beforeend', '<input><input>');
+          };
+        }''')
+
+        with self.assertRaisesRegex(TmallFormListingError, "含量输入框"):
+            await listing.fill_after_sales({"材质成分/材质": "羊皮"})
+
+    async def test_declared_percentage_field_without_input_is_rejected(self):
+        listing = await self._conditional_material_listing()
+        await self.page.evaluate('window.keepPercentageLabel = true')
+
+        with self.assertRaisesRegex(TmallFormListingError, "含量输入框"):
+            await listing.fill_after_sales({"材质成分/材质": "棉/100%"})
 
     async def test_after_sales_refills_normal_fields_after_material_rerender(self):
         listing = await self._listing(

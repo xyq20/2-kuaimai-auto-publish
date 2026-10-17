@@ -54,8 +54,10 @@ const state = {selected:['douyin','jd','xhs'], product:null, products:[], produc
 const labels = {pending:'等待执行', running:'运行中', waiting_review:'等待审核', stopping:'正在停止',
   stopped:'已停止', interrupted:'运行中断', failed:'失败', completed:'已完成', success:'已完成'};
 const errors = {
-  products_unavailable:'产品目录暂不可用，请先连接共享文件目录，再刷新商品列表。',
+  products_unavailable:'商品目录暂不可用，请连接美工共享盘并确认当月文件夹，再刷新列表。',
   product_not_found:'商品已移动或删除，请刷新后重新选择。', product_unreadable:'无法读取这个商品的 Excel，请检查文件。',
+  product_excel_missing:'请在当前商品文件夹中放入产品信息.xlsx，再刷新列表。',
+  product_excel_ambiguous:'这个商品匹配到多个 Excel，请将确认的产品信息.xlsx 放入当前商品文件夹。',
   job_already_running:'已有任务正在运行，请先查看当前任务。', external_job_running:'命令行有任务正在运行，结束后再从网页启动。',
   publish_confirmation_required:'请确认本次要保存并铺货。', review_not_configured:'审核服务尚未配置，请通过 run-review-center.command 启动。',
   admin_required:'当前账号可审核和查看记录；启动或停止任务需要管理员账号。', unauthorized:'登录已过期，请重新登录。',
@@ -103,7 +105,7 @@ function renderProduct() {
   $('product-image').replaceChildren();
   if (p?.image) { const img = document.createElement('img'); img.src = p.image; img.alt = p.title; $('product-image').append(img); }
   else $('product-image').innerHTML = `<div class="demo-art">${icon('shirt')}</div>`;
-  $('product-code').textContent = p?.style_code || '待选择';
+  $('product-code').textContent = p?.style_code || (p?.runnable === false ? '待补充 Excel' : '待选择');
   $('product-title').textContent = p?.title || '请选择本次处理的商品';
   $('product-category').textContent = p?.category || '';
   $('plan-product').textContent = p?.style_code || '待选择';
@@ -131,7 +133,7 @@ function renderPlan() {
     return `<li><span class="queue-number">${index+1}</span><span class="queue-logo">${p ? logo(p) : icon('box')}</span><span class="queue-name">${name}</span>${reorder}</li>`;
   }).join('');
   $('empty-plan').hidden = ids.length > 0;
-  $('preview-run').disabled = !state.admin || !state.product || !ids.length || !!state.active;
+  $('preview-run').disabled = !state.admin || !state.product || state.product.runnable === false || !ids.length || !!state.active;
   $('preview-run').innerHTML = icon('play') + (state.active ? '已有任务运行中' : '开始运行') + icon('arrow');
   $('plan-mode').textContent = mode().name;
   $('plan-learning').innerHTML = state.learning && normal ? '<i></i>已开启' : '已关闭';
@@ -233,6 +235,7 @@ async function chooseProduct(id) {
     const p = await api('/api/launcher/products/'+id);
     if (request !== productRequest) return;
     state.product = p; renderProduct(); remember(); $('product-dialog').close();
+    notice(p.runnable === false ? (p.excel_status === 'ambiguous' ? errors.product_excel_ambiguous : errors.product_excel_missing) : '');
   } catch (e) { if (request === productRequest) notice(e.message); }
 }
 function productIdentity(p) {
@@ -261,23 +264,27 @@ function renderProducts() {
     const selected = p.id === state.product?.id;
     return `<button class="product-choice ${selected ? 'selected' : ''}" data-product="${escapeHTML(p.id)}" aria-pressed="${selected}">
       <span class="choice-image">${icon('shirt')}<img src="${escapeHTML(p.image || '/api/launcher/products/'+encodeURIComponent(p.id)+'/image')}" alt="" loading="lazy" decoding="async"></span>
-      <span class="choice-info"><strong title="${escapeHTML(folder)}">${escapeHTML(name)}</strong><span class="choice-code">${escapeHTML(code || '查看商品详情')}</span>${p.processed ? `<span class="product-status-note" title="${escapeHTML((p.processed_platforms || []).join('、'))}">已保存 · ${escapeHTML((p.processed_platforms || []).join('、') || '商品资料')}</span>` : ''}</span>
+      <span class="choice-info"><strong title="${escapeHTML(folder)}">${escapeHTML(name)}</strong><span class="choice-code">${escapeHTML(p.runnable === false ? (p.excel_status === 'ambiguous' ? '待确认 Excel' : '待补充 Excel') : code || 'Excel 资料已就绪')}</span>${p.processed ? `<span class="product-status-note" title="${escapeHTML((p.processed_platforms || []).join('、'))}">已保存 · ${escapeHTML((p.processed_platforms || []).join('、') || '商品资料')}</span>` : ''}</span>
       <span class="choice-state">${selected ? `<span>当前商品</span>${icon('check')}` : icon('chevron')}</span>
     </button>`;
   }).join('');
   $('product-list').querySelectorAll('img').forEach(img => { img.onerror = () => img.remove(); });
   $('product-empty').hidden = products.length > 0;
-  $('product-empty').textContent = terms.length ? '没有匹配的商品，试试其他关键词或切换到“全部”。' : state.productFilter === 'unprocessed' ? '当前商品都有保存记录了，可到“已处理”查看或继续处理其他平台。' : '这个分组暂时没有商品。';
+  $('product-empty').textContent = !state.products.length ? '当月目录没有找到带产品信息.xlsx 的商品，补齐资料后刷新列表。' : terms.length ? '没有匹配的商品，试试其他关键词或切换到“全部”。' : state.productFilter === 'unprocessed' ? '当前商品都有保存记录了，可到“已处理”查看或继续处理其他平台。' : '这个分组暂时没有商品。';
 }
 async function loadProducts(preferred, refreshOnly = false) {
   clearTimeout(productRetryTimer); productRetryTimer = null;
   $('refresh-products').disabled = true;
   try {
     const data = await api('/api/launcher/products'); state.products = data.products; renderProducts();
-    notice(state.products.length ? (!state.admin ? errors.admin_required : '') : '目录内没有找到产品信息.xlsx，请检查共享目录。');
-    const selected = state.products.find(p => p.id === (preferred || state.product?.id)) || state.products[0];
+    notice(state.products.length ? (!state.admin ? errors.admin_required : '') : '当月目录没有找到带产品信息.xlsx 的商品，补齐资料后刷新列表。');
+    const selected = state.products.find(p => p.id === (preferred || state.product?.id)) || state.products.find(p => p.runnable !== false && !p.processed) || state.products.find(p => p.runnable !== false) || state.products[0];
     if (!refreshOnly) {
       if (selected) await chooseProduct(selected.id); else { state.product = null; renderProduct(); }
+    } else if (state.product) {
+      const current = state.products.find(p => p.id === state.product.id);
+      if (!current) { state.product = null; renderProduct(); }
+      else { state.product = {...state.product, ...current}; renderProduct(); }
     }
   } catch (e) {
     state.product = null; renderProduct(); notice(e.message);

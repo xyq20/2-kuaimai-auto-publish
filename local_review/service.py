@@ -93,6 +93,10 @@ EVENT_FIELDS: dict[str, tuple[set[str], set[str]]] = {
         },
         {"image_version", "checkpoint_id"},
     ),
+    "review.superseded": (
+        {"run_id", "device_id", "product_version", "platform_id", "review_id", "snapshot_version", "reason"},
+        set(),
+    ),
     "stage.completed": (
         {
             "run_id",
@@ -272,7 +276,7 @@ def validate_device_event(data: Any) -> tuple[str, str, dict[str, Any]]:
         require(isinstance(custom_allowed, bool), 400, "invalid_custom_allowed")
         require(
             isinstance(options, list)
-            and len(options) <= 5000
+            and len(options) <= 10000
             and (bool(options) or custom_allowed),
             400,
             "invalid_options",
@@ -430,18 +434,13 @@ def _validate_stage(connection: sqlite3.Connection, payload: dict[str, Any]) -> 
 def ingest_event(settings: Settings, data: Any) -> tuple[int, dict[str, Any]]:
     key, event_type, payload = validate_device_event(data)
     with transaction(settings) as connection:
-        existing = connection.execute(
-            "SELECT id,event_type,payload_json FROM device_events WHERE idempotency_key=?",
-            (key,),
-        ).fetchone()
-        if existing is not None:
-            require(
-                existing["event_type"] == event_type
-                and canonical_json(json.loads(existing["payload_json"])) == canonical_json(payload),
-                409,
-                "idempotency_payload_conflict",
-            )
-            return 409, {"event_id": existing["id"]}
+        if event_type == 'review.superseded':
+            task = connection.execute('SELECT * FROM review_tasks WHERE id=?', (payload['review_id'],)).fetchone()
+            require(task is not None and all(task[name] == payload[name] for name in
+                    ('run_id', 'device_id', 'product_version', 'platform_id', 'snapshot_version')), 409, 'review_identity_conflict')
+            require(task['status'] in {'pending', 'invalidated'} and task['claimed_by'] is None,
+                    409, 'review_already_handled')
+            _text(payload['reason'], 'reason', 1000)
         if payload.get("product_version"):
             product = connection.execute(
                 "SELECT deleting FROM products WHERE product_version=?",
@@ -502,6 +501,21 @@ def ingest_event(settings: Settings, data: Any) -> tuple[int, dict[str, Any]]:
             event_product = checkpoint["product_version"]
         if event_type == "checkpoint.updated":
             _validate_checkpoint(connection, payload)
+        # Compare after server-derived fields have been normalized. If the
+        # first response was lost, an identical retry must remain idempotent
+        # even when canonical_field/reason_code were filled by this service.
+        existing = connection.execute(
+            "SELECT id,event_type,payload_json FROM device_events WHERE idempotency_key=?",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            require(
+                existing["event_type"] == event_type
+                and canonical_json(json.loads(existing["payload_json"])) == canonical_json(payload),
+                409,
+                "idempotency_payload_conflict",
+            )
+            return 409, {"event_id": existing["id"]}
         if event_type == "stage.completed":
             _validate_stage(connection, payload)
 
@@ -563,6 +577,9 @@ def ingest_event(settings: Settings, data: Any) -> tuple[int, dict[str, Any]]:
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET current_index=excluded.current_index,status=excluded.status,pending_review_id=excluded.pending_review_id,version=excluded.version,updated_at=excluded.updated_at WHERE excluded.version>run_checkpoints.version",
                 (payload["run_id"], payload["product_version"], payload["device_id"], payload["execution_mode"], canonical_json(payload["platform_order"]), payload["current_index"], payload["status"], payload.get("pending_review_id"), payload["version"], payload.get("image_version", ""), now),
             )
+        elif event_type == 'review.superseded':
+            connection.execute("UPDATE review_tasks SET status='invalidated',version=version+1,updated_at=? WHERE id=? AND status='pending'",
+                (now, payload['review_id']))
         elif event_type == "stage.completed":
             connection.execute(
                 "INSERT INTO stage_results(idempotency_key,run_id,platform_id,status,expected_json,readback_json,verified,updated_at) "

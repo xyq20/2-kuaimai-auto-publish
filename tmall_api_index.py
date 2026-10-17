@@ -383,6 +383,12 @@ class TmallApiJsonIndex:
         category_id = _response_category_id(response) or _payload_category_id(payload)
         if category_id:
             self._category_leaf_ids.add(category_id)
+            if self._fields and any(
+                field.category_leaf_id not in {None, category_id}
+                for field in self._fields
+            ):
+                # A category switch invalidates all previously captured fields.
+                self._fields.clear()
         fields = tuple(
             TmallApiField(
                 endpoint_path=field.endpoint_path,
@@ -396,8 +402,10 @@ class TmallApiJsonIndex:
             for field in extract_api_fields(payload, path)
         )
         # payload 在这里离开作用域；只保留字段 schema，不保留原始响应。
-        existing = {
-            (field.endpoint_path, field.source_id, normalize_api_label(field.label))
+        # 同一字段可能因类目联动或页面重渲染返回新候选，必须用最新定义
+        # 替换旧值，否则后续匹配会继续使用已经失效的下拉项。
+        by_identity = {
+            (field.endpoint_path, field.source_id, normalize_api_label(field.label)): field
             for field in self._fields
         }
         for field in fields:
@@ -406,9 +414,8 @@ class TmallApiJsonIndex:
                 field.source_id,
                 normalize_api_label(field.label),
             )
-            if identity not in existing:
-                existing.add(identity)
-                self._fields.append(field)
+            by_identity[identity] = field
+        self._fields = list(by_identity.values())
         self._endpoint_states[path] = {
             "path": path,
             "method": method,

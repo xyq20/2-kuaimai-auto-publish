@@ -58,6 +58,7 @@ class LearningClientTests(unittest.TestCase):
             "stage.completed",
             "readback.recorded",
             "review.created",
+            "review.superseded",
             "text_facts.created",
         }
         self.assertEqual(DEVICE_EVENT_TYPES, frozenset(expected))

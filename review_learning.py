@@ -22,6 +22,17 @@ def field_key(value):
     return FIELD_ALIASES.get(label, label)
 
 
+def _category_intent(category):
+    if not isinstance(category, dict) or not isinstance(category.get('hints'), list):
+        return category
+    # Older product registrations stored each OR alternative as a list item;
+    # current registrations keep the original slash-separated Excel cell.
+    # Preserve their order and all other category metadata when comparing.
+    return {**category, 'hints': [normalized(part)
+        for hint in category['hints'] for part in re.split(r'[/／]', str(hint))
+        if normalized(part)]}
+
+
 def _related_fields(request, row):
     current = field_key(request['field_label'])
     previous = field_key(row['field_label'])
@@ -114,7 +125,8 @@ def choose_review_learning(request, records):
         if tuple(normalized(v) for v in row.get('excel_candidates', [])) != excel:
             continue
         same = row['product_version'] == request['product_version']
-        if not same and (not excel or not request['category'] or row['category'] != request['category']):
+        if not same and (not excel or not request['category']
+                         or _category_intent(row['category']) != _category_intent(request['category'])):
             continue
         mapped = _remap_choice(row['labels'], request['options'], excel)
         if not mapped:

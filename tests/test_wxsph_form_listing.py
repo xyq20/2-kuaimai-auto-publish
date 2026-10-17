@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 from attribute_runtime import NO_FILL_VALUE_ID, ResolvedAttribute
 from wxsph_data import parse_wxsph_fields
 from wxsph_form_listing import WxsphFormListing, WxsphFormListingError
+from taobao_listing import TaobaoListingError
 
 
 def select_markup(options):
@@ -82,7 +83,7 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
                 "适用场景", "日常，休闲", multi=False,
                 category_hints=("流行男鞋 > 休闲皮鞋",),
             ),
-            (("日常",), ("休闲",)),
+            (("日常，休闲", "日常", "休闲"),),
         )
         self.assertEqual(
             WxsphFormListing._selection_groups_for_control(
@@ -96,7 +97,7 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
                 "适用场景", "日常，休闲", multi=False,
                 category_hints=("男装 > 卫衣",),
             ),
-            (("日常，休闲",),),
+            (("日常，休闲", "日常", "休闲"),),
         )
 
     async def test_persisted_readback_uses_pre_save_resolved_values(self):
@@ -809,6 +810,48 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         result = await listing.apply_batch_delivery()
         self.assertTrue(await listing.panel.get_by_role('radio', name='按规格预售', exact=True).is_checked())
         self.assertEqual(result['days'], '15')
+
+    async def test_custom_delivery_modal_without_dialog_class_or_role(self):
+        listing = await self._listing()
+        await self.page.locator('#delivery-dialog').evaluate("e => {e.className='km-popup';e.removeAttribute('role');}")
+        result = await listing.apply_batch_delivery()
+        self.assertEqual(result['days'], '15')
+        self.assertEqual(result['row_count'], 2)
+
+    async def test_review_boundary_precedes_sku_and_delivery(self):
+        from attribute_runtime import ReviewBatchRequired, ReviewRequired
+        from tests.test_attribute_runtime import make_length_request
+        from types import SimpleNamespace
+        review = ReviewRequired('review', make_length_request(), 'uncertain', 'snapshot')
+        listing = await self._listing()
+        listing.attribute_runtime = SimpleNamespace(raise_deferred_reviews=lambda: (_ for _ in ()).throw(ReviewBatchRequired((review,))))
+        listing.fill_category_attributes = AsyncMock(return_value={'attributes': {}})
+        listing.fill_sku_batch = AsyncMock()
+        listing.apply_batch_delivery = AsyncMock()
+        with self.assertRaises(ReviewBatchRequired):
+            await listing.apply_excel_fields(SimpleNamespace(fields={}))
+        listing.fill_sku_batch.assert_not_awaited()
+        listing.apply_batch_delivery.assert_not_awaited()
+
+    async def test_season_uses_complete_first_plan_and_later_fallback(self):
+        listing = await self._listing()
+        await self.page.set_content('<div id="season"></div>')
+        select = self.page.locator('#season')
+        await select.evaluate("e => {e.__vue__={cachedOptions:['秋','冬','春秋'].map(v=>({value:v,label:v}))};}")
+        self.assertEqual(await listing._excel_groups_for_select(select, '适用季节', '秋季，冬季/春秋冬/春秋', multi=True), (('秋',), ('冬',)))
+        await select.evaluate("e => {e.__vue__.cachedOptions=[{value:'春秋',label:'春秋'}];}")
+        self.assertEqual(await listing._excel_groups_for_select(select, '适用季节', '秋季，冬季/春秋冬/春秋', multi=True), (('春秋',),))
+
+    async def test_registered_option_recovers_hidden_dropdown_and_readback(self):
+        listing = await self._listing()
+        select = self.page.locator('#fabric .el-select')
+        await select.evaluate("""e => {
+          e.__vue__.cachedOptions=[{value:'棉',currentLabel:'棉'}];
+          e.querySelector('input').value='';
+          e.__vue__.handleOptionSelect=o=>{e.querySelector('input').value=o.currentLabel;};
+        }""")
+        listing._visible_dom_options = AsyncMock(side_effect=TaobaoListingError('未找到可见选项'))
+        self.assertEqual(await listing._select_values(select, (('棉',),), label='里料材质', multi=False, allow_review=False), ('棉',))
 
     async def test_fills_attributes_batch_once_and_fixed_weight(self):
         listing = await self._listing()

@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 
+from product_materials import default_materials_root
+
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_PRODUCTS_ROOT = Path.home() / "Desktop" / "共享文件" / "谭" / "products"
@@ -29,6 +31,7 @@ class Settings:
     review_port: int = 8787
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-flash"
+    materials_root: Path | None = None
 
     @property
     def database_path(self) -> Path:
@@ -76,6 +79,7 @@ class Settings:
             products_root=Path(
                 os.environ.get("KUAIMAI_PRODUCTS_ROOT", str(default_products_root()))
             ).expanduser(),
+            materials_root=default_materials_root(),
             review_port=int(os.environ.get("KUAIMAI_REVIEW_PORT", "8787")),
             deepseek_api_key=str(os.environ.get("KUAIMAI_DEEPSEEK_API_KEY", os.environ.get("DEEPSEEK_API_KEY", deepseek.get("api_key", "")))).strip(),
             deepseek_model=str(os.environ.get("KUAIMAI_DEEPSEEK_MODEL", deepseek.get("model", "deepseek-flash"))).strip(),

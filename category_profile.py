@@ -212,10 +212,6 @@ def choose_category_candidate(
         for hint in path_hints
         for variant in category_input_variants(hint)
     )
-    terms = tuple(
-        re.sub(r"[\s*:：]+", "", value).casefold()
-        for value in category_search_terms(hint_values)
-    )
     gender_roots = tuple(root.casefold() for root in category_gender_roots(hint_values))
 
     def flattened(levels: Tuple[Tuple[str, ...], ...]) -> Tuple[str, ...]:
@@ -244,6 +240,14 @@ def choose_category_candidate(
         text: category_path_levels(text)
         for text in paths
     }
+
+    # If the live candidate set contains descendants, the shorter path is a
+    # known branch even when an Excel alternative literally ends there.
+    paths = tuple(text for text in paths if not any(
+        len(candidate_levels[other]) > len(candidate_levels[text])
+        and candidate_levels[other][:len(candidate_levels[text])] == candidate_levels[text]
+        for other in paths
+    ))
 
     for expected in expected_paths:
         complete = [
@@ -285,47 +289,9 @@ def choose_category_candidate(
                 return winners[0], "excel_hint_exact"
             return "", "ambiguous_hint"
 
-    scored = []
-    # A gender root is a branch constraint, not a category leaf.  When the
-    # Excel value also contains a concrete leaf (for example ``牛仔裤``), do
-    # not let the shared ``男装`` segment score an unrelated candidate such
-    # as ``男装 > 休闲裤``.
-    scoring_terms = tuple(term for term in terms if term not in gender_roots) or terms
-    for text in paths:
-        levels = candidate_levels[text]
-        parts = flattened(levels)
-        if not has_gender_root(levels):
-            continue
-        score = 0
-        for index, wanted in enumerate(scoring_terms):
-            if wanted in parts:
-                score += 1000 - index * 10 + len(wanted)
-        # Gender narrows a category match; it cannot create one by itself.
-        # Otherwise any male category would match an unrelated Excel leaf
-        # such as “牛仔裤” vs “休闲裤”.
-        if score and gender_roots and any(root in parts for root in gender_roots):
-            score += 5000
-        if score:
-            # When the Excel hint only identifies a lower branch (for example
-            # 男装/夹克), a prediction may prepend unrelated levels such as
-            # 新制造. Prefer the shortest matching path; it is the candidate
-            # that introduces the fewest category levels absent from Excel.
-            scored.append((score, len(parts), text))
-    if not scored:
-        return "", ""
-    best_score = max(score for score, _path_length, _text in scored)
-    score_winners = tuple(
-        (path_length, text)
-        for score, path_length, text in scored
-        if score == best_score
-    )
-    shortest_path = min(path_length for path_length, _text in score_winners)
-    winners = tuple(
-        text for path_length, text in score_winners if path_length == shortest_path
-    )
-    if len(winners) != 1:
-        return "", "ambiguous_hint"
-    return winners[0], "excel_hint_exact"
+    # An ancestor overlap is useful evidence for the model, never an exact
+    # leaf match. Returning no choice routes adapters to semantic/review flow.
+    return "", ""
 
 
 def choose_category_object(

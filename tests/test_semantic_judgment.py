@@ -116,7 +116,7 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.value_id,result.label,result.source),('young,middle','青年,中年','human_override'))
         self.client.semantic_judge.assert_not_called()
 
-    async def test_failed_confirmed_write_uses_original_intent_for_model_recovery(self):
+    async def test_failed_confirmed_write_retries_human_choice_without_model(self):
         from learning_models import CandidateSnapshot
         snapshot = CandidateSnapshot(self.request.platform_id, self.request.category_leaf_id,
             self.request.field_id, self.request.field_label, self.request.candidates,
@@ -132,12 +132,9 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
             platform_id='wxsph', field_label='版型', error='选择后页面仍为空')
         await self.runtime.drain()
 
-        self.assertEqual((recovered.label, recovered.source), ('直筒', 'deepseek'))
-        trace = self.runtime.model_decisions[0]
-        self.assertEqual(trace['excel_value'], '平直廓形')
-        self.assertEqual(trace['input_evidence']['failed_selection'], '直筒')
-        self.assertEqual(trace['input_evidence']['validation_error'], '选择后页面仍为空')
-        self.assertEqual(trace['selected_labels'], ['直筒'])
+        self.assertEqual((recovered.label, recovered.source), ('直筒', 'human_override'))
+        self.client.semantic_judge.assert_not_called()
+        self.assertEqual(self.runtime._write_recovery_requests[('wxsph', '版型')].excel_value, '平直廓形')
 
     async def test_write_recovery_does_not_silently_replace_human_choice(self):
         from attribute_runtime import ResolvedAttribute
@@ -148,28 +145,22 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         result = await self.runtime.recover_failed_write(
             platform_id='wxsph', field_label='版型', error='候选点击失败')
         await self.runtime.drain()
-        self.assertIsNone(result)
-        self.assertEqual(len(self.runtime.deferred_reviews), 1)
-        self.assertEqual(self.runtime.model_decisions[0]['status'], 'review_required')
+        self.assertEqual((result.label, result.source), ('宽松', 'human_override'))
+        self.client.semantic_judge.assert_not_called()
+        self.assertFalse(self.runtime.deferred_reviews)
 
-    async def test_uncertain_write_recovery_queues_review_with_failure_evidence(self):
+    async def test_exact_write_recovery_retries_without_model_or_review(self):
         await self.runtime.resolve(dataclasses.replace(self.request, excel_value='直筒'))
         self.runtime.begin_review_collection('wxsph')
         self.suggestion(.7)
-
         result = await self.runtime.recover_failed_write(
             platform_id='wxsph', field_label='版型', error='回读为空')
         await self.runtime.drain()
+        self.assertEqual((result.label, result.source), ('直筒', 'explicit_text'))
+        self.client.semantic_judge.assert_not_called()
+        self.assertFalse(self.runtime.deferred_reviews)
 
-        self.assertIsNone(result)
-        self.assertEqual(len(self.runtime.deferred_reviews), 1)
-        review = self.runtime.deferred_reviews[0]
-        self.assertEqual(review.reason_code, 'platform_write_failed')
-        self.assertEqual(review.request.evidence['validation_error'], '回读为空')
-        self.assertEqual(tuple(v.label for v in review.request.candidates), ('直筒', '宽松'))
-        self.assertEqual(self.runtime.model_events[-1]['status'], 'review_required')
-
-    async def test_failed_model_retry_queues_review_without_another_model_request(self):
+    async def test_failed_exact_retry_queues_operation_review_without_model(self):
         await self.runtime.resolve(dataclasses.replace(self.request, excel_value='直筒'))
         self.runtime.begin_review_collection('wxsph')
         self.suggestion()
@@ -190,8 +181,8 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(row[0])
         self.assertEqual(payload['suggested_value_id'], 'straight')
         self.assertEqual(payload['evidence_json']['validation_error'], '重试回读仍为空')
-        self.assertEqual(self.runtime.model_decisions[0]['status'], 'review_required')
-        self.assertEqual(self.runtime.model_decisions[0]['readback_status'], 'write_failed')
+        self.assertFalse(self.runtime.model_decisions)
+        self.client.semantic_judge.assert_not_called()
 
     async def test_category_requires_excel_or_confirmed_library_evidence(self):
         self.request = dataclasses.replace(self.request, field_id='__category__', field_label='商品类目',

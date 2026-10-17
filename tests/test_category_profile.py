@@ -13,6 +13,33 @@ from category_profile import (
 
 
 class CategoryProfileTests(unittest.TestCase):
+    def test_known_parent_does_not_win_over_available_leaf(self):
+        self.assertEqual(choose_category_candidate(
+            ("流行男鞋 > 靴子", "流行男鞋 > 靴子 > 时装靴"),
+            ("鞋靴 > 男鞋 > 靴子", "流行男鞋 > 靴子 > 时装靴"),
+        )[0], "流行男鞋 > 靴子 > 时装靴")
+
+    def test_ancestor_overlap_is_not_an_exact_leaf_match(self):
+        self.assertEqual(choose_category_candidate(
+            ("流行男鞋 > 靴子 > 雪地靴",),
+            ("流行男鞋 > 靴子 > 时装靴",),
+        ), ("", ""))
+
+    def test_supplier_can_supply_two_full_boot_paths_and_peer_leaves(self):
+        from kuaimai_erp import parse_category_hints
+
+        expression = "鞋靴 > 男鞋 > 靴子/流行男鞋 > 靴子 > 时装靴/工装靴"
+        hints = parse_category_hints(expression)
+        self.assertEqual(hints, ("鞋靴 > 男鞋 > 靴子", "流行男鞋 > 靴子 > 时装靴/工装靴"))
+        self.assertEqual(choose_category_candidate(
+            ("鞋靴 > 男鞋 > 皮鞋", "鞋靴 > 男鞋 > 靴子"), hints
+        ), ("鞋靴 > 男鞋 > 靴子", "full_ordered_path"))
+        self.assertEqual(choose_category_candidate(
+            ("流行男鞋 > 靴子 > 时装靴",), hints
+        )[0], "流行男鞋 > 靴子 > 时装靴")
+        self.assertEqual(parse_category_hints("服装 > 男装 > 针织衫/毛衣"),
+                         ("服装 > 男装 > 针织衫/毛衣",))
+
     def test_category_syntax_distinguishes_path_levels_from_peer_options(self):
         expression = "服装 > 男装 > 针织衫/毛衣/羊毛衫"
         self.assertEqual(
