@@ -6238,7 +6238,10 @@ async def run_browser_automation(
                         product,
                         timeout_seconds=args.timeout,
                         logger=logger,
-                        platform_label="拼多多价格库存",
+                        platform_label="拼多多价格库存（重新加载服务端数据）",
+                        # 保存后旧抽屉的 SKU 可能重置为 0/1/0；
+                        # 重新加载商品后再校验，避免把旧表格当成保存结果。
+                        force_reload=True,
                     )
                 )
                 persisted_pdd = PddFormListing(
@@ -6393,7 +6396,10 @@ async def run_browser_automation(
                         product,
                         timeout_seconds=args.timeout,
                         logger=logger,
-                        platform_label="京东关键字段",
+                        platform_label="京东关键字段（重新加载服务端数据）",
+                        # 共享抽屉保存后可能仍保留价格库存为 0 的旧模型。
+                        # 从服务端重开商品，继续使用严格的持久化校验。
+                        force_reload=True,
                     )
                 )
                 persisted_jd = JdFormListing(page, persisted_drawer, logger)
