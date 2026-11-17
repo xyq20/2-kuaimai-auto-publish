@@ -67,6 +67,207 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await listing.apply_recommended_category(), "男装 > 牛仔裤")
         self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤'])
 
+    async def _collapsed_search_selection(self):
+        listing = await self._category_search_listing('休闲裤')
+        await self.page.evaluate('''() => {
+          window.rootClicks = 0; window.confirmClicks = 0;
+          window.categoryPath = ['服饰内衣', '男装', '裤装', '休闲裤'];
+          window.selectedCategoryModel = {
+            categoryNames: window.categoryPath,
+            categoryIds: [10000111, 10000115, 10000477, 545733],
+            pathLabels: window.categoryPath,
+            hasChange: true,
+            initOptionsLoading: false, isSelectLoading: false, isSearch: false,
+            lastLevelCateGory: {cid:545733, parentCid:10000477,
+              name:'休闲裤', leaf:1, state:1,
+              pathName:'休闲裤 -> 裤装 -> 男装 -> 服饰内衣'}
+          };
+          const menus = document.querySelector('#menus');
+          menus.className = 'el-cascader-panel';
+          menus.__vue__ = {$parent: {$data: window.selectedCategoryModel}};
+          window.renderMenus = () => {
+            menus.innerHTML = '<div class="el-cascader-menu">' +
+              '<div class="el-cascader-node" aria-haspopup="true" onclick="window.rootClicks++">' +
+              '<span class="el-cascader-node__label">个人护理</span></div></div>';
+          };
+          window.showCategory = value => {
+            window.searches.push(value);
+            const row = document.createElement('li');
+            row.textContent = window.categoryPath.join(' > ');
+            row.onclick = () => {
+              window.chosen = row.textContent;
+              document.querySelector('#chosen').textContent = '已选：' + row.textContent;
+              renderMenus();
+            };
+            document.querySelector('#results').replaceChildren(row);
+          };
+          document.querySelector('[role=dialog] button').addEventListener('click',
+            () => window.confirmClicks++);
+        }''')
+        return listing
+
+    async def test_search_confirms_proven_leaf_when_only_root_menu_is_visible(self):
+        listing = await self._collapsed_search_selection()
+        expected = '服饰内衣 > 男装 > 裤装 > 休闲裤'
+        self.assertEqual(await listing.apply_recommended_category(), expected)
+        self.assertEqual(await self.page.locator('.current').inner_text(), expected)
+        self.assertEqual(await self.page.evaluate('window.rootClicks'), 0)
+        self.assertEqual(await self.page.evaluate('window.confirmClicks'), 1)
+
+    async def test_search_confirms_active_leaf_when_legacy_names_are_reset(self):
+        expected = '服饰内衣 > 男装 > 裤装 > 休闲裤'
+        for legacy in ('empty', 'previous_category'):
+            with self.subTest(legacy=legacy):
+                listing = await self._collapsed_search_selection()
+                await self.page.evaluate('''legacy => {
+                  const model = window.selectedCategoryModel;
+                  model.categoryNames = legacy === 'empty' ? [] :
+                    ['服饰内衣','男装','裤装','工装裤'];
+                }''', legacy)
+                self.assertEqual(await listing.apply_recommended_category(), expected)
+                self.assertEqual(await self.page.locator('.current').inner_text(), expected)
+                self.assertEqual(await self.page.evaluate('window.rootClicks'), 0)
+                self.assertEqual(await self.page.evaluate('window.confirmClicks'), 1)
+
+    async def test_category_search_waits_for_initial_load_before_selecting_new_path(self):
+        listing = await self._collapsed_search_selection()
+        await self.page.evaluate('''() => {
+          const model = window.selectedCategoryModel;
+          model.initOptionsLoading = true;
+          window.searchedDuringInit = false;
+          const show = window.showCategory;
+          window.showCategory = value => {
+            if (model.initOptionsLoading) window.searchedDuringInit = true;
+            show(value);
+          };
+          const modify = document.querySelector('#panel button');
+          modify.addEventListener('click', () => setTimeout(() => {
+            // The old request clears the new selection if search overlaps it.
+            if (window.searchedDuringInit) {
+              model.categoryIds = []; model.categoryNames = [];
+            }
+            model.initOptionsLoading = false;
+          }, 600));
+          document.querySelector('[role=dialog] button').onclick = function() {
+            document.querySelector('.current').textContent = model.categoryIds.length
+              ? window.chosen : '';
+            this.parentElement.style.display = 'none';
+          };
+        }''')
+        expected = '服饰内衣 > 男装 > 裤装 > 休闲裤'
+        self.assertEqual(await listing.apply_recommended_category(), expected)
+        self.assertFalse(await self.page.evaluate('window.searchedDuringInit'))
+        self.assertEqual(await self.page.locator('.current').inner_text(), expected)
+        self.assertEqual(await self.page.evaluate('window.confirmClicks'), 1)
+
+    async def test_category_confirmation_waits_for_search_load_and_submission_ids(self):
+        listing = await self._collapsed_search_selection()
+        await self.page.evaluate('''() => {
+          const model = window.selectedCategoryModel;
+          const show = window.showCategory;
+          window.confirmedDuringLoad = false;
+          window.showCategory = value => {
+            show(value);
+            const row = document.querySelector('#results li');
+            const select = row.onclick;
+            row.onclick = () => {
+              select(); model.initOptionsLoading = true; model.isSelectLoading = true;
+              model.isSearch = true;
+              // Early path and leaf evidence exists before IDs are loaded.
+              model.categoryIds = [];
+              setTimeout(() => {
+                model.categoryIds = [10000111,10000115,10000477,545733];
+                model.initOptionsLoading = false; model.isSelectLoading = false;
+                model.isSearch = false;
+              }, 700);
+            };
+          };
+          document.querySelector('[role=dialog] button').onclick = function() {
+            window.confirmedDuringLoad = model.initOptionsLoading || model.isSelectLoading;
+            document.querySelector('.current').textContent = model.categoryIds.length
+              ? window.chosen : '';
+            this.parentElement.style.display = 'none';
+          };
+        }''')
+        expected = '服饰内衣 > 男装 > 裤装 > 休闲裤'
+        self.assertEqual(await listing.apply_recommended_category(), expected)
+        self.assertFalse(await self.page.evaluate('window.confirmedDuringLoad'))
+        self.assertEqual(await self.page.locator('.current').inner_text(), expected)
+        self.assertEqual(await self.page.evaluate('window.confirmClicks'), 1)
+
+    async def test_category_leaf_guard_continues_loaded_parent_with_model_state(self):
+        listing = await self._collapsed_search_selection()
+        await self.page.evaluate('''() => {
+          document.querySelector('[role=dialog]').style.display = 'block';
+          const model = window.selectedCategoryModel;
+          const path = window.categoryPath.slice(0, -1);
+          model.pathLabels = path; model.categoryIds = [10000111,10000115,10000477];
+          model.lastLevelCateGory = {cid:10000477,parentCid:10000115,name:'裤装',
+            leaf:0,state:1,pathName:'裤装 -> 男装 -> 服饰内衣'};
+          model.hasChange = false;
+          document.querySelector('#chosen').textContent = '已选：' + path.join(' > ');
+          document.querySelector('#menus').innerHTML = window.categoryPath.map((name,i)=>
+            '<div class="el-cascader-menu"><div class="el-cascader-node" '+
+            (i<3?'aria-haspopup="true"':'id="child"')+'><span class="el-cascader-node__label">'+name+
+            '</span></div></div>').join('');
+          document.querySelector('#child').onclick = () => {
+            model.pathLabels = window.categoryPath;
+            model.categoryIds = [10000111,10000115,10000477,545733];
+            model.lastLevelCateGory = {cid:545733,parentCid:10000477,name:'休闲裤',
+              leaf:1,state:1,pathName:'休闲裤 -> 裤装 -> 男装 -> 服饰内衣'};
+            model.hasChange = true;
+            document.querySelector('#chosen').textContent = '已选：' + window.categoryPath.join(' > ');
+          };
+        }''')
+        dialog = self.page.get_by_role('dialog', name='修改类目')
+        self.assertEqual(
+            await listing._complete_category_leaf(dialog, '服饰内衣 > 男装 > 裤装'),
+            '服饰内衣 > 男装 > 裤装 > 休闲裤',
+        )
+        self.assertEqual(await self.page.evaluate('window.confirmClicks'), 0)
+
+    async def test_collapsed_leaf_validation_rejects_unproven_or_stale_node(self):
+        cases = (
+            "window.selectedCategoryModel.lastLevelCateGory.leaf = 0",
+            "delete window.selectedCategoryModel.lastLevelCateGory.leaf",
+            "window.selectedCategoryModel.lastLevelCateGory.cid = 0",
+            "window.selectedCategoryModel.lastLevelCateGory.parentCid = 0",
+            "window.selectedCategoryModel.lastLevelCateGory.cid = 545735",
+            "window.selectedCategoryModel.lastLevelCateGory.parentCid = 10000672",
+            "window.selectedCategoryModel.categoryIds = []",
+            "window.selectedCategoryModel.categoryIds.pop()",
+            "window.selectedCategoryModel.categoryIds[1] = 10000111",
+            "window.selectedCategoryModel.categoryIds[3] = 545735",
+            "window.selectedCategoryModel.initOptionsLoading = true",
+            "window.selectedCategoryModel.isSelectLoading = true",
+            "window.selectedCategoryModel.isSearch = true",
+            "window.selectedCategoryModel.lastLevelCateGory.name = '工装裤'",
+            "window.selectedCategoryModel.lastLevelCateGory.state = 0",
+            "window.selectedCategoryModel.pathLabels = ['服饰内衣','女装','裤子','休闲裤']",
+            "window.selectedCategoryModel.pathLabels.pop()",
+            "window.selectedCategoryModel.lastLevelCateGory.pathName = '休闲裤 -> 裤子 -> 女装 -> 服饰内衣'",
+            "window.selectedCategoryModel.lastLevelCateGory.pathName = '工装裤 -> 裤装 -> 男装 -> 服饰内衣'",
+            "delete window.selectedCategoryModel.lastLevelCateGory.pathName",
+            "window.selectedCategoryModel.hasChange = false",
+            "delete document.querySelector('#menus').__vue__",
+            "document.querySelector('#chosen').textContent = '已选：服饰内衣 > 男装 > 裤装 > 工装裤'",
+        )
+        expected = '服饰内衣 > 男装 > 裤装 > 休闲裤'
+        for mutation in cases:
+            with self.subTest(mutation=mutation):
+                listing = await self._collapsed_search_selection()
+                dialog = self.page.get_by_role('dialog', name='修改类目')
+                await self.page.evaluate('''() => {
+                  document.querySelector('[role=dialog]').style.display='block';
+                  document.querySelector('#chosen').textContent='已选：'+window.categoryPath.join(' > ');
+                  renderMenus();
+                }''')
+                await self.page.evaluate(mutation)
+                with self.assertRaisesRegex(TaobaoListingError, '类目末级校验失败'):
+                    await listing._validate_category_leaf(dialog, expected, timeout=0)
+                self.assertEqual(await self.page.evaluate('window.rootClicks'), 0)
+                self.assertEqual(await self.page.evaluate('window.confirmClicks'), 0)
+
     async def test_category_keeps_explicit_composite_member_without_search_or_review(self):
         runtime = type('Runtime', (), {'resolve': AsyncMock()})()
         listing = await self._category_search_listing(BELT_HINTS[0], runtime)

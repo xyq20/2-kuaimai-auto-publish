@@ -1220,6 +1220,68 @@ class WxsphFormListing(YouzanFormListing):
             await asyncio.sleep(0.1)
         raise WxsphFormListingError(f"微信小店类目回读不一致：期望 {expected!r}，实际 {actual!r}")
 
+    async def _category_model_state(self, dialog: Any) -> Optional[Mapping[str, Any]]:
+        return await dialog.evaluate("""root => {
+          const panels = Array.from(root.querySelectorAll('.el-cascader-panel'))
+            .filter(panel => panel.getClientRects().length);
+          if (panels.length !== 1) return null;
+          for (let vm = panels[0].__vue__, depth = 0; vm && depth < 8;
+               vm = vm.$parent, depth++) {
+            const data = vm.$data;
+            if (!data || !Array.isArray(data.pathLabels)
+                || !Object.prototype.hasOwnProperty.call(data, 'lastLevelCateGory')) continue;
+            const last = data.lastLevelCateGory || {};
+            return {names: data.pathLabels, changed: data.hasChange === true,
+              ids: Array.isArray(data.categoryIds) ? data.categoryIds : [],
+              loading: !!(data.initOptionsLoading || data.isSelectLoading || data.isSearch),
+              last: {cid:last.cid, parentCid:last.parentCid, name:last.name,
+                     leaf:last.leaf, state:last.state, pathName:last.pathName}};
+          }
+          return null;
+        }""")
+
+    async def _wait_for_category_dialog_ready(self, dialog: Any) -> None:
+        # method_open and handleSelect both start initOptions(). Starting a
+        # search before the former completes lets its stale response clear the
+        # new categoryIds; confirming during the latter can submit partial IDs.
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            selected = await self._category_model_state(dialog)
+            if (not (selected and selected.get("loading"))
+                    and await dialog.locator(".el-loading-mask:visible").count() == 0):
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise WxsphFormListingError("微信小店类目弹窗初始化/选择加载未完成，未搜索或确认类目")
+            await asyncio.sleep(0.1)
+
+    async def _category_selection_state(self, dialog: Any, expected: str) -> Mapping[str, Any]:
+        state = await super()._category_selection_state(dialog, expected)
+        selected = await self._category_model_state(dialog)
+        if not isinstance(selected, Mapping):
+            return state
+        invalid = {**state, "matched_path": False, "terminal": False}
+        names = selected.get("names", ())
+        last = selected.get("last", {})
+        ids = tuple(str(value).strip() for value in selected.get("ids", ()))
+        expected_parts = category_path_parts(expected)
+        node_path = " > ".join(reversed(str(last.get("pathName", "")).split("->")))
+        leaf = last.get("leaf") in (1, "1")
+        if (selected.get("loading") or (leaf and selected.get("changed") is not True)
+                or len(names) < 2 or len(names) != len(expected_parts) or len(ids) != len(names)
+                or len(set(ids)) != len(ids)
+                or not all(value.isdecimal() and int(value) > 0 for value in ids)
+                or category_path_parts(state["actual"]) != expected_parts
+                or category_path_parts(" > ".join(str(name) for name in names)) != expected_parts
+                or category_path_parts(node_path) != expected_parts
+                or str(last.get("cid", "")) != ids[-1]
+                or str(last.get("parentCid", "")) != ids[-2]
+                or normalize_label(str(last.get("name", ""))) != normalize_label(str(names[-1]))
+                or last.get("leaf") not in (0, "0", 1, "1")
+                or last.get("state") not in (1, "1")):
+            return invalid
+        return {**state, "matched_path": True, "terminal": leaf,
+                "selection_source": "wechat_selected_category_node"}
+
     async def _category_dialog(self) -> Any:
         """Locate the visible WeChat category dialog without relying on ARIA.
 
@@ -1302,6 +1364,7 @@ class WxsphFormListing(YouzanFormListing):
         modify = self.panel.get_by_role("button", name="修改类目", exact=True)
         await modify.click()
         dialog = await self._category_dialog()
+        await self._wait_for_category_dialog_ready(dialog)
         search = dialog.get_by_placeholder("请输入类目关键词，支持模糊查询", exact=True)
         selected = None
         observed_terms: Dict[str, str] = {}
@@ -1389,6 +1452,7 @@ class WxsphFormListing(YouzanFormListing):
             raise WxsphFormListingError("微信小店类目与 Excel 不匹配，未找到唯一可用候选，停止填写")
         expected, row = selected
         await row.click()
+        await self._wait_for_category_dialog_ready(dialog)
         expected = await self._complete_category_leaf(dialog, expected)
         deadline = asyncio.get_running_loop().time() + 10
         while asyncio.get_running_loop().time() < deadline:
