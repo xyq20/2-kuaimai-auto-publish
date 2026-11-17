@@ -18,7 +18,7 @@ class FieldPolicyTests(unittest.TestCase):
     def test_freight_scope_is_explicit_not_all_publish_shops(self):
         self.assertEqual(FREIGHT_TEMPLATE_SHOPS['wxsph'], ('NEIGBORL钊叔制鞋服',))
         self.assertEqual(FREIGHT_TEMPLATE_SHOPS['xhs'],
-                         ('钊叔的店', '啊亮製NEIGBORL的店', '钊叔制NEIGBORL的店'))
+                         ('Z钊叔制的店', '啊亮製NEIGBORL的店', '钊叔制NEIGBORL的店'))
 
     def test_freight_or_preserves_template_punctuation(self):
         self.assertEqual(freight_alternatives({"运费设置/运费模板": "新疆，西藏不包邮-鞋子，皮衣，外套/外套模板"}),

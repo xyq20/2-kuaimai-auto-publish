@@ -21,7 +21,10 @@ from urllib.parse import parse_qs, urlsplit
 
 from attribute_runtime import AttributeRequest
 from canonical_fields import is_learning_managed_field
-from category_profile import category_input_hints, category_search_terms, preferred_category_leaf
+from category_profile import (
+    category_input_hints, category_search_terms, preferred_category_leaf,
+    choose_category_candidate, is_belt_category,
+)
 from category_search import CategorySearchCapture, category_response_paths
 from douyin_data import MaterialComponent
 from jd_data import JdFields
@@ -29,6 +32,7 @@ from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from platform_candidate_source import (
     select_supports_multiple,
+    select_supports_custom_value,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -294,6 +298,9 @@ def _required_excel_value(
         for key, value in fields.items()
         if wanted.intersection(excel_aliases(key)) and str(value).strip()
     ]
+    if money and any("商品分类" in excel_aliases(key) and is_belt_category(value)
+                     for key, value in fields.items()):
+        matches = [(key, value) for key, value in matches if value != "元"]
     if not matches:
         raise JdFormListingError(
             "Excel 中缺少京东{0}字段（可识别：{1}）".format(
@@ -394,17 +401,26 @@ def _jd_category_hints(fields: Mapping[str, str]) -> Tuple[str, ...]:
     return hints
 
 
-def jd_category_target(fields: Mapping[str, str]) -> Tuple[Tuple[str, ...], str]:
+def jd_category_target(
+    fields: Mapping[str, str], *, category_hints: Sequence[str] = ()
+) -> Tuple[Tuple[str, ...], str]:
     """Choose the first authored leaf; the page still proves uniqueness."""
 
-    hints = _jd_category_hints(fields)
-    target = preferred_category_leaf((fields["商品分类"],))
+    if is_belt_category(fields.get("商品分类", "")):
+        hints = tuple(category_hints) or (fields["商品分类"],)
+        target = preferred_category_leaf(hints)
+    else:
+        hints = _jd_category_hints(fields)
+        target = preferred_category_leaf((fields["商品分类"],))
     if not target:
         raise JdFormListingError("Excel 京东商品分类无法生成搜索词")
     return hints, target
 
 
 def _jd_category_matches(current: str, hints: Sequence[str], target: str) -> bool:
+    if any(is_belt_category(hint) for hint in hints):
+        selected, _strategy = choose_category_candidate((current,), hints)
+        return bool(selected)
     parts = _category_parts(current)
     hint_text = " ".join(str(hint) for hint in hints)
     for markers in (("男装", "男士", "男鞋"), ("女装", "女士", "女鞋")):
@@ -1081,6 +1097,7 @@ class JdFormListing(YouzanFormListing):
                 not bool(option.get("disabled")),
             )
             for option in options
+            if not (field.option_values and option.get("created"))
         )
         try:
             candidates = reconcile_candidates(field.option_values, dom_values)
@@ -1130,12 +1147,20 @@ class JdFormListing(YouzanFormListing):
         request_candidates = tuple(
             CandidateValue(value.value_id, value.label) for value in candidates
         )
+        # 可搜索的下拉输入框只能筛选候选，不代表可以保存自定义值。
+        # 京东接口提供 valueId 字典时，审核也必须遵守写入器的候选限制；
+        # canNote（规格备注）不能把数字候选字段变成自由文本字段。
+        custom_allowed = await select_supports_custom_value(
+            select, schema_allowed=field.custom_allowed,
+            requires_candidate_id=bool(field.option_values),
+        )
         reuse = getattr(runtime, "reusable_choice", None)
         reusable = reuse(AttributeRequest(
             platform_id="jd", category_leaf_id=category_id,
             field_id=str(field.source_id), field_label=page_label,
             candidates=request_candidates, excel_value=str(desired).strip(),
-            evidence={}, custom_allowed=True, schema_version=schema_version,
+            evidence={"selection_only": not custom_allowed},
+            custom_allowed=custom_allowed, schema_version=schema_version,
             control_type="multi_select" if multi else "select",
         )) if callable(reuse) else None
         if (
@@ -1143,6 +1168,7 @@ class JdFormListing(YouzanFormListing):
             and str(desired).strip()
             and reusable is None
             and not field.option_values
+            and custom_allowed
         ):
             # Exhaust the Excel input route before requesting human review.
             # 京东类目属性提交铺货时必须是平台数字 valueId；接口已给出候选
@@ -1167,9 +1193,11 @@ class JdFormListing(YouzanFormListing):
                 field_label=page_label,
                 candidates=request_candidates,
                 excel_value=exact if exact is not None else str(desired).strip(),
-                evidence={"excel": bool(str(desired).strip())},
-                # Operator input is permitted; the writer still verifies it.
-                custom_allowed=True,
+                evidence={
+                    "excel": bool(str(desired).strip()),
+                    "selection_only": not custom_allowed,
+                },
+                custom_allowed=custom_allowed,
                 schema_version=schema_version,
                 control_type="multi_select" if multi else "select",
             )
@@ -1820,8 +1848,9 @@ class JdFormListing(YouzanFormListing):
         return inside or await from_root(self.page)
 
     async def apply_category(self, fields: Mapping[str, str]) -> Mapping[str, Any]:
-        category_hints, target = jd_category_target(fields)
+        category_hints, target = jd_category_target(fields, category_hints=self.category_hints)
         self.category_hints = tuple(category_hints)
+        belt = any(is_belt_category(hint) for hint in category_hints)
         try:
             current = await self._category_text()
         except JdFormListingError:
@@ -1862,7 +1891,7 @@ class JdFormListing(YouzanFormListing):
         api_candidates: List[Mapping[str, Any]] = []
         candidates: List[Any] = []
         async with CategorySearchCapture(self.page, category_response_paths) as capture:
-            for target in category_search_terms((fields["商品分类"],)):
+            for target in category_search_terms(category_hints if belt else (fields["商品分类"],)):
                 capture.start(target)
                 api_matches.clear()
                 api_candidates.clear()
@@ -1870,7 +1899,8 @@ class JdFormListing(YouzanFormListing):
                 await search.fill(target)
                 if self.logger is not None:
                     self.logger.info("京东类目按 Excel 顺序搜索：%s", target)
-                deadline = asyncio.get_running_loop().time() + 30
+                search_seconds = 3 if belt else 30
+                deadline = asyncio.get_running_loop().time() + search_seconds
                 stable_since: Optional[float] = None
                 while asyncio.get_running_loop().time() < deadline:
                     if capture.error:
@@ -1906,7 +1936,7 @@ class JdFormListing(YouzanFormListing):
                 if api_matches and len(candidates) == 1:
                     break
                 if not capture.received:
-                    raise JdFormListingError("京东类目搜索接口在 30 秒内未响应：" + target)
+                    raise JdFormListingError("京东类目搜索接口在 {0} 秒内未响应：{1}".format(search_seconds, target))
                 if capture.paths and any(
                     normalize_label(target) == normalize_label(path.split(" > ")[-1])
                     for path in capture.paths
@@ -2432,6 +2462,8 @@ class JdFormListing(YouzanFormListing):
     ) -> Dict[str, Tuple[str, str]]:
         sources: Dict[str, List[Tuple[str, str]]] = {}
         page_items = without_color_attributes(page_items)
+        belt = any("商品分类" in excel_aliases(key) and is_belt_category(value)
+                   for key, value in fields.items())
         for excel_key, raw_value in fields.items():
             excel_names = set(excel_aliases(excel_key))
             for page_key, (page_label, _item) in page_items.items():
@@ -2443,6 +2475,8 @@ class JdFormListing(YouzanFormListing):
                     continue
                 accepted = {base}
                 accepted.update(JD_FIELD_ALIASES.get(base, ()))
+                if belt and base == normalize_label("带扣"):
+                    accepted.update(normalize_label(label) for label in ("带扣款式", "腰带带扣款式"))
                 if excel_names.intersection(accepted):
                     sources.setdefault(page_key, []).append((str(excel_key), str(raw_value).strip()))
         assignments: Dict[str, Tuple[str, str]] = {}
@@ -2914,7 +2948,7 @@ class JdFormListing(YouzanFormListing):
                 raise JdFormListingError(
                     "京东材质百分比输入框数量不是 {0}".format(len(expected_rows))
                 )
-            percent_text = str(int(percentage))
+            percent_text = str(percentage)
             percent_input = inputs[index]
             if not _numeric_equal(
                 (await percent_input.input_value()).strip(), percent_text
@@ -3882,8 +3916,13 @@ class JdFormListing(YouzanFormListing):
                 if await labels.nth(index).is_visible()
             ]
 
+        async def visible_sku_items() -> List[Any]:
+            items = dialog.locator('.el-form-item:visible')
+            return [items.nth(index) for index in range(await items.count())
+                    if await items.nth(index).locator(':scope > .el-form-item__label').count() == 1]
+
         labels = await visible_thickness_labels()
-        if not labels:
+        if not labels and not await visible_sku_items():
             refreshes = await self._innermost_visible_text(dialog, "刷新数据")
             if len(refreshes) != 1:
                 raise JdFormListingError(
@@ -3917,7 +3956,7 @@ class JdFormListing(YouzanFormListing):
                 while asyncio.get_running_loop().time() < refresh_deadline:
                     await self._raise_as_jd(super()._wait_for_loading_masks())
                     labels = await visible_thickness_labels()
-                    if labels:
+                    if labels or await visible_sku_items():
                         break
                     await asyncio.sleep(0.15)
             finally:
@@ -3931,22 +3970,51 @@ class JdFormListing(YouzanFormListing):
                     thickness_paths,
                     len(labels),
                 )
-        if len(labels) != 1:
+        if len(labels) > 1:
             raise JdFormListingError(
                 "京东 SKU 属性刷新后厚度字段不是唯一项：{0}".format(len(labels))
             )
-        item = labels[0].locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' el-form-item ')][1]")
-        actual = await self._raise_as_jd(
-            self._fill_attribute("厚度", item, JD_SKU_THICKNESS, required=True)
-        )
-        if actual is None:
-            raise JdFormListingError("京东 SKU 厚度没有常规精确候选")
+        items = await visible_sku_items()
+        if not items:
+            raise JdFormListingError("京东 SKU 属性刷新后未出现可填写字段")
+        report: Dict[str, str] = {}
+        seen = set()
+        for item in items:
+            label = item.locator(':scope > .el-form-item__label')
+            name = (await label.inner_text()).strip().strip('*：: ')
+            normalized = normalize_label(name)
+            if not normalized:
+                continue
+            if normalized in seen:
+                raise JdFormListingError(f"京东 SKU 属性“{name}”不唯一")
+            seen.add(normalized)
+            required = await self._is_required(item)
+            if normalized == normalize_label("厚度"):
+                desired = JD_SKU_THICKNESS
+            elif required:
+                aliases = (name, *JD_FIELD_ALIASES.get(normalized, ()))
+                desired = _required_excel_value(fields or {}, aliases, f"SKU 属性“{name}”")
+            else:
+                continue
+            actual = await self._raise_as_jd(
+                self._fill_attribute(name, item, desired, required=True)
+            )
+            if actual is None:
+                runtime = self.attribute_runtime
+                if getattr(runtime, "has_deferred_reviews", False):
+                    runtime.raise_deferred_reviews()
+                raise JdFormListingError(
+                    f"京东 SKU 必填属性“{name}”未能填写：{desired}"
+                )
+            report[name] = "/".join(actual)
         confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
         if await confirm.count() != 1:
             raise JdFormListingError("京东 SKU 属性弹窗确定不是唯一项")
         await confirm.click()
         await dialog.wait_for(state="hidden", timeout=10_000)
-        return {"厚度": actual[0]}
+        if self.logger is not None:
+            self.logger.info("京东 SKU 属性批量填写并回读：%s", report)
+        return report
 
     @staticmethod
     def _json_contains_text(payload: Any, target: str) -> bool:
@@ -4591,7 +4659,7 @@ class JdFormListing(YouzanFormListing):
         self, fields: JdFields, *, style_code: str, expected_attributes=None
     ) -> Mapping[str, Any]:
         category = await self._category_text()
-        _category_hints, category_target = jd_category_target(fields.fields)
+        _category_hints, category_target = jd_category_target(fields.fields, category_hints=self.category_hints)
         if not _jd_category_matches(category, _category_hints, category_target):
             raise JdFormListingError("京东保存后类目回读失败：{0!r}".format(category))
         brand_item = await self._form_item_exact("品牌")

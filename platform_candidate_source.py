@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 from platform_schema import FieldOption
 
@@ -13,6 +13,8 @@ async def select_supports_multiple(select) -> bool:
         const component = element.__vue__;
         if (typeof component?.multiple === 'boolean') return component.multiple;
         if (typeof component?.$props?.multiple === 'boolean') return component.$props.multiple;
+        if (Array.isArray(component?.value)) return true;
+        if (component && component.value !== undefined && component.value !== null) return false;
         return element.hasAttribute('multiple')
           || element.getAttribute('aria-multiselectable') === 'true'
           || element.classList.contains('is-multiple')
@@ -25,6 +27,44 @@ async def select_multiple_limit(select) -> int:
         const c = element.__vue__;
         return Number(c?.multipleLimit ?? c?.$props?.multipleLimit ?? 0) || 0;
     }"""))
+
+
+def custom_value_allowed(
+    *, schema_allowed: Optional[bool] = None, dom_allowed: bool = False,
+    save_verified: bool = False, save_rejected: bool = False,
+    requires_candidate_id: bool = False,
+) -> bool:
+    """Decide whether a new value can be persisted, independently of platform.
+
+    Searchability and an editable input are deliberately not evidence. A real
+    free-form schema, a create-value control or a verified save permits new
+    values. A rejected save or a mandatory platform candidate ID takes priority.
+    """
+    if save_rejected or requires_candidate_id:
+        return False
+    return schema_allowed is True or dom_allowed is True or save_verified is True
+
+
+async def select_supports_custom_value(
+    select, *, schema_allowed: Optional[bool] = None,
+    requires_candidate_id: bool = False, save_verified: bool = False,
+    save_rejected: bool = False,
+) -> bool:
+    if save_rejected or requires_candidate_id:
+        return False
+    if schema_allowed is True or save_verified:
+        return True
+    dom_allowed = await select.evaluate("""element => {
+        const c = element.__vue__;
+        const yes = value => value === true || value === 'true' || value === '1';
+        return yes(element.getAttribute('caninputcustom'))
+          || yes(element.getAttribute('can-input-custom'))
+          || yes(c?.canInputCustom) || yes(c?.$props?.canInputCustom)
+          || yes(c?.allowCreate) || yes(c?.$props?.allowCreate)
+          || (element.hasAttribute('allow-create')
+              && element.getAttribute('allow-create') !== 'false');
+    }""")
+    return custom_value_allowed(schema_allowed=schema_allowed, dom_allowed=dom_allowed)
 
 
 class CandidateSourceError(RuntimeError):
@@ -164,6 +204,8 @@ def validate_observed_selection(
 
 
 __all__ = [
+    "custom_value_allowed",
+    "select_supports_custom_value",
     "CandidateSourceError",
     "DomCandidate",
     "reconcile_candidates",

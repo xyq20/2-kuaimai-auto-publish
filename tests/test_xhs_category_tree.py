@@ -69,6 +69,97 @@ class XhsCategoryTreeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.searches,[])
         self.assertEqual(await self.page.evaluate('window.categoryClicks'), ['男装', '针织衫/毛衣', '毛针织开衫'])
 
+    async def test_checked_leaf_with_parent_breadcrumb_is_reselected_before_confirmation(self):
+        listing = await self.tree_listing()
+        await self.page.evaluate('''() => {
+          const open = window.openCategory;
+          window.openCategory = () => {
+            open();
+            const draw = window.drawMenu;
+            window.drawMenu = (rows, level) => {
+              draw(rows, level);
+              if (level !== 2) return;
+              document.getElementById('chosen').textContent = '已选：男装 > 针织衫/毛衣';
+              const nodes = document.querySelectorAll('.el-cascader-menu')[level].children;
+              for (const node of nodes) {
+                const original = node.onclick;
+                if (node.textContent === '毛针织开衫') node.classList.add('is-active');
+                node.onclick = () => {
+                  if (node.classList.contains('is-active')) return;
+                  for (const other of nodes) other.classList.remove('is-active');
+                  node.classList.add('is-active');
+                  original();
+                };
+              }
+            };
+          };
+        }''')
+        report = await listing.apply_category(('服装', '男装', '毛衣/毛针织开衫'))
+        self.assertEqual(report['selected'], '男装 > 针织衫/毛衣 > 毛针织开衫')
+        self.assertEqual(await self.page.evaluate('window.categoryClicks'),
+                         ['男装', '针织衫/毛衣', '毛针织套头衫', '毛针织开衫'])
+
+    async def test_stale_leaf_without_enabled_sibling_does_not_choose_or_confirm(self):
+        listing = await self.tree_listing()
+        await self.page.evaluate('''() => {
+          window.tree[0].children[0].children = [window.tree[0].children[0].children[1]];
+          const open = window.openCategory;
+          window.openCategory = () => {
+            open(); const draw = window.drawMenu;
+            window.drawMenu = (rows, level) => {
+              draw(rows, level);
+              if (level !== 2) return;
+              document.getElementById('chosen').textContent = '已选：男装 > 针织衫/毛衣';
+              const node = document.querySelectorAll('.el-cascader-menu')[level].children[0];
+              node.classList.add('is-active'); node.onclick = () => {};
+            };
+          };
+        }''')
+        await self.page.locator('button').filter(has_text='修改类目').click()
+        dialog = await listing._category_dialog()
+        await listing._click_category_tree_path(dialog, ('男装', '针织衫/毛衣', '毛针织开衫'))
+        self.assertFalse(await listing._repair_stale_category_selection(
+            dialog, '男装 > 针织衫/毛衣 > 毛针织开衫'))
+        self.assertEqual(listing._selected_category_text(await dialog.inner_text()), '男装 > 针织衫/毛衣')
+
+    async def test_accessory_gender_does_not_limit_tree_to_clothing_and_shoes(self):
+        listing = await self.tree_listing()
+        tree = deepcopy(TREE)
+        tree.append({'cid': 90, 'name': '箱包配饰', 'leaf': 0, 'children': [
+            {'cid': 91, 'name': '腰带配件', 'leaf': 0, 'children': [
+                {'cid': 92, 'name': '男士皮带', 'leaf': 1}]}]})
+        await self.page.route('**/xhs/getCategoryTree.json*',
+                              lambda route: route.fulfill(json={'result': 1, 'data': tree}))
+        await self.page.evaluate('tree => window.tree=tree', tree)
+        hints = ('服装 > 服装配饰 > 腰带/皮带/腰链',
+                 '服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带')
+        listing.category_hints = hints
+        report = await listing.apply_category(('服装', '服装配饰', '腰带/皮带/腰链/服饰内衣',
+                                               '服饰配件', '腰带/腰链/男士皮带'))
+        self.assertEqual(report['selected'], '箱包配饰 > 腰带配件 > 男士皮带')
+        self.assertEqual(report['strategy'], 'composite_member_exact')
+        self.assertEqual(listing.category_hints, hints)
+        self.assertEqual(self.searches, [])
+
+    async def test_composite_accessory_leaf_uses_shared_match_across_platform_roots(self):
+        listing = await self.tree_listing()
+        tree = deepcopy(TREE)
+        tree.extend([
+            {'cid': 90, 'name': '服饰配件/皮带/帽子/围巾', 'leaf': 0, 'children': [
+                {'cid': 91, 'name': '腰带/皮带/腰链', 'leaf': 1}]},
+            {'cid': 92, 'name': '全新奢侈品', 'leaf': 0, 'children': [
+                {'cid': 93, 'name': '贸易服饰配件', 'leaf': 0, 'children': [
+                    {'cid': 94, 'name': '腰带/皮带/腰链', 'leaf': 1}]}]},
+        ])
+        await self.page.route('**/xhs/getCategoryTree.json*',
+                              lambda route: route.fulfill(json={'result': 1, 'data': tree}))
+        await self.page.evaluate('tree => window.tree=tree', tree)
+        listing.category_hints = ('服装 > 服装配饰 > 腰带/皮带/腰链',
+                                  '服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带')
+        report = await listing.apply_category(('服装', '服装配饰', '腰带/腰链/男士皮带'))
+        self.assertEqual(report['selected'], '服饰配件/皮带/帽子/围巾 > 腰带/皮带/腰链')
+        self.assertEqual(self.searches, [])
+
     async def model_listing(self, directory, confidence):
         listing = await self.tree_listing()
         store=LearningStore(Path(directory)/'learning.sqlite3');store.migrate()
@@ -191,6 +282,14 @@ class XhsCategoryTreeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class XhsTreeParsingTests(unittest.IsolatedAsyncioTestCase):
+    def test_non_belt_gender_scope_keeps_original_department_filter(self):
+        from platform_schema import CategoryCandidate
+        from xhs_form_listing import XhsFormListing
+        candidates = tuple(CategoryCandidate(leaf_id=str(index), path=path) for index, path in enumerate((
+            ('男装', '毛衣'), ('女装', '毛衣'), ('箱包配饰', '其他配件'))))
+        self.assertEqual(XhsFormListing._category_tree_scope(candidates, ('服装', '男士毛衣')),
+                         (candidates[0],))
+
     async def test_empty_parent_is_not_a_leaf_and_does_not_refetch_whole_tree(self):
         tree = deepcopy(TREE)
         tree.append({'cid':30, 'name':'空分支', 'leaf':0, 'children':None})

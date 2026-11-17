@@ -65,6 +65,46 @@ function generate(){
 
 
 class BrowserTemplateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_optional_base_size_group_allows_accessory_without_size(self):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content('''
+                  <div id="drawer"><div class="block-specification">
+                    <div><div class="title-bg"><input value="颜色"></div>
+                      <div class="specification-value"><div class="specification-value-flex_input"><input value="黑色"></div></div>
+                    </div>
+                  </div></div>
+                ''')
+                self.assertEqual(
+                    await erp.read_optional_base_specification_values(
+                        page.locator('#drawer'), '尺码'
+                    ),
+                    (),
+                )
+                with self.assertRaisesRegex(erp.AutomationError, '尺码.*匹配到 0 组'):
+                    await erp.read_base_specification_values(
+                        page.locator('#drawer'), '尺码'
+                    )
+                await page.locator('#drawer').evaluate('''root => root.insertAdjacentHTML('beforeend', `
+                  <div class="block-specification-list"><div class="el-table">
+                    <div class="el-table__header-wrapper"><table><thead><tr><th>颜色</th><th>商品编码</th></tr></thead></table></div>
+                    <div class="el-table__body-wrapper"><table><tbody><tr><td>黑色</td><td>ZH0222皮带黑色</td></tr></tbody></table></div>
+                  </div></div>`)
+                ''')
+                rows = await erp.read_base_sku_color_code_rows(
+                    page.locator('#drawer'), require_size=False
+                )
+                self.assertEqual(rows, [
+                    {'颜色': '黑色', '尺码': '', '商品编码': 'ZH0222皮带黑色'}
+                ])
+                self.assertEqual(erp.validate_base_sku_color_codes(
+                    rows, 'ZH0222皮带', ('黑色',)
+                ), 1)
+            finally:
+                await browser.close()
+
     async def test_existing_sku_images_follow_untouched_page_colors(self):
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(channel='chrome', headless=True)

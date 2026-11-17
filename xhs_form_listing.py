@@ -28,7 +28,9 @@ from category_profile import (
     category_input_variants,
     category_path_levels,
     category_search_terms,
+    choose_category_candidate,
     is_footwear_category,
+    is_belt_category,
 )
 from category_search import CategorySearchCapture
 from canonical_fields import is_learning_managed_field
@@ -37,6 +39,7 @@ from money_values import MoneyValueError, normalize_money_value
 from platform_discovery import ApiClient, EndpointSpec, PlatformDiscoveryError
 from platform_candidate_source import (
     select_supports_multiple,
+    select_supports_custom_value,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -125,6 +128,11 @@ def _required_excel_value(
         for key, value in fields.items()
         if wanted.intersection(excel_aliases(key)) and str(value).strip()
     ]
+    if money and any(
+        "商品分类" in excel_aliases(key) and is_belt_category(value)
+        for key, value in fields.items()
+    ):
+        matches = [(key, value) for key, value in matches if value != "元"]
     if not matches:
         raise XhsFormListingError(
             "Excel 中缺少小红书{0}字段（可识别：{1}）".format(
@@ -953,13 +961,18 @@ class XhsFormListing(TaobaoListing):
 
     @staticmethod
     def _category_tree_scope(candidates, path):
-        """Require an actual gender root, rather than a word in a luxury branch."""
+        """Scope to authored departments; leaf gender never picks a department."""
         roots = {normalize_label(root) for root in category_gender_roots(category_input_hints(path))}
         if not roots:
             return tuple(candidates)
         # Explicit Excel roots distinguish men's clothing from men's shoes.
         hints = {normalize_label(hint) for hint in category_input_hints(path)}
         explicit_roots = roots.intersection(hints)
+        if not explicit_roots and is_belt_category(" > ".join(path)):
+            # A gender word inside a leaf describes its audience, not the
+            # platform's top-level department. Accessories must remain eligible
+            # even if a male clothing/shoe root happens to exist in the tree.
+            return tuple(candidates)
         if explicit_roots:
             roots = explicit_roots
         return tuple(
@@ -1015,8 +1028,64 @@ class XhsFormListing(TaobaoListing):
     def _category_node_label(self, value: str) -> str:
         return re.sub(r"\s*[(（]灰度[)）]\s*$", "", super()._category_node_label(value))
 
+    async def _repair_stale_category_selection(self, dialog: Any, expected: str) -> bool:
+        """已勾选叶子但回显停在父级时，在弹窗内重新触发选择事件。"""
+        parts = [part.strip() for part in re.split(r"[>＞]", expected) if part.strip()]
+        if len(parts) < 2:
+            return False
+        state = await self._category_selection_state(dialog, expected)
+        if not (
+            state.get("matched_path") and state.get("terminal")
+            and self._normalize_category_path(state.get("actual"))
+            == self._normalize_category_path(" > ".join(parts[:-1]))
+        ):
+            return False
+        menus = dialog.locator(".el-cascader-menu:visible")
+        if await menus.count() < len(parts):
+            return False
+        menu = menus.nth(len(parts) - 1)
+
+        async def nodes_by_label():
+            nodes = menu.locator(".el-cascader-node:visible")
+            result = []
+            for index in range(await nodes.count()):
+                node = nodes.nth(index)
+                labels = node.locator(".el-cascader-node__label")
+                text = self._category_node_label(await (labels.first if await labels.count() else node).inner_text())
+                classes = (await node.get_attribute("class") or "").split()
+                disabled = await node.get_attribute("aria-disabled") == "true" or "is-disabled" in classes
+                branch = await node.get_attribute("aria-haspopup") == "true" or bool(
+                    await node.locator(".el-cascader-node__postfix").count()
+                )
+                result.append((text, node, classes, disabled, branch))
+            return result
+
+        records = await nodes_by_label()
+        targets = [row for row in records if normalize_label(row[0]) == normalize_label(parts[-1])
+                   and not row[3] and not row[4]]
+        if len(targets) != 1 or "is-active" not in targets[0][2]:
+            return False
+        alternatives = [row for row in records if normalize_label(row[0]) != normalize_label(parts[-1])
+                        and not row[3] and not row[4] and "is-active" not in row[2]
+                        and sum(normalize_label(other[0]) == normalize_label(row[0]) for other in records) == 1]
+        if not alternatives:
+            return False
+        # 两次点击仅发生在未确认的类目弹窗内；最终仍由完整路径和
+        # 末级校验把关，不会确认临时选中的同级类目。
+        await alternatives[0][1].click(timeout=10_000)
+        records = await nodes_by_label()
+        targets = [row for row in records if normalize_label(row[0]) == normalize_label(parts[-1])
+                   and not row[3] and not row[4]]
+        if len(targets) != 1:
+            raise XhsFormListingError("小红书类目回显恢复时目标末级不唯一，未确认类目")
+        await targets[0][1].click(timeout=10_000)
+        if self.logger is not None:
+            self.logger.info("小红书类目叶子已勾选但回显停在父级，已重新触发目标选择：%s", expected)
+        return True
+
     async def _confirm_category_path(self, dialog: Any, expected: str) -> str:
         try:
+            await self._repair_stale_category_selection(dialog, expected)
             selected = await self._validate_category_leaf(dialog, expected, timeout=10)
         except TaobaoListingError as exc:
             raise XhsFormListingError(str(exc)) from exc
@@ -1042,6 +1111,7 @@ class XhsFormListing(TaobaoListing):
             return None
         scoped = self._category_tree_scope(candidates, path)
         candidate_paths = tuple(" > ".join(candidate.path) for candidate in scoped)
+        hints = tuple(self.category_hints) or (" > ".join(path),)
         target_text, strategy = "", ""
         try:
             target_text, strategy = self._choose_category_text(candidate_paths, path)
@@ -1049,6 +1119,8 @@ class XhsFormListing(TaobaoListing):
                 target_text = ""
         except XhsFormListingError:
             pass
+        if not target_text and any(is_belt_category(hint) for hint in hints):
+            target_text, strategy = choose_category_candidate(candidate_paths, hints)
         if target_text:
             runtime = self.attribute_runtime
             if runtime is not None and hasattr(runtime, "model_events"):
@@ -1064,10 +1136,11 @@ class XhsFormListing(TaobaoListing):
             review_candidates = self._category_tree_review_candidates(scoped or candidates, path)
             target_text = await self._resolve_category_review(
                 tuple(" > ".join(candidate.path) for candidate in review_candidates),
-                source="xhs_category_tree", excel_value=" > ".join(path),
+                source="xhs_category_tree", excel_value=" / ".join(hints),
                 evidence={"api_category_tree": True, "api_path": "/xhs/getCategoryTree.json",
                           "category_tree_complete": True, "live_dom": False,
-                          "excel_category_hints": list(path),
+                          "excel_category_hints": (list(hints) if any(is_belt_category(hint) for hint in hints)
+                                                   else list(path)),
                           "category_tree_leaf_count": len(candidates),
                           "category_tree_candidate_count": len(review_candidates),
                           "gender_root_not_found": bool(not scoped),
@@ -1098,7 +1171,8 @@ class XhsFormListing(TaobaoListing):
         if self.panel is None:
             raise XhsFormListingError("请先调用 open() 打开小红书资料")
         path = tuple(str(item).strip() for item in category_path if str(item).strip())
-        self.category_hints = (" > ".join(path),)
+        if not self.category_hints or not any(is_belt_category(hint) for hint in self.category_hints):
+            self.category_hints = (" > ".join(path),)
         if not path:
             raise XhsFormListingError("Excel 小红书商品分类没有可选择的层级")
         modify = self.panel.get_by_role("button", name="修改类目", exact=True)
@@ -1463,6 +1537,9 @@ class XhsFormListing(TaobaoListing):
                 ],
             }
         )
+        custom_allowed = await select_supports_custom_value(
+            select, schema_allowed=field.get("custom_allowed")
+        )
         resolved_values = []
         for group in groups:
             request_candidates, excel_value = await self._excel_before_review(
@@ -1472,7 +1549,7 @@ class XhsFormListing(TaobaoListing):
                     field_id=field_id, field_label=page_label,
                     candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
                     excel_value="/".join(group), evidence={},
-                    custom_allowed=bool(field.get("custom_allowed")), schema_version=schema_version,
+                    custom_allowed=custom_allowed, schema_version=schema_version,
                     control_type=control_type,
                 ),
             )
@@ -1489,7 +1566,7 @@ class XhsFormListing(TaobaoListing):
                               "requested_groups": [list(g) for g in groups],
                               "previously_resolved_labels": list(dict.fromkeys(resolved_values)),
                               "control_type": control_type},
-                    custom_allowed=bool(field.get("custom_allowed")),
+                    custom_allowed=custom_allowed,
                     schema_version=schema_version,
                     control_type=control_type,
                 )
@@ -1512,6 +1589,19 @@ class XhsFormListing(TaobaoListing):
     ) -> Optional[Tuple[str, ...]]:
         await item.scroll_into_view_if_needed()
         selects = item.locator(".el-select:visible")
+        if await selects.count() == 0 and any(is_belt_category(hint) for hint in self.category_hints):
+            controls = item.locator(XHS_IDENTITY_CONTROL_SELECTOR)
+            if await controls.count() == 1:
+                control = controls.first
+                groups = selection_value_groups(page_label, expected)
+                text = groups[0][0] if len(groups) == 1 and groups[0] else expected.strip()
+                if (await control.input_value()).strip() != text:
+                    await control.fill(text)
+                    await control.press("Tab")
+                actual = (await control.input_value()).strip()
+                if actual != text:
+                    raise XhsFormListingError(f"小红书属性“{page_label}”输入回读失败：{actual!r}")
+                return (actual,)
         if await selects.count() != 1:
             raise XhsFormListingError(
                 "小红书属性“{0}”下拉框不是唯一项：{1}".format(
@@ -1956,7 +2046,11 @@ class XhsFormListing(TaobaoListing):
             )
         return matches[0]
 
+    def _expected_presale_days(self) -> str:
+        return "7" if any(is_belt_category(hint) for hint in self.category_hints) else "15"
+
     async def apply_full_payment_presale(self) -> Mapping[str, str]:
+        expected_days = self._expected_presale_days()
         full_mode = await self._ensure_radio("全款预售模式")
         await self._wait_for_loading_masks()
         timed_mode = await self._ensure_radio("时段预售")
@@ -1964,22 +2058,22 @@ class XhsFormListing(TaobaoListing):
         if is_select:
             try:
                 actual_values = await self._select_values(
-                    control, (("15", "15天"),), label="预售发货时间", multi=False
+                    control, ((expected_days, expected_days + "天"),), label="预售发货时间", multi=False
                 )
             except TaobaoListingError as exc:
                 raise XhsFormListingError(str(exc).replace("淘宝", "小红书")) from exc
             if actual_values is None:
-                raise XhsFormListingError("小红书预售发货时间没有“15天”精确候选")
+                raise XhsFormListingError(f"小红书预售发货时间没有“{expected_days}天”精确候选")
             days = actual_values[0]
         else:
             current = (await control.input_value()).strip()
-            if not _numeric_equal(current, "15"):
-                await control.fill("15")
+            if not _numeric_equal(current, expected_days):
+                await control.fill(expected_days)
                 await control.press("Tab")
             days = (await control.input_value()).strip()
-            if not _numeric_equal(days, "15"):
+            if not _numeric_equal(days, expected_days):
                 raise XhsFormListingError(
-                    "小红书预售发货时间回读失败：期望 15，页面为 {0!r}".format(days)
+                    "小红书预售发货时间回读失败：期望 {0}，页面为 {1!r}".format(expected_days, days)
                 )
         return {"发货模式": full_mode, "预售类型": timed_mode, "付款后": days}
 
@@ -2314,12 +2408,18 @@ class XhsFormListing(TaobaoListing):
                 continue
             page_label, item = matches[0]
             selects = item.locator(".el-select:visible")
-            if await selects.count() != 1:
+            controls = item.locator(XHS_IDENTITY_CONTROL_SELECTOR)
+            if (await selects.count() == 0 and await controls.count() == 1
+                    and any(is_belt_category(hint) for hint in self.category_hints)):
+                value = (await controls.first.input_value()).strip()
+                actual = (value,) if value else ()
+            elif await selects.count() == 1:
+                select = selects.first
+                multi = await select_supports_multiple(select)
+                actual = await self._read_select_values(select, multi=multi)
+            else:
                 errors.append("{0}=下拉控件不唯一".format(page_label))
                 continue
-            select = selects.first
-            multi = await select_supports_multiple(select)
-            actual = await self._read_select_values(select, multi=multi)
             expected_counter = Counter(
                 normalize_option(value)
                 for value in expected_values
@@ -2373,6 +2473,11 @@ class XhsFormListing(TaobaoListing):
         expected_freight: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
         """Read critical Xiaohongshu values after save without changing them."""
+        if not self.category_hints and is_belt_category(" > ".join(fields.category_path)):
+            # The runner creates a fresh adapter for persisted readback.
+            # Recover only belt context from the same Excel fields so its text
+            # attributes and confirmed 7-day rule use the same checks as fill.
+            self.category_hints = (" > ".join(fields.category_path),)
         identity = await self._verify_persisted_identity(title, style_code)
         attributes = await self._verify_persisted_attributes(expected_attributes)
         freight = await sync_store_freight(self, fields.fields, read_only=True, expected=expected_freight)
@@ -2387,9 +2492,10 @@ class XhsFormListing(TaobaoListing):
             days = days_values[0] if len(days_values) == 1 else ""
         else:
             days = (await day_control.input_value()).strip()
+        expected_days = self._expected_presale_days()
         if normalize_option(days) not in {
-            normalize_option("15"),
-            normalize_option("15天"),
+            normalize_option(expected_days),
+            normalize_option(expected_days + "天"),
         }:
             raise XhsFormListingError(
                 "小红书保存后预售天数回读失败：{0!r}".format(days)

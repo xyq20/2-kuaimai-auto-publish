@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from attribute_runtime import AttributeRequest, AttributeRuntime, ResolvedAttribute, ReviewRequired
 from learning_store import LearningStore
-from douyin_data import MaterialComponent
+from douyin_data import MaterialComponent, parse_materials
 from douyin_listing import (
     DouyinListing,
     DouyinListingError,
@@ -33,9 +33,19 @@ class OptionMatchingTests(unittest.TestCase):
         self.assertEqual(choose_unique_option("常 规-款", options)["id"], "1")
 
     def test_choose_unique_option_rejects_ambiguous_match_with_candidates(self):
-        options = ({"name": "纯棉", "id": "1"}, {"name": "纯-棉", "id": "2"})
-        with self.assertRaisesRegex(DouyinListingError, r"匹配数为 2.*纯棉.*纯-棉"):
+        options = ({"name": "纯棉", "id": "1"}, {"name": "纯棉", "id": "2"})
+        with self.assertRaisesRegex(DouyinListingError, r"匹配数为 2.*纯棉.*纯棉"):
             choose_unique_option("纯棉", options)
+
+    def test_exact_horse_leather_label_wins_over_punctuation_collision(self):
+        options = ({'name': '马皮革', 'id': '341895'}, {'name': '马皮（革）', 'id': '2534'})
+        self.assertEqual(choose_unique_option('马皮（革）', options)['id'], '2534')
+        self.assertEqual(choose_unique_option('马皮革', options)['id'], '341895')
+        self.assertEqual(choose_unique_option('马 皮 革', options)['id'], '341895')
+
+    def test_parenthesis_width_difference_does_not_match_unparenthesized_material(self):
+        options = ({'name': '马皮革', 'id': '341895'}, {'name': '马皮(革)', 'id': '2534'})
+        self.assertEqual(choose_unique_option('马皮（革）', options)['id'], '2534')
 
     def test_choose_unique_option_rejects_missing_match_with_candidates(self):
         options = ({"name": "棉", "id": "1"}, {"name": "亚麻", "id": "2"})
@@ -512,11 +522,96 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             actual = await self.listing._select_values(select, ('常规款',), label='厚度', multi=False)
             self.assertEqual(actual, ('常规款',))
             self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
-            self.assertEqual(len(calls), 0)
+            self.assertEqual(len(calls), 1)
+            self.assertIn('选择后校验失败', calls[0]['evidence']['validation_error'])
             self.assertFalse(runtime.deferred_reviews)
         finally:
             await runtime.drain()
             store.close()
+
+    async def test_api_and_dom_exact_material_match_survives_parenthesis_collision(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        select = (await self.listing._attribute_item('厚度')).locator('.el-select').first
+        await select.evaluate("""element => {
+          const values = ['马皮革', '马皮（革）'];
+          const dropdown = document.getElementById(
+            element.querySelector('input').getAttribute('aria-controls'));
+          dropdown.querySelectorAll('.el-select-dropdown__item').forEach((option, index) => {
+            option.textContent = values[index];
+            option.onclick = () => pickOption(option, values[index], false);
+          });
+        }""")
+        actual = await self.listing._write_select_values_once(
+            select, ('马皮（革）',), label='鞋垫材质', multi=False,
+            api_options=({'name': '马皮革', 'id': '341895'}, {'name': '马皮（革）', 'id': '2534'}))
+        self.assertEqual(actual, ('马皮（革）',))
+        self.assertEqual(await select.locator('input.el-input__inner').input_value(), '马皮（革）')
+
+    async def test_unparenthesized_existing_value_is_replaced_by_exact_material(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        select = (await self.listing._attribute_item('厚度')).locator('.el-select').first
+        await select.evaluate("""element => {
+          const input = element.querySelector('input');
+          input.value = '马皮革';
+          const dropdown = document.getElementById(input.getAttribute('aria-controls'));
+          dropdown.querySelectorAll('.el-select-dropdown__item').forEach((option, index) => {
+            const value = ['马皮革', '马皮（革）'][index];
+            option.textContent = value;
+            option.onclick = () => pickOption(option, value, false);
+          });
+        }""")
+        actual = await self.listing._write_select_values_once(
+            select, ('马皮（革）',), label='鞋垫材质', multi=False)
+        self.assertEqual(actual, ('马皮（革）',))
+        self.assertEqual(await select.locator('input.el-input__inner').input_value(), '马皮（革）')
+
+    async def test_readback_rejects_other_material_with_removed_parentheses(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        select = (await self.listing._attribute_item('厚度')).locator('.el-select').first
+        await select.evaluate("""element => {
+          const dropdown = document.getElementById(
+            element.querySelector('input').getAttribute('aria-controls'));
+          dropdown.querySelectorAll('.el-select-dropdown__item').forEach((option, index) => {
+            option.textContent = ['马皮革', '马皮（革）'][index];
+            option.onclick = () => pickOption(option, '马皮革', false);
+          });
+        }""")
+        with self.assertRaisesRegex(DouyinListingError, '选择后校验失败'):
+            await self.listing._write_select_values_once(
+                select, ('马皮（革）',), label='鞋垫材质', multi=False)
+
+    async def test_fill_attribute_does_not_skip_different_parenthesized_candidate(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        select = (await self.listing._attribute_item('厚度')).locator('.el-select').first
+        await select.evaluate("""element => {
+          const input = element.querySelector('input');
+          input.value = '马皮革';
+          const dropdown = document.getElementById(input.getAttribute('aria-controls'));
+          dropdown.querySelectorAll('.el-select-dropdown__item').forEach((option, index) => {
+            const value = ['马皮革', '马皮（革）'][index];
+            option.textContent = value;
+            option.onclick = () => pickOption(option, value, false);
+          });
+        }""")
+        actual = await self.listing.fill_attribute('厚度', '马皮（革）')
+        self.assertEqual(actual, ('马皮（革）',))
+
+    async def test_saved_readback_rejects_material_with_different_parentheses(self):
+        await self.listing.open()
+        applied = await self.listing.apply_category_and_fields(
+            SimpleNamespace(short_title='复古工装裤', attributes={}))
+        await self.listing.fill_text_field('商品标题', '复古水洗工装裤')
+        await self.listing.fill_sku_price_inventory('586', 0, 100)
+        select = (await self.listing._attribute_item('厚度')).locator('.el-select').first
+        await select.locator('input.el-input__inner').evaluate("input => input.value = '马皮革'")
+        with self.assertRaisesRegex(DouyinListingError, '保存后字段.*不一致'):
+            await self.listing.verify_persisted_values(
+                applied['category'], '复古水洗工装裤', applied['short_title'],
+                {'厚度': ('马皮（革）',)}, '586', 0, 100, 5)
 
     async def test_unmapped_dropdown_uses_visible_candidates_for_review(self):
         await self.listing.open()
@@ -868,6 +963,16 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             "棉",
         )
 
+    async def test_decimal_materials_are_written_and_read_without_integer_truncation(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+
+        actual = await self.listing.apply_materials(parse_materials("棉95.4%，亚麻4.6%"), ())
+
+        self.assertEqual(actual, (("棉", 95.4), ("亚麻", 4.6)))
+        self.assertEqual(await self.page.locator('#material-rows .el-input-digit input').evaluate_all(
+            'inputs => inputs.map(input => input.value)'), ['95.4', '4.6'])
+
     async def test_material_component_is_skipped_when_category_has_no_field(self):
         await self.listing.open()
         await self.listing.apply_first_recommended_category()
@@ -1088,6 +1193,61 @@ class DouyinListingFixtureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(actual, (("棉", 94), ("氨纶", 6)))
         self.assertEqual(await self.page.locator("#material-rows .measure-item").count(), 2)
+
+    async def test_smart_fill_normalizes_excel_format_for_real_platform_parser(self):
+        await self.listing.open()
+        await self.listing.apply_first_recommended_category()
+        await self.page.add_script_tag(
+            path=str(Path(__file__).parent / "fixtures" / "kuaimai_material_parser.js")
+        )
+        await self.page.evaluate("""() => {
+          const wrap = document.querySelector('.measure-wrap');
+          const button = document.createElement('button');
+          button.textContent = '智能填充';
+          button.onclick = () => {
+            document.body.insertAdjacentHTML('beforeend',
+              `<div class="el-popover"><input placeholder="请输入面料材质">
+                 <button type="button">确认</button></div>`);
+            const dialog = document.querySelector('.el-popover:last-child');
+            dialog.querySelector('button').onclick = () => {
+              window.submittedMaterials = dialog.querySelector('input').value;
+              const parsed = parseKuaimaiMaterials(window.submittedMaterials);
+              const rows = document.querySelector('#material-rows');
+              rows.innerHTML = '';
+              for (const component of parsed) {
+                rows.insertAdjacentHTML('beforeend', materialRow());
+                const row = rows.lastElementChild;
+                row.querySelector('.el-input__inner').value = component.valueName;
+                row.querySelector('.el-input-digit input').value = component.percentageValue;
+              }
+              dialog.remove();
+            };
+          };
+          wrap.prepend(button);
+        }""")
+
+        sources = (
+            "棉（95.4%），聚脂钎维（4.6%）",
+            "棉(95.4%),聚脂钎维(4.6%)",
+            "棉/95.4%；聚脂钎维/4.6%",
+            "棉95.4%，聚脂钎维4.6%",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                # Restore the same initial blank row for each attempt.
+                await self.page.evaluate("""() => {
+                  document.querySelector('#material-rows').innerHTML = materialRow();
+                }""")
+                actual = await self.listing.apply_materials(parse_materials(source), (), source)
+
+                self.assertEqual(actual, (("棉", 95.4), ("聚脂钎维", 4.6)))
+                self.assertEqual(
+                    await self.page.locator('#material-rows .el-input-digit input').evaluate_all(
+                        'inputs => inputs.map(input => input.value)'),
+                    ['95.4', '4.6'],
+                )
+                self.assertEqual(await self.page.evaluate('window.submittedMaterials'),
+                                 '棉95.4% 聚脂钎维4.6%')
 
     async def test_or_value_prefers_existing_later_candidate_before_creating(self):
         await self.listing.open()

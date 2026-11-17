@@ -135,12 +135,20 @@ class MonthlyCatalogTests(unittest.TestCase):
              patch('product_materials.current_month_directory', return_value=november):
             self.assertEqual([p['title'] for p in self.catalog.listing()], [new.name])
 
-    def test_workbench_api_discovers_local_excel_and_launches_that_workbook(self):
+    def test_workbench_uses_original_library_even_when_materials_have_a_local_workbook(self):
         folder = self.artwork('10.13【太阳照常升起】')
-        excel = self.workbook(folder, '太阳照常升起', 'NGBL-2143')
-        self.artwork('10.14【旅行家】')
+        local_excel = self.workbook(folder, '太阳照常升起', 'LOCAL-2143')
+        excel = self.workbook(self.legacy/'太阳照常升起+NGBL-2143', '太阳照常升起', 'NGBL-2143')
+        (excel.parent/'1：1主图').mkdir()
+        original_image = excel.parent/'1：1主图/1.png'
+        original_image.write_bytes(b'original-image')
+        other = self.workbook(self.legacy/'没有当月素材+OLD-1', '没有当月素材', 'OLD-1')
+        self.workbook(self.artwork('10.14【旅行家】'), '旅行家', 'LOCAL-2')
         settings = Settings(self.root/'data', 'device', products_root=self.legacy,
-                            materials_root=self.month.parent)
+                            materials_root=self.month.parent,
+                            dewu_products_root=self.root/'dewu', bilibili_products_root=self.root/'bilibili')
+        dewu_excel = self.workbook(settings.dewu_products_root/'得物商品', '得物商品', 'DEWU-1')
+        bili_excel = self.workbook(settings.bilibili_products_root/'B站商品', 'B站商品', 'BILI-1')
         migrate(settings)
         with transaction(settings) as connection:
             create_user(connection, 'admin', '1234', role='admin')
@@ -149,9 +157,21 @@ class MonthlyCatalogTests(unittest.TestCase):
             self.assertEqual(client.post('/api/login', headers=origin,
                                         json={'username':'admin','password':'1234'}).status_code, 200)
             products = client.get('/api/launcher/products').json()['products']
-            self.assertEqual([p['title'] for p in products], [folder.name])
-            product_id = products[0]['id']
-            self.assertEqual(client.get(f'/api/launcher/products/{product_id}/image').content, b'image')
+            self.assertEqual({p['title'] for p in products}, {excel.parent.name, other.parent.name})
+            product_id = next(p['id'] for p in products if p['title'] == excel.parent.name)
+            launcher = client.app.state.launcher
+            self.assertIs(type(launcher.catalog), ProductCatalog)
+            self.assertIsNone(launcher.catalog.materials_root)
+            self.assertEqual(launcher.catalog.path(product_id), excel)
+            self.assertNotEqual(launcher.catalog.path(product_id), local_excel)
+            detail = client.get(f'/api/launcher/products/{product_id}').json()
+            self.assertEqual(detail['style_code'], 'NGBL-2143')
+            self.assertEqual(client.get(f'/api/launcher/products/{product_id}/image').content, b'original-image')
+            self.assertEqual(launcher.catalog.image(product_id), original_image)
+            for source, expected in [('dewu', dewu_excel), ('bilibili', bili_excel)]:
+                independent = client.get('/api/launcher/products', params={'source': source}).json()['products']
+                self.assertEqual(len(independent), 1)
+                self.assertEqual(launcher.catalog_for(source).path(independent[0]['id']), expected)
             child = Mock(pid=987654)
             child.poll.return_value = None
             with patch('local_review.launcher.external_runner_active', return_value=False), \
@@ -164,10 +184,11 @@ class MonthlyCatalogTests(unittest.TestCase):
             import json
             argv = json.loads(launch.read_text())['argv']
             self.assertEqual(argv[argv.index('--excel-url') + 1], str(excel))
+            self.assertNotIn('--materials-root', argv)
             with patch('local_review.launcher.subprocess.run') as opened:
                 reply = client.post(f'/api/launcher/products/{product_id}/open-folder', headers=origin, json={})
             self.assertEqual(reply.status_code, 200)
-            self.assertEqual(opened.call_args.args[0], ['/usr/bin/open', str(folder)])
+            self.assertEqual(opened.call_args.args[0], ['/usr/bin/open', str(excel.parent)])
 
 
 if __name__ == '__main__':

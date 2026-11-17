@@ -9,6 +9,7 @@ from .database import connect
 from .deepseek import JudgmentUnavailable, request_json
 from .service import require
 from semantic_policy import is_style_judgment_field
+from category_profile import is_belt_category
 
 
 def _control_family(value):
@@ -144,7 +145,9 @@ def judge_attribute(settings, data):
     require(isinstance(data["excel_value"], str) and len(data["excel_value"]) <= 10000
             and isinstance(data["evidence"], dict), 400, "invalid_semantic_request")
     options = data["options"]
-    require(isinstance(options, list) and 0 < len(options) <= 1000, 400, "invalid_semantic_candidates")
+    pre_review = data['evidence'].get('pre_review_fallback') is True
+    require(isinstance(options, list) and (bool(options) or pre_review)
+            and len(options) <= 1000, 400, "invalid_semantic_candidates")
     require(all(isinstance(o, dict) and set(o) == {"value_id", "label"}
                 and all(isinstance(o[k], str) and 0 < len(o[k]) <= 2000 for k in o)
                 for o in options), 400, "invalid_semantic_candidates")
@@ -164,7 +167,8 @@ def judge_attribute(settings, data):
                      and e.get("excel_candidates") == current_intent]
     human_sets = {tuple(sorted(e["selected_labels"])) for e in current_human if not e.get("no_fill")}
     human_no_fill = any(e.get("no_fill") for e in current_human)
-    if len(human_sets) == 1 and not human_no_fill:
+    fresh_judgment = pre_review or bool(data['evidence'].get('validation_error'))
+    if len(human_sets) == 1 and not human_no_fill and not fresh_judgment:
         labels = next(iter(human_sets))
         matches = [[o for o in options if o["label"] == label] for label in labels]
         if matches and all(len(m) == 1 for m in matches):
@@ -176,7 +180,7 @@ def judge_attribute(settings, data):
                     "assessment": {"relation": "equivalent", "source_text": data["excel_value"].strip(),
                                    "assumptions": [], "conflicts": [], "competing_value_ids": []}}
     cached = reuse(settings, data, context) if (
-        context.get("history_summary") and not data['evidence'].get('validation_error')
+        context.get("history_summary") and not fresh_judgment
     ) else None
     if cached:
         rule_id, proposal, check = cached
@@ -212,7 +216,7 @@ def judge_attribute(settings, data):
         'excel_ordered_plans': excel_selection_plans(data['excel_value'], multi=_control_family(data['control_type']) == 'multi_select'),
         'excel_ordered_exact_matches': [{'value_id': c.value_id, 'label': c.label} for c in variants[0]] if variants else []}}
     allowed_kinds = ["product"] + (["excel"] if data["excel_value"].strip() else []) + (["human_learning"] if context["human_examples"] else [])
-    operation_names = {"validation_error", "first_validation_error", "failed_selection", "failed_selection_value_ids", "failed_selection_source", "bounded_write_retry", "selection_only", "force_review"}
+    operation_names = {"validation_error", "first_validation_error", "failed_selection", "failed_selection_value_ids", "failed_selection_source", "bounded_write_retry", "selection_only", "force_review", "write_retry_exhausted", "pre_review_fallback", "review_reason_code", "prior_suggested_value_id", "prior_decision", "review_learning_result"}
     execution_state = {k:v for k,v in data["evidence"].items() if k in operation_names}
     model_data = {**data, "evidence": {k:v for k,v in data["evidence"].items() if k not in operation_names}}
     # The existing operator correction takes priority over ordered Excel alternatives.
@@ -239,6 +243,8 @@ def judge_attribute(settings, data):
         "优先符合 Excel 的含义和候选顺序；>表示逐级路径，/表示按顺序备选而非路径。"
         "类目必须校验完整路径和最终叶子，重名叶子不可仅按名字选。"
         "execution_state记录操作失败，仅用于提醒后续写入和回读验证，不是商品事实冲突或候选竞争。你只判断应选什么，不能宣称已写入或已保存。"
+        "pre_review_fallback=true表示送人工前最后兜底，须统筹原始资料、实时候选、人工历史及学习库摘要，主动判断是否已有充分依据自动填写；不能仅因程序报错、规则拒绝或学习记录冲突就照搬转审结论。仍无法确定时明确指出缺少什么证据。"
+        "options为空时不得创造候选或尺寸、材质等事实，返回空value_ids并说明需要补充的页面候选或商品资料。"
         "assessment.conflicts只列商品资料或明确人工要求的矛盾，assumptions只列未经证实的商品事实，不能把已声明的逗号分组和/备选语法当成假设。"
         "evidence_kinds只能使用allowed_evidence_kinds中的来源，没有human_examples时禁止human_learning；历史回读不是人工。"
         "current_product_human_choices是当前商品的明确纠正，有记录时优先，不要用程序首选备选替代人工选择。"
@@ -266,6 +272,14 @@ def judge_attribute(settings, data):
         "推断时额外输出 supporting_quotes:[{source:'product'或'human_learning',text:'支持所选值的资料原文'}]；"
         "必须逐字引用 product_and_learning 中商品资料或人工历史的原文，不能引用模型历史冒充人工依据。"
     ) + assessment_instructions
+    if data["control_type"] == "category" and any(is_belt_category(hint) for hint in (
+        data["evidence"].get("excel_category_hints") or (data["excel_value"],)
+    )):
+        system += (
+            "皮带类目在不同平台的上下级归属和末级名称可以不同，须结合Excel与商品资料核对完整含义。"
+            "组合名称内部的/保留为名称文字；current_category是页面已选的真实路径，语义相符时可保留。"
+            "Excel组合类目明确列出的带性别限定成员属于已有类目意图，不是凭标题推测性别；仍须核对商品类型、完整路径和相反性别信号。"
+        )
     attempts = 0
     feedback = []
     auxiliary = {"verified_fill_examples", "verified_model_examples", "learned_rule_guidance"}

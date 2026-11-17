@@ -25,6 +25,7 @@ from shoe_size import recognize_shoe_measurements
 
 CATEGORY_PANTS = "pants"
 CATEGORY_CLOTHING = "clothing"
+CATEGORY_VEST = "vest"
 CATEGORY_FOOTWEAR = "footwear"
 CATEGORY_GENERIC = "generic"
 
@@ -181,7 +182,7 @@ def classify_tmall_category(category_path: str) -> str:
     if leaf.endswith(_PANTS_SUFFIXES):
         return CATEGORY_PANTS
     if leaf.endswith(_CLOTHING_SUFFIXES):
-        return CATEGORY_CLOTHING
+        return CATEGORY_VEST if leaf.endswith(("马甲", "背心")) else CATEGORY_CLOTHING
     return CATEGORY_GENERIC
 
 
@@ -247,8 +248,17 @@ def resolve_tmall_size_sources(
 ) -> TmallSizeSources:
     """Resolve Tmall size-table rows from Excel and category-specific evidence."""
 
-    sizes = parse_tmall_sizes(fields)
     category_kind = classify_tmall_category(category_path)
+    source = _field_mapping(fields)
+    if category_kind == CATEGORY_GENERIC and "尺码" not in source:
+        return TmallSizeSources(
+            category_kind=category_kind,
+            sizes=(),
+            headers=(),
+            rows=(),
+            evidence=(),
+        )
+    sizes = parse_tmall_sizes(fields)
 
     if category_kind == CATEGORY_FOOTWEAR:
         try:
@@ -309,7 +319,7 @@ def resolve_tmall_size_sources(
             "ocr:尺码信息表",
             "ocr:身高体重推荐表",
         )
-    elif category_kind == CATEGORY_CLOTHING:
+    elif category_kind in {CATEGORY_CLOTHING, CATEGORY_VEST}:
         size_chart = _required_size_chart(size_chart_image)
         height_weight = discover_height_weight_image(product_dir)
         if height_weight is None:
@@ -318,9 +328,14 @@ def resolve_tmall_size_sources(
                 reason_code="missing_height_weight_image",
             )
         try:
-            recognized = recognize_clothing_recommendations(
-                size_chart, height_weight, sizes
-            )
+            if category_kind == CATEGORY_VEST:
+                recognized = recognize_clothing_recommendations(
+                    size_chart, height_weight, sizes, garment_kind=category_kind
+                )
+            else:
+                recognized = recognize_clothing_recommendations(
+                    size_chart, height_weight, sizes
+                )
         except RecognitionError as error:
             raise TmallSizeReviewRequired(
                 "服装天猫尺码 OCR 无法安全解析：{0}".format(error),

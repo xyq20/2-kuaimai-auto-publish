@@ -13,6 +13,16 @@ from xhs_form_listing import XhsFormListing, title_without_neigborl
 
 
 class XhsDataTests(unittest.TestCase):
+    def test_unit_only_money_template_does_not_override_real_price(self):
+        from xhs_form_listing import _required_excel_value, XhsFormListingError
+        fields = {'吊牌价/价格/基本售价': '元', '售卖价/售价/价格': '298',
+                  '商品分类': '服装 > 服装配饰 > 腰带/皮带/腰链'}
+        self.assertEqual(_required_excel_value(fields, ('售价', '价格', '基本售价'), '售价', money=True), '298')
+        with self.assertRaisesRegex(XhsFormListingError, '缺少小红书售价'):
+            _required_excel_value({'价格': '元', '商品分类': fields['商品分类']}, ('价格',), '售价', money=True)
+        with self.assertRaisesRegex(XhsFormListingError, '不是有效金额'):
+            _required_excel_value(dict(fields, 商品分类='男装 > 休闲裤'), ('价格',), '售价', money=True)
+
     def test_first_exact_sweatshirt_alternative_is_not_replaced_by_last_alias(self):
         self.assertEqual(XhsFormListing._choose_category_text(
             ('男装 > 卫衣',), ('卫衣/打底衫/男士套头卫衣/套头卫衣',)),
@@ -50,6 +60,52 @@ class XhsDataTests(unittest.TestCase):
 
 
 class XhsFormListingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_belt_presale_is_seven_days_and_other_categories_keep_fifteen(self):
+        from xhs_form_listing import XhsFormListingError
+        for path, expected in (('服装 > 服装配饰 > 腰带/皮带/腰链', '7'),
+                               ('男装 > 休闲裤', '15'), ('男鞋 > 正装皮鞋', '15')):
+            with self.subTest(path=path):
+                listing = await self._listing()
+                listing.category_hints = (path,)
+                self.assertEqual((await listing.apply_full_payment_presale())['付款后'], expected)
+                listing._verify_persisted_identity = AsyncMock(return_value={})
+                listing._verify_persisted_attributes = AsyncMock(return_value={})
+                listing._persisted_radio_is_checked = AsyncMock(return_value=True)
+                listing._sku_table_snapshot = AsyncMock(return_value={})
+                listing._validate_sku_snapshot = Mock(return_value=({},))
+                listing._visible_validation_errors = AsyncMock(return_value=())
+                fields = parse_xhs_fields({'商品分类': path, '价格': '298', '数量': '100'})
+                if expected == '7':
+                    listing.category_hints = ()  # fresh persisted-readback adapter
+                with patch('xhs_form_listing.sync_store_freight', new=AsyncMock(return_value={})):
+                    report = await listing.verify_persisted_values(
+                        fields, title='商品', style_code='test', expected_attributes={})
+                    self.assertEqual(report['presale']['付款后'], expected)
+                    await self.page.locator('[data-xhs-presale-days]').fill('15' if expected == '7' else '7')
+                    with self.assertRaisesRegex(XhsFormListingError, '保存后预售天数回读失败'):
+                        await listing.verify_persisted_values(
+                            fields, title='商品', style_code='test', expected_attributes={})
+
+    async def test_plain_category_text_input_fills_and_verifies_persisted_value(self):
+        from xhs_form_listing import XhsFormListingError
+        listing = await self._listing()
+        listing.category_hints = ('服装 > 服装配饰 > 腰带/皮带/腰链',)
+        await self.page.set_content('''<div id="width" class="el-form-item">
+          <label class="el-form-item__label">宽度</label><div><input></div></div>''')
+        item = self.page.locator('#width')
+        self.assertEqual(await listing._fill_attribute('宽度', item, '3.8cm/3.8'), ('3.8cm',))
+        listing._attribute_items = AsyncMock(return_value={'宽度': ('宽度', item)})
+        self.assertEqual(await listing._verify_persisted_attributes({'宽度': ('3.8cm',)}),
+                         {'宽度': ('3.8cm',)})
+        await item.locator('input').fill('3.0cm')
+        with self.assertRaisesRegex(XhsFormListingError, '保存后类目属性回读失败'):
+            await listing._verify_persisted_attributes({'宽度': ('3.8cm',)})
+        listing.category_hints = ('男装 > 休闲裤',)
+        await item.locator('input').fill('')
+        with self.assertRaisesRegex(XhsFormListingError, '下拉框不是唯一项'):
+            await listing._fill_attribute('宽度', item, '3.8cm')
+        self.assertEqual(await item.locator('input').input_value(), '')
+
     async def _empty_saved_attribute_listing(self, payload, *, status=200):
         await self.page.route(
             "https://api.test/",

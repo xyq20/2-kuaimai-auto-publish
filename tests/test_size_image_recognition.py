@@ -229,9 +229,21 @@ class VisionOCRUnitTests(unittest.TestCase):
             _token("56", 0.40, 0.60), _token("57", 0.60, 0.60), _token("58", 0.80, 0.60),
         )
 
-        actual = parse_clothing_measurement_table(tokens, ("S", "M", "L"), source="缺少肩宽的尺码表")
-
-        self.assertEqual([actual[size]["shoulder"] for size in ("S", "M", "L")], [10, 11, 12])
+    def test_douyin_vest_accepts_hem_instead_of_sleeve(self):
+        tokens = (
+            _token("S", 0.40, 0.10), _token("M", 0.60, 0.10),
+            _token("衣长/LENGTH", 0.05, 0.30, width=0.20),
+            _token("胸围/BUST", 0.05, 0.45, width=0.20),
+            _token("下摆/HEM", 0.05, 0.60, width=0.20),
+            _token("肩宽/SHOULDER WIDTH", 0.05, 0.75, width=0.20),
+            _token("64", 0.40, 0.30), _token("65", 0.60, 0.30),
+            _token("106", 0.40, 0.45), _token("110", 0.60, 0.45),
+            _token("106", 0.40, 0.60), _token("110", 0.60, 0.60),
+            _token("43", 0.40, 0.75), _token("45", 0.60, 0.75),
+        )
+        actual = parse_clothing_measurement_table(tokens, ("S", "M"), garment_kind="vest")
+        self.assertEqual(actual["S"]["hem"], 106)
+        self.assertEqual(actual["S"]["sleeve"], 106)
 
     def test_douyin_clothing_recombines_split_sleeve_label(self):
         tokens = (
@@ -745,9 +757,89 @@ class SizeRecommendationParserTests(unittest.TestCase):
 
 @unittest.skipUnless(
     sys.platform == "darwin" and shutil.which("xcrun") is not None,
+    "需要 macOS 和 xcrun 才能运行 Swift OCR 合并测试",
+)
+class SwiftTokenMergeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        temporary_directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name)
+        production_script = Path(size_image_recognition.__file__).with_name("scripts") / "vision_ocr.swift"
+        declarations, _main = production_script.read_text(encoding="utf-8").rsplit("\ndo {\n", 1)
+        script = root / "merge_test.swift"
+        script.write_text(declarations + '''
+let batches = try JSONDecoder().decode(
+    [[OCRToken]].self, from: FileHandle.standardInput.readDataToEndOfFile())
+var merged: [OCRToken] = []
+for batch in batches { merge(batch, into: &merged) }
+FileHandle.standardOutput.write(try JSONEncoder().encode(merged))
+''', encoding="utf-8")
+        cls.binary = root / "merge_test"
+        size_image_recognition._compile_bridge(
+            script, cls.binary, size_image_recognition._active_toolchain()
+        )
+
+    def _merge(self, *batches):
+        result = subprocess.run(
+            [str(self.binary)],
+            input=json.dumps([[dataclasses.asdict(token) for token in batch] for batch in batches]),
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        return tuple(OCRToken(**item) for item in json.loads(result.stdout))
+
+    def test_l_from_later_pass_replaces_low_confidence_seven(self):
+        wrong = OCRToken("7", 0.3, 0.532174, 0.555759, 0.019130, 0.025594)
+        correct = OCRToken("L", 1.0, 0.530523, 0.555725, 0.020349, 0.024427)
+        inverted = OCRToken("L", 1.0, 0.532174, 0.555759, 0.019130, 0.025594)
+
+        self.assertEqual(self._merge((wrong,), (correct,), (inverted,)), (correct,))
+
+    def test_lower_or_equal_confidence_does_not_overwrite_existing_text(self):
+        correct = OCRToken("L", 1.0, 0.53, 0.55, 0.02, 0.03)
+        for confidence in (0.3, 1.0):
+            with self.subTest(confidence=confidence):
+                wrong = dataclasses.replace(correct, text="7", confidence=confidence)
+                self.assertEqual(self._merge((correct,), (wrong,)), (correct,))
+
+    def test_distinct_cells_and_ambiguous_spanning_box_remain_separate(self):
+        first = OCRToken("80", 0.5, 0.10, 0.10, 0.04, 0.03)
+        second = OCRToken("84", 0.5, 0.15, 0.10, 0.04, 0.03)
+        spanning = OCRToken("8084", 1.0, 0.10, 0.10, 0.09, 0.03)
+
+        self.assertEqual(self._merge((first, second), (spanning,)), (first, second))
+
+    def test_contained_duplicate_uses_stronger_result_without_extra_cell(self):
+        large = OCRToken("100", 0.5, 0.10, 0.10, 0.12, 0.06)
+        tight = OCRToken("100", 1.0, 0.14, 0.12, 0.04, 0.02)
+
+        self.assertEqual(self._merge((large,), (tight,)), (tight,))
+
+
+@unittest.skipUnless(
+    sys.platform == "darwin" and shutil.which("xcrun") is not None,
     "需要 macOS Vision 和 xcrun 才能运行本地 OCR 集成测试",
 )
 class VisionOCRIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(
+        Path("/Volumes/共享文件/谭/products/11.13【曼哈顿计划】 黑色/身高体重推荐表/1_08.jpg").is_file(),
+        "需要首轮把 L 误识别为 7 的原始体重表",
+    )
+    def test_l_correction_survives_merge_across_scales_and_inversion(self):
+        image = Path("/Volumes/共享文件/谭/products/11.13【曼哈顿计划】 黑色/身高体重推荐表/1_08.jpg")
+        tokens = vision_ocr(image)
+
+        self.assertEqual(
+            size_image_recognition.parse_height_weight_chart(
+                image, tokens, ("S", "M", "L", "XL", "2XL")
+            ),
+            {
+                "S": (155, 160, 50, 60), "M": (160, 170, 60, 70),
+                "L": (170, 180, 70, 80), "XL": (180, 190, 80, 90),
+                "2XL": (190, 200, 90, 100),
+            },
+        )
+
     def test_top_edge_roundoff_does_not_reject_valid_size_chart(self):
         image = FIXTURE_IMAGE.with_name("vision_ocr_top_edge.jpg")
         tokens = vision_ocr(image)

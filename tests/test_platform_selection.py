@@ -24,6 +24,50 @@ def batch_args(platforms, mode):
 
 
 class PlatformSelectionTests(unittest.TestCase):
+    def test_dewu_review_flag_is_explicit_and_cannot_mix_with_draft_modes(self):
+        args = erp.build_parser().parse_args(['--platform', 'dewu', '--dewu-submit-review'])
+        erp.validate_execution_mode(args)
+        self.assertEqual(erp.learning_execution_mode(args), 'submit_review')
+        for flags in (['--platform', 'jd'], ['--platform', 'dewu', '--save-only'],
+                      ['--platform', 'dewu', '--no-save']):
+            with self.subTest(flags=flags), self.assertRaises(SystemExit):
+                erp.validate_execution_mode(erp.build_parser().parse_args([*flags, '--dewu-submit-review']))
+
+    def test_dewu_is_a_standalone_draft_flow(self):
+        for mode in ("--no-save", "--save-only", "--save"):
+            with self.subTest(mode=mode):
+                args = erp.build_parser().parse_args(["--platform", "dewu", mode])
+                selected = erp.validate_execution_mode(args)
+                self.assertEqual(tuple(spec.cli_name for spec in selected), ("dewu",))
+                self.assertFalse(selected[0].publish_allowed)
+                self.assertEqual(erp.learning_execution_mode(args),
+                                 "preview" if mode == "--no-save" else "save_only")
+        for value in ("dewu,jd", "base,dewu", "dewu,douyin"):
+            with self.subTest(value=value), self.assertRaisesRegex(SystemExit, "单独选择"):
+                erp.validate_execution_mode(erp.build_parser().parse_args([
+                    "--platform", value, "--save-only",
+                ]))
+
+    def test_dewu_specific_selection_cannot_run_other_platforms(self):
+        for flag, value in (("--dewu-product", "双头鹰"),
+                            ("--dewu-resume-url", "https://stark.dewu.com/example")):
+            with self.subTest(flag=flag), self.assertRaisesRegex(SystemExit, "仅用于"):
+                erp.validate_execution_mode(erp.build_parser().parse_args([
+                    "--platform", "all", "--save-only", flag, value,
+                ]))
+
+    def test_dewu_main_dispatch_does_not_read_erp_inputs_or_start_erp_browser(self):
+        with patch("sys.argv", ["kuaimai_erp.py", "--platform", "dewu", "--dry-run"]), patch(
+            "dewu_listing.run_dewu_command", return_value=0
+        ) as dewu, patch.object(erp, "resolve_excel_path") as resolve, patch.object(
+            erp, "read_product_data"
+        ) as read, patch.object(erp, "run_browser_automation", new_callable=AsyncMock) as browser:
+            self.assertEqual(erp.main(), 0)
+            self.assertEqual(dewu.call_args.args[0].platform, "dewu")
+            resolve.assert_not_called()
+            read.assert_not_called()
+            browser.assert_not_awaited()
+
     def test_all_mode_resume_and_skip_preserve_existing_behavior(self):
         args = erp.build_parser().parse_args([
             "--platform", "all", "--save-only", "--all-platform-start-at", "xhs",
@@ -72,6 +116,7 @@ class PlatformSelectionTests(unittest.TestCase):
             with self.subTest(platforms=platforms), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
                 product = SimpleNamespace(
                     style_code="TEST", title="商品", base_price="100",
+                    product_dir=Path(directory),
                     main_images=(), main_images_34=(), detail_images=(), sku_images=(),
                 )
                 stack.enter_context(patch("sys.argv", [
@@ -94,6 +139,49 @@ class PlatformSelectionTests(unittest.TestCase):
 
 
 class PlatformBatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_skips_requested_platform_without_rerunning_saved_stages(self):
+        order = ("tmall", "pdd", "wxsph", "xhs", "youzan", "jd")
+        for resume_index in (4, 5):
+            with self.subTest(resume_index=resume_index):
+                args = batch_args("all", "--save-only")
+                args.resume_run_id = "a" * 32
+                args.all_platform_skip = ["youzan"]
+                erp.validate_execution_mode(args)
+                context = SimpleNamespace(
+                    client=object(), store=Mock(), run_id=args.resume_run_id,
+                    product_version="product", device_id="device", image_version="images",
+                    attribute_runtime=SimpleNamespace(unrestored_run_reviews=Mock(return_value=[])),
+                )
+                context.store.load_checkpoint.return_value = erp.RunCheckpoint(
+                    args.resume_run_id, "product", "save_only", order, resume_index, "failed",
+                    device_id="device", image_version="images",
+                )
+                with tempfile.TemporaryDirectory() as directory, patch.object(
+                    erp, "initialize_learning_run", new_callable=AsyncMock
+                ), patch.object(erp, "drain_learning_events", new_callable=AsyncMock), patch.object(
+                    erp, "run_browser_automation", new_callable=AsyncMock
+                ) as browser, patch.object(erp, "record_learning_stage") as record, patch.object(
+                    erp, "close_shared_browser_session", new_callable=AsyncMock
+                ):
+                    output = Path(directory)
+                    if resume_index == 5:
+                        (output / "all-platform-result.json").write_text(json.dumps([
+                            {"platform": "youzan", "status": "skipped", "reason": "用户指定跳过"},
+                            {"platform": "jd", "status": "failed"},
+                        ]))
+                    await erp.run_all_implemented_platforms(
+                        args, SimpleNamespace(douyin_fields=None), output, LOGGER, context,
+                    )
+                    results = json.loads((output / "all-platform-result.json").read_text())
+                self.assertEqual([call.args[0].platform for call in browser.await_args_list], ["jd"])
+                self.assertEqual([(row["platform"], row["status"]) for row in results],
+                                 [("youzan", "skipped"), ("jd", "success")])
+                self.assertEqual(record.call_count, 1)
+                self.assertEqual(record.call_args.args[1].platform_id, "jd")
+                checkpoints = [call.args[0] for call in context.store.save_checkpoint.call_args_list]
+                self.assertTrue(all(item.platform_order == order for item in checkpoints))
+                self.assertEqual((checkpoints[-1].current_index, checkpoints[-1].status), (6, "completed"))
+
     async def test_saved_douyin_readback_retries_initial_stale_price(self):
         verify = AsyncMock(side_effect=[
             DouyinListingError("保存后第 1 个 SKU 的价格不一致：页面为 0"),

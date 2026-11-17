@@ -75,3 +75,9 @@ body.review-active .workspace{height:100dvh;display:flex;flex-direction:column;m
 body.review-active .topbar{flex:0 0 auto}
 body.review-active #review-view{width:100%;margin:0;align-self:stretch;height:auto;flex:1 1 0;min-height:0;padding-bottom:20px}
 @media(max-width:650px){body.review-active .workspace{height:calc(100dvh - 65px)}}
+
+.platform-logo.dewu{background:#e9f7f7;color:#0d8d91}.platform-name small{display:block;margin-top:4px;font-size:9px;font-weight:400;color:var(--muted)}.dewu-draft-link{display:inline-flex;margin-bottom:18px}.dewu-draft-link[hidden],.learning-row[hidden],.mode-card[hidden]{display:none}
+
+.mode-grid.dewu-mode{grid-template-columns:repeat(2,minmax(0,1fr))}
+.platform-logo.bilibili{background:#fff0f5;color:#e65b8e}
+@media(max-width:650px){.mode-grid.dewu-mode{grid-template-columns:1fr}}

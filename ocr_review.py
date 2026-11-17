@@ -11,12 +11,15 @@ from attribute_runtime import AttributeRequest, ReviewBatchRequired, ReviewRequi
 from learning_client import LearningClientError
 from learning_models import CandidateValue, canonical_sha256
 from ocr_semantics import MEANINGS, OCRJudgmentRequired, OCRSemanticSession, validate_suggestions
-from size_image_recognition import RecognitionError, SizeSetMismatch, _matches_alias_composition, _MEASUREMENT_ALIASES, _CLOTHING_MEASUREMENT_ALIASES, _CLOTHING_EXTRA_ROW_ALIASES
+from size_image_recognition import (RecognitionError, SizeSetMismatch, _matches_alias_composition,
+                                    _MEASUREMENT_ALIASES, _CLOTHING_MEASUREMENT_ALIASES,
+                                    _CLOTHING_EXTRA_ROW_ALIASES, _VEST_MEASUREMENT_ALIASES)
 
 
 def unresolved_labels(error):
     aliases = (_MEASUREMENT_ALIASES if error.garment_kind == "pants" else
-               {**_CLOTHING_MEASUREMENT_ALIASES, **_CLOTHING_EXTRA_ROW_ALIASES})
+               (_VEST_MEASUREMENT_ALIASES if error.garment_kind == "vest" else
+                {**_CLOTHING_MEASUREMENT_ALIASES, **_CLOTHING_EXTRA_ROW_ALIASES}))
     return tuple(i for i in error.label_token_ids
                  if not any(_matches_alias_composition(error.tokens[i].text, a) for a in aliases.values()))
 
@@ -204,7 +207,8 @@ async def resolve_ocr_failure(runtime, client, session: OCRSemanticSession,
             # review action is the only new training evidence.
             await runtime._raise_review(request, snapshot, None,
                                         str(response.get("reason_code") or "ocr_semantic_uncertain"),
-                                        suggestions[ident][0] if valid and ident in suggestions else None)
+                                        suggestions[ident][0] if valid and ident in suggestions else None,
+                                        model_checked=True)
         except ReviewRequired as review:
             reviews.append(review)
     if reviews:

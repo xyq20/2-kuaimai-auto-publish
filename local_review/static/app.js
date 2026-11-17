@@ -41,6 +41,8 @@ const platforms = [
   {id:'xhs', name:'小红书', mark:'小红书'},
   {id:'youzan', name:'有赞', mark:'赞'},
   {id:'jd', name:'京东', mark:'JD'},
+  {id:'dewu', name:'得物', mark:'得', independent:true},
+  {id:'bilibili', name:'bilibili', mark:'哔', independent:true},
 ];
 const platform = id => platforms.find(p => p.id === id);
 const logo = p => `<span class="platform-logo ${p.id}" aria-hidden="true">${p.mark}</span>`;
@@ -52,9 +54,12 @@ const modes = [
 const state = {selected:['douyin','jd','xhs'], product:null, products:[], productFilter:'unprocessed', mode:'save', learning:true,
   operation:'platforms', history:[], historySearchResults:null, historySearchTotal:0, active:null, opened:null, draft:null, admin:false, learningAvailable:false, reviewCount:0};
 const labels = {pending:'等待执行', running:'运行中', waiting_review:'等待审核', stopping:'正在停止',
-  stopped:'已停止', interrupted:'运行中断', failed:'失败', completed:'已完成', success:'已完成'};
+  stopped:'已停止', interrupted:'运行中断', failed:'失败', completed:'已完成', success:'已完成', skipped:'已跳过'};
 const errors = {
-  products_unavailable:'商品目录暂不可用，请连接美工共享盘并确认当月文件夹，再刷新列表。',
+  dewu_products_unavailable:'得物上款目录暂不可用，请连接美工共享盘后刷新。',
+  invalid_product_source:'商品目录来源不正确，请重新选择平台和商品。',
+  review_submission_confirmation_required:'请确认本次要向得物提交审核。',
+  products_unavailable:'产品资料库暂不可用，请连接共享文件盘并确认 products 目录，再刷新列表。',
   product_not_found:'商品已移动或删除，请刷新后重新选择。', product_unreadable:'无法读取这个商品的 Excel，请检查文件。',
   product_excel_missing:'请在当前商品文件夹中放入产品信息.xlsx，再刷新列表。',
   product_excel_ambiguous:'这个商品匹配到多个 Excel，请将确认的产品信息.xlsx 放入当前商品文件夹。',
@@ -66,12 +71,26 @@ const errors = {
   folder_open_unavailable:'审核服务所在电脑不支持打开文件夹。', folder_open_failed:'文件夹未能打开，请检查共享盘是否已连接。',
 };
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const mode = () => modes.find(m => m.id === state.mode);
+const dewuModes = {
+  save:{id:'save', name:'保存草稿', description:'填写并保存得物草稿', icon:'save', note:'保存草稿后结束，不提交审核。'},
+  publish:{id:'publish', name:'提交审核', description:'校验通过后提交得物审核', icon:'upload', note:'会真实提交得物审核；平台校验错误会阻止提交。'},
+};
+const bilibiliModes = {
+  preview:{id:'preview', name:'仅填写', description:'填写并校验 B 站表单', icon:'edit', note:'只填写并校验，保留页面供检查。'},
+  save:{id:'save', name:'保存草稿', description:'保存 B 站商品草稿', icon:'save', note:'校验后保存 B 站草稿。'},
+  publish:{id:'publish', name:'发布商品', description:'校验后发布至 B 站店铺', icon:'upload', note:'将真实发布到当前登录的 B 站店铺。'},
+};
+const independent = operation => ['dewu','bilibili'].includes(operation);
+const modeFor = (operation, id) => operation === 'dewu' ? dewuModes[id] : operation === 'bilibili' ? bilibiliModes[id] : modes.find(m => m.id === id);
+const mode = () => modeFor(state.operation, state.mode);
 const platformName = id => platform(id)?.name || (id === 'base' ? '基础资料' : id);
-const operationName = id => ({platforms:'平台资料',base:'基础资料',create:'新建商品'}[id] || id);
+const operationName = id => ({platforms:'平台资料',base:'基础资料',create:'新建商品',dewu:'得物独立上款',bilibili:'B 站独立上款'}[id] || id);
+const productSource = () => independent(state.operation) ? state.operation : 'default';
+const productApi = (suffix='', source=productSource()) => '/api/launcher/products'+suffix+(source !== 'default' ? '?source='+encodeURIComponent(source) : '');
+const emptyCatalogMessage = () => independent(state.operation) ? `${platformName(state.operation)}上款目录没有找到带产品信息.xlsx 的商品，补齐资料后刷新列表。` : '产品资料库没有找到带产品信息.xlsx 的商品，补齐资料后刷新列表。';
 const isActive = job => job && ['running','waiting_review','stopping'].includes(job.status);
 const uuid = () => crypto.randomUUID().replaceAll('-','');
-let toastTimer, pollTimer, productRetryTimer, historySearchTimer, productRequest = 0, historyRequest = 0, actionBusy = false;
+let toastTimer, pollTimer, productRetryTimer, historySearchTimer, productRequest = 0, catalogRequest = 0, historyRequest = 0, actionBusy = false, productLoading = false;
 
 async function api(path, data) {
   const response = await fetch(path, {method:data === undefined ? 'GET' : 'POST', credentials:'same-origin',
@@ -92,7 +111,7 @@ function toast(message) {
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
 function remember() {
   try {
-    const snapshot = {selected:state.selected, mode:state.mode, productId:state.product?.id};
+    const snapshot = {selected:state.selected, operation:state.operation, mode:state.mode, productId:state.product?.id};
     // `learning:false` was written by older builds even when the review
     // service was unavailable.  Keep an explicit preference under a new key
     // so that stale automatic state cannot disable review after a restart.
@@ -120,33 +139,62 @@ function renderPlatformSelection() {
 }
 function renderPlan() {
   const normal = state.operation === 'platforms';
+  const dewu = state.operation === 'dewu';
   const autoBase = normal && state.mode !== 'preview' && state.product && state.product.base_saved === false;
-  const ids = normal ? (autoBase ? ['base', ...state.selected] : state.selected) : ['base'];
-  $('platform-section').hidden = !normal;
+  const bili = state.operation === 'bilibili';
+  const ids = independent(state.operation) ? [state.operation] : normal ? (autoBase ? ['base', ...state.selected] : state.selected) : ['base'];
+  $('platform-section').hidden = !normal && !independent(state.operation);
   $('operation-banner').hidden = normal;
-  $('operation-label').textContent = `${operationName(state.operation)} · 保存快麦商品，不铺货`;
+  $('operation-label').textContent = bili ? `B 站独立上款 · ${mode().name}` : dewu ? `得物独立上款 · ${mode().name}` : `${operationName(state.operation)} · 保存快麦商品，不铺货`;
+  $('product-source-note').hidden = false;
+  $('product-source-note').textContent = independent(state.operation) ? `当前商品来自${platformName(state.operation)}上款专用目录` : '资料表与图片均来自原商品目录。';
+  $('platform-description').textContent = bili ? '直接在 B 站商家后台上款，使用当前商品的 Excel 和素材。' : dewu ? '得物独立运行，使用专用商品目录。选择其他平台可切回多平台流程。' : '点选一个或多个平台，运行顺序可在右侧调整。';
+  $('platform-footnote-copy').textContent = bili ? '默认保存草稿，可选择仅填写或发布商品。' : dewu ? '保存后可在运行记录中查看得物草稿。' : '只处理选中的平台，沿用各平台已配置的店铺。';
+  $('start-caption').textContent = bili ? mode().note : dewu ? (state.mode === 'publish' ? '校验通过后提交得物审核' : '保存草稿后结束，不提交审核') : '默认只保存，可按需选择其他模式';
+  $('page-footnote-copy').textContent = bili ? 'B 站独立上款 · 与其他平台共用学习库和审核流程' : dewu ? '默认保存草稿；选择提交审核并确认后，将提交到得物后台'  : '与命令行共用执行程序和学习库 · 审核后自动继续当前任务';
+  $('mode-grid').classList.toggle('dewu-mode', dewu);
   $('plan-count').textContent = normal ? `${ids.length} 个平台` : operationName(state.operation);
   $('plan-list').innerHTML = ids.map((id,index) => {
     const p = platform(id);
-    const name = normal ? platformName(id) : operationName(state.operation);
+    const name = normal || independent(state.operation) ? platformName(id) : operationName(state.operation);
     const reorder = normal && id !== 'base' ? `<div class="reorder"><button data-move="${id}" data-direction="-1" aria-label="上移${name}" ${index === 0 || ids[index - 1] === 'base' ? 'disabled' : ''}>${icon('up')}</button><button data-move="${id}" data-direction="1" aria-label="下移${name}" ${index === ids.length-1 ? 'disabled' : ''}>${icon('down')}</button></div>` : '';
     return `<li><span class="queue-number">${index+1}</span><span class="queue-logo">${p ? logo(p) : icon('box')}</span><span class="queue-name">${name}</span>${reorder}</li>`;
   }).join('');
   $('empty-plan').hidden = ids.length > 0;
-  $('preview-run').disabled = !state.admin || !state.product || state.product.runnable === false || !ids.length || !!state.active;
+  $('preview-run').disabled = !state.admin || !state.product || productLoading || state.product.runnable === false || !ids.length || !!state.active;
   $('preview-run').innerHTML = icon('play') + (state.active ? '已有任务运行中' : '开始运行') + icon('arrow');
   $('plan-mode').textContent = mode().name;
-  $('plan-learning').innerHTML = state.learning && normal ? '<i></i>已开启' : '已关闭';
+  $('plan-learning').innerHTML = state.learning && (normal || independent(state.operation)) ? '<i></i>已开启' : '已关闭';
   $('mode-note').classList.toggle('publish', state.mode === 'publish');
   const baseNote = autoBase ? '新商品会先保存基础资料，再继续所选平台。' : '';
   $('mode-note').innerHTML = icon(state.mode === 'publish' ? 'info' : 'shield') + `<p>${baseNote || mode().note}</p>`;
-  $('learning-toggle').disabled = !normal || !state.learningAvailable;
-  $('learning-toggle').checked = state.learning && normal;
+  $('learning-toggle').disabled = !(normal || independent(state.operation)) || !state.learningAvailable;
+  $('learning-toggle').checked = state.learning && (normal || independent(state.operation));
+  $('learning-toggle').closest('.learning-row').hidden = false;
   document.querySelectorAll('[data-mode]').forEach(button => {
-    button.disabled = !normal && button.dataset.mode !== 'save';
+    const description = modeFor(state.operation, button.dataset.mode) || modes.find(m => m.id === button.dataset.mode);
+    button.querySelector('.mode-top > span').textContent = description.name;
+    button.querySelector('p').textContent = description.description;
+    button.hidden = dewu && button.dataset.mode === 'preview';
+    button.disabled = normal || bili ? false : dewu ? button.dataset.mode === 'preview' : button.dataset.mode !== 'save';
     button.setAttribute('aria-checked', String(button.dataset.mode === state.mode));
     button.tabIndex = button.dataset.mode === state.mode ? 0 : -1;
   });
+}
+function setOperation(operation) {
+  const sourceChanged = (independent(operation) ? operation : 'default') !== productSource();
+  const operationChanged = operation !== state.operation;
+  state.operation = operation;
+  if (operationChanged || operation !== 'platforms' || sourceChanged) state.mode = 'save';
+  if (!independent(operation)) state.selected = state.selected.filter(id => !platform(id)?.independent);
+  if (sourceChanged) {
+    ++productRequest; ++catalogRequest; productLoading = false;
+    clearTimeout(productRetryTimer); productRetryTimer = null;
+    state.product = null; state.products = []; state.draft = null;
+    renderProducts(); renderProduct();
+    loadProducts();
+  }
+  renderPlatformSelection(); remember();
 }
 function setMode(id) { state.mode = id; renderPlan(); remember(); }
 function showView(view, reviewRun='', reviewId='') {
@@ -189,15 +237,17 @@ $('copy-diagnostics').onclick = async () => {
   finally { button.disabled = false; }
 };
 $('logout').onclick = async () => { try { await api('/api/logout', {}); location.assign('/'); } catch (e) { toast(e.message); } };
-$('platform-grid').innerHTML = platforms.map(p => `<button class="platform-card" data-platform="${p.id}" aria-label="${p.name}" aria-pressed="false">${logo(p)}<span class="platform-name">${p.name}</span><span class="select-check">${icon('check')}</span></button>`).join('');
+$('platform-grid').innerHTML = platforms.map(p => `<button class="platform-card${p.independent ? ' independent-platform' : ''}" data-platform="${p.id}" aria-label="${p.name}" aria-pressed="false">${logo(p)}<span class="platform-name">${p.name}${p.independent ? '<small>独立上款</small>' : ''}</span><span class="select-check">${icon('check')}</span></button>`).join('');
 $('platform-grid').onclick = event => {
   const button = event.target.closest('[data-platform]'); if (!button) return;
   const id = button.dataset.platform;
+  if (platform(id)?.independent) { state.selected = [id]; setOperation(id); return; }
+  if (independent(state.operation)) { state.selected = [id]; setOperation('platforms'); return; }
   state.selected = state.selected.includes(id) ? state.selected.filter(item => item !== id) : [...state.selected,id];
   renderPlatformSelection(); remember();
 };
-$('select-all').onclick = () => { state.selected = [...state.selected, ...platforms.map(p => p.id).filter(id => !state.selected.includes(id))]; renderPlatformSelection(); remember(); };
-$('clear-all').onclick = () => { state.selected = []; renderPlatformSelection(); remember(); };
+$('select-all').onclick = () => { state.selected = [...state.selected.filter(id => !platform(id)?.independent), ...platforms.filter(p => !p.independent).map(p => p.id).filter(id => !state.selected.includes(id))]; setOperation('platforms'); };
+$('clear-all').onclick = () => { state.selected = []; setOperation('platforms'); };
 $('plan-list').onclick = event => {
   const button = event.target.closest('[data-move]'); if (!button || button.disabled) return;
   const index = state.selected.indexOf(button.dataset.move), target = index + Number(button.dataset.direction);
@@ -208,19 +258,22 @@ $('plan-list').onclick = event => {
 $('mode-grid').innerHTML = modes.map(m => `<button class="mode-card" role="radio" data-mode="${m.id}" aria-checked="false"><div class="mode-top">${icon(m.icon)}<span>${m.name}</span><span class="radio-mark"></span></div><p>${m.description}</p></button>`).join('');
 $('mode-grid').onclick = event => { const button = event.target.closest('[data-mode]'); if (button && !button.disabled) setMode(button.dataset.mode); };
 $('mode-grid').onkeydown = event => {
-  if (!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key) || state.operation !== 'platforms') return;
-  event.preventDefault(); const index = modes.findIndex(m => m.id === state.mode);
-  setMode(modes[(index+(['ArrowLeft','ArrowUp'].includes(event.key) ? 2 : 1))%3].id);
+  if (!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key) || !['platforms','dewu','bilibili'].includes(state.operation)) return;
+  event.preventDefault(); const options = state.operation === 'dewu' ? Object.values(dewuModes) : state.operation === 'bilibili' ? Object.values(bilibiliModes) : modes;
+  const index = options.findIndex(m => m.id === state.mode);
+  setMode(options[(index+(['ArrowLeft','ArrowUp'].includes(event.key) ? options.length - 1 : 1))%options.length].id);
   document.querySelector(`[data-mode="${state.mode}"]`).focus();
 };
 $('learning-toggle').onchange = event => { state.learning = event.target.checked; renderPlan(); remember(); };
 document.querySelectorAll('[data-operation]').forEach(button => button.onclick = () => {
-  state.operation = button.dataset.operation; state.mode = 'save'; $('more-dialog').close(); renderPlan();
+  $('more-dialog').close(); setOperation(button.dataset.operation);
 });
-$('back-platforms').onclick = () => { state.operation = 'platforms'; renderPlan(); };
+$('back-platforms').onclick = () => setOperation('platforms');
 
 async function chooseProduct(id) {
   const request = ++productRequest;
+  const source = productSource();
+  productLoading = true;
   // Keep the selected card visible while the workbook details are loading.
   // Clearing it first made a normal SMB read look like the page had frozen.
   const summary = state.products.find(item => item.id === id);
@@ -232,11 +285,12 @@ async function chooseProduct(id) {
     renderProduct();
   }
   try {
-    const p = await api('/api/launcher/products/'+id);
-    if (request !== productRequest) return;
+    const p = await api(productApi('/'+id, source));
+    if (request !== productRequest || source !== productSource()) return;
+    productLoading = false;
     state.product = p; renderProduct(); remember(); $('product-dialog').close();
     notice(p.runnable === false ? (p.excel_status === 'ambiguous' ? errors.product_excel_ambiguous : errors.product_excel_missing) : '');
-  } catch (e) { if (request === productRequest) notice(e.message); }
+  } catch (e) { if (request === productRequest) { productLoading = false; renderPlan(); notice(e.message); } }
 }
 function productIdentity(p) {
   const folder = p.folder || p.title || '';
@@ -263,21 +317,25 @@ function renderProducts() {
     const {name, code, folder} = productIdentity(p);
     const selected = p.id === state.product?.id;
     return `<button class="product-choice ${selected ? 'selected' : ''}" data-product="${escapeHTML(p.id)}" aria-pressed="${selected}">
-      <span class="choice-image">${icon('shirt')}<img src="${escapeHTML(p.image || '/api/launcher/products/'+encodeURIComponent(p.id)+'/image')}" alt="" loading="lazy" decoding="async"></span>
+      <span class="choice-image">${icon('shirt')}<img src="${escapeHTML(p.image || productApi('/'+encodeURIComponent(p.id)+'/image'))}" alt="" loading="lazy" decoding="async"></span>
       <span class="choice-info"><strong title="${escapeHTML(folder)}">${escapeHTML(name)}</strong><span class="choice-code">${escapeHTML(p.runnable === false ? (p.excel_status === 'ambiguous' ? '待确认 Excel' : '待补充 Excel') : code || 'Excel 资料已就绪')}</span>${p.processed ? `<span class="product-status-note" title="${escapeHTML((p.processed_platforms || []).join('、'))}">已保存 · ${escapeHTML((p.processed_platforms || []).join('、') || '商品资料')}</span>` : ''}</span>
       <span class="choice-state">${selected ? `<span>当前商品</span>${icon('check')}` : icon('chevron')}</span>
     </button>`;
   }).join('');
   $('product-list').querySelectorAll('img').forEach(img => { img.onerror = () => img.remove(); });
   $('product-empty').hidden = products.length > 0;
-  $('product-empty').textContent = !state.products.length ? '当月目录没有找到带产品信息.xlsx 的商品，补齐资料后刷新列表。' : terms.length ? '没有匹配的商品，试试其他关键词或切换到“全部”。' : state.productFilter === 'unprocessed' ? '当前商品都有保存记录了，可到“已处理”查看或继续处理其他平台。' : '这个分组暂时没有商品。';
+  $('product-empty').textContent = !state.products.length ? emptyCatalogMessage() : terms.length ? '没有匹配的商品，试试其他关键词或切换到“全部”。' : state.productFilter === 'unprocessed' ? '当前商品都有保存记录了，可到“已处理”查看或继续处理其他平台。' : '这个分组暂时没有商品。';
 }
 async function loadProducts(preferred, refreshOnly = false) {
+  const request = ++catalogRequest;
+  const source = productSource();
   clearTimeout(productRetryTimer); productRetryTimer = null;
   $('refresh-products').disabled = true;
   try {
-    const data = await api('/api/launcher/products'); state.products = data.products; renderProducts();
-    notice(state.products.length ? (!state.admin ? errors.admin_required : '') : '当月目录没有找到带产品信息.xlsx 的商品，补齐资料后刷新列表。');
+    const data = await api(productApi('', source));
+    if (request !== catalogRequest || source !== productSource()) return;
+    state.products = data.products; renderProducts();
+    notice(state.products.length ? (!state.admin ? errors.admin_required : '') : emptyCatalogMessage());
     const selected = state.products.find(p => p.id === (preferred || state.product?.id)) || state.products.find(p => p.runnable !== false && !p.processed) || state.products.find(p => p.runnable !== false) || state.products[0];
     if (!refreshOnly) {
       if (selected) await chooseProduct(selected.id); else { state.product = null; renderProduct(); }
@@ -287,13 +345,14 @@ async function loadProducts(preferred, refreshOnly = false) {
       else { state.product = {...state.product, ...current}; renderProduct(); }
     }
   } catch (e) {
+    if (request !== catalogRequest || source !== productSource()) return;
     state.product = null; renderProduct(); notice(e.message);
-    if (e.message === errors.products_unavailable) {
+    if (e.message === errors.products_unavailable || e.message === errors.dewu_products_unavailable) {
       productRetryTimer = setTimeout(() => loadProducts(preferred, refreshOnly), 5000);
       notice(`${e.message} 正在自动重试…`);
     }
   }
-  finally { $('refresh-products').disabled = false; }
+  finally { if (request === catalogRequest) $('refresh-products').disabled = false; }
 }
 $('change-product').onclick = () => { $('product-search').value=''; renderProducts(); openDialog('product-dialog'); $('product-search').focus(); loadProducts(undefined, true); };
 $('open-product-folder').onclick = async () => {
@@ -301,7 +360,7 @@ $('open-product-folder').onclick = async () => {
   if (!id) { toast('请先选择商品。'); return; }
   if (!state.admin) { toast(errors.admin_required); return; }
   $('open-product-folder').disabled = true;
-  try { await api('/api/launcher/products/'+encodeURIComponent(id)+'/open-folder', {}); toast('已在审核服务所在电脑打开商品文件夹'); }
+  try { await api(productApi('/'+encodeURIComponent(id)+'/open-folder'), {}); toast('已在审核服务所在电脑打开商品文件夹'); }
   catch (e) { toast(e.message); }
   finally { $('open-product-folder').disabled = !state.product || !state.admin; }
 };
@@ -317,7 +376,7 @@ function renderHistory() {
   $('history-results').textContent = searching
     ? jobs === null ? '正在搜索运行记录…' : `找到 ${state.historySearchTotal} 条记录`
     : `最近 ${state.history.length} 条运行记录`;
-  $('history-list').innerHTML = jobs?.length ? jobs.map(job => `<button class="history-row" data-job="${job.id}"><div><strong>${escapeHTML(job.style_code)} · ${escapeHTML(job.title)}</strong><p>${escapeHTML(job.platforms.map(platformName).join(' → '))} · ${modes.find(m=>m.id===job.mode)?.name || ''}<br>${escapeHTML(new Date(job.created_at).toLocaleString('zh-CN'))} · ${escapeHTML(job.created_by)}</p></div><span class="history-status ${job.status}">${labels[job.status] || job.status} ${icon('chevron')}</span></button>`).join('') : `<p class="empty-message">${searching ? jobs === null ? '正在搜索…' : '没有匹配的运行记录。' : '还没有网页运行记录。开始一次任务后会记录在这里。'}</p>`;
+  $('history-list').innerHTML = jobs?.length ? jobs.map(job => `<button class="history-row" data-job="${job.id}"><div><strong>${escapeHTML(job.style_code)} · ${escapeHTML(job.title)}</strong><p>${escapeHTML(job.platforms.map(platformName).join(' → '))} · ${modeFor(job.operation, job.mode)?.name || ''}<br>${escapeHTML(new Date(job.created_at).toLocaleString('zh-CN'))} · ${escapeHTML(job.created_by)}</p></div><span class="history-status ${job.status}">${labels[job.status] || job.status} ${icon('chevron')}</span></button>`).join('') : `<p class="empty-message">${searching ? jobs === null ? '正在搜索…' : '没有匹配的运行记录。' : '还没有网页运行记录。开始一次任务后会记录在这里。'}</p>`;
 }
 async function loadHistorySearch() {
   const query = $('history-search').value.trim();
@@ -343,14 +402,32 @@ $('history-search').oninput = () => {
 $('history-list').onclick = event => { const b = event.target.closest('[data-job]'); if (b) openJob(b.dataset.job); };
 $('active-job').onclick = () => { if (state.active) openJob(state.active.id); };
 function renderJob(job) {
+  const dewu = job.operation === 'dewu';
+  const bili = job.operation === 'bilibili';
   if (job.base_auto_added && job.product_id === state.product?.id &&
       job.stages?.some(stage => stage.platform === 'base' && stage.status === 'success')) {
     state.product.base_saved = true;
     renderPlan();
   }
   $('run-title').textContent = `${job.style_code} · ${labels[job.status] || job.status}`;
-  $('run-subtitle').textContent = isActive(job) ? '关闭此窗口不影响任务。需要人工确认时可进入商品属性审核。' : '以下为实际运行结果；已保存或已铺货的操作不会因关闭窗口而撤回。';
-  $('run-summary').innerHTML = `<span>商品</span><strong>${escapeHTML(job.style_code)}</strong><span>执行模式</span><strong>${modes.find(m=>m.id===job.mode)?.name}</strong><span>任务编号</span><strong>${job.id.slice(0,8)}</strong>`;
+  $('run-subtitle').textContent = bili ? `B 站独立上款 · ${modeFor(job.operation, job.mode)?.name}。${isActive(job) ? '关闭此窗口不影响任务。' : ''}` : dewu ? (job.dewu_status === 'submitted_for_review' || job.dewu_status === 'already_submitted' ? '已提交得物审核。' : job.mode === 'publish' ? '得物独立上款，校验通过后提交审核。关闭此窗口不影响任务。' : '得物独立上款，只保存草稿，不提交审核。关闭此窗口不影响任务。') : isActive(job) ? '关闭此窗口不影响任务。需要人工确认时可进入商品属性审核。' : '以下为实际运行结果；已保存或已铺货的操作不会因关闭窗口而撤回。';
+  $('run-summary').innerHTML = `<span>商品</span><strong>${escapeHTML(job.style_code)}</strong><span>执行模式</span><strong>${modeFor(job.operation, job.mode)?.name}</strong><span>任务编号</span><strong>${job.id.slice(0,8)}</strong>`;
+  const draftLink = $('dewu-draft-link');
+  let draftUrl = null;
+  try {
+    const parsed = new URL(job.draft_url);
+    if (dewu && parsed.protocol === 'https:' && parsed.hostname === 'stark.dewu.com' &&
+        (!parsed.port || parsed.port === '443') && !parsed.username && !parsed.password &&
+        /^\/vueProduct\/newProductApply\/spuEdit\/operation\/\d+$/.test(parsed.pathname)) draftUrl = parsed.href;
+  } catch (_) { /* No verified draft address yet. */ }
+  if (bili && job.draft_url) {
+    try { const parsed = new URL(job.draft_url);
+      if (parsed.protocol === 'https:' && parsed.hostname === 'shop.bilibili.com' && !parsed.username && !parsed.password && (!parsed.port || parsed.port === '443') && parsed.pathname === '/' && /^#\/g\/goods\/publish\?draftId=\d+$/.test(parsed.hash)) draftUrl = parsed.href;
+    } catch (_) {}
+  }
+  draftLink.textContent = bili ? '查看 B 站草稿' : '查看得物草稿';
+  draftLink.hidden = !draftUrl;
+  if (draftUrl) draftLink.href = draftUrl; else draftLink.removeAttribute('href');
   $('run-stages').innerHTML = job.stages.map(s => `<div class="run-stage ${s.status === 'success' ? 'done' : s.status}">${platform(s.platform) ? logo(platform(s.platform)) : icon('box')}<span>${platformName(s.platform)}</span><span class="run-stage-status">${labels[s.status] || s.status}</span></div>`).join('');
   $('log-details').hidden = false;
   let judgment = $('model-judgment-details');
@@ -377,7 +454,10 @@ function renderJob(job) {
     ['待处理审核',`${job.pending_reviews || 0} 项`],['异常',`${(summary.unavailable_count || 0)+(summary.rejected_count || 0)} 次`]];
   const visibleEvents = events.filter(row => row.status !== 'skipped' &&
     !decisions.some(decision => decision.key === row.key || decision.request_key === row.key));
-  const cards = [...decisions, ...visibleEvents].filter(row => row.selected_labels?.length);
+  const cards = [...decisions, ...visibleEvents].filter(row => row.selected_labels?.length &&
+    !(job.review_tasks || []).some(task => ['pending','claimed'].includes(task.status) &&
+      task.platform_id === row.platform_id && task.field_id === row.field_id &&
+      task.snapshot_version === row.snapshot_version));
   const activityHTML = visibleEvents.filter(row => ['requesting','unavailable','rejected'].includes(row.status))
     .map(row => `<p class="model-explanation"><strong>${escapeHTML(platformName(row.platform_id))} · ${escapeHTML(row.field_label)} · ${escapeHTML(judgmentStates[row.status])}</strong><br>${escapeHTML(row.reason || '')}</p>`).join('');
   const expandedTraces = new Set([...judgment.querySelectorAll('.model-trace[open]')].map(node => node.closest('article').dataset.judgmentKey));
@@ -428,19 +508,20 @@ async function openJob(id) {
   catch(e) { toast(e.message); }
 }
 $('preview-run').onclick = () => {
-  if (!state.product || state.active || !state.admin) return;
+  if (!state.product || productLoading || state.active || !state.admin) return;
+  const dewu = state.operation === 'dewu';
   state.opened = null;
-  state.draft = {request_key:uuid(), product_id:state.product.id, platforms:[...state.selected], mode:state.mode,
-    operation:state.operation, learning:state.operation === 'platforms' && state.learning};
+  state.draft = {request_key:uuid(), product_id:state.product.id, platforms:independent(state.operation) ? [state.operation] : [...state.selected], mode:state.mode,
+    operation:state.operation, learning:(state.operation === 'platforms' || independent(state.operation)) && state.learning};
   $('run-title').textContent = '确认这次运行';
   const autoBase = state.operation === 'platforms' && state.mode !== 'preview' && state.product.base_saved === false;
-  const runIds = state.operation === 'platforms' ? (autoBase ? ['base', ...state.selected] : state.selected) : ['base'];
-  $('run-subtitle').textContent = autoBase ? '本次会先保存基础资料，再继续所选平台。' : state.mode === 'publish' ? '本次会真实保存并铺货到已配置的店铺，请核对商品与平台。' : state.mode === 'save' ? '本次会保存快麦商品资料，不提交到店铺。' : '本次只填写并校验，不保存、不铺货。';
+  const runIds = independent(state.operation) ? [state.operation] : state.operation === 'platforms' ? (autoBase ? ['base', ...state.selected] : state.selected) : ['base'];
+  $('run-subtitle').textContent = state.operation === 'bilibili' ? (state.mode === 'publish' ? '将向当前登录的 B 站店铺发布商品，请核对商品。' : mode().note) : dewu ? (state.mode === 'publish' ? '本次会真实提交得物审核，请核对商品；平台校验错误将阻止提交。' : '本次使用得物专用商品资料，填写并保存草稿，不提交审核。') : autoBase ? '本次会先保存基础资料，再继续所选平台。' : state.mode === 'publish' ? '本次会真实保存并铺货到已配置的店铺，请核对商品与平台。' : state.mode === 'save' ? '本次会保存快麦商品资料，不提交到店铺。' : '本次只填写并校验，不保存、不铺货。';
   $('run-summary').innerHTML = `<span>商品</span><strong>${escapeHTML(state.product.style_code)}</strong><span>执行模式</span><strong>${mode().name}</strong><span>处理范围</span><strong>${runIds.map(platformName).join(' → ')}</strong>`;
-  $('run-stages').replaceChildren(); $('log-details').hidden = true; $('run-error').hidden = true; $('run-review').hidden = true;
+  $('run-stages').replaceChildren(); $('log-details').hidden = true; $('run-error').hidden = true; $('run-review').hidden = true; $('dewu-draft-link').hidden = true;
   if ($('model-judgment-details')) $('model-judgment-details').hidden = true;
   $('run-confirm').hidden = false; $('run-confirm').disabled = false;
-  $('run-confirm').textContent = state.mode === 'publish' ? '确认保存并铺货' : '确认开始';
+  $('run-confirm').textContent = state.operation === 'bilibili' ? (state.mode === 'publish' ? '确认发布商品' : '确认开始') : dewu ? (state.mode === 'publish' ? '确认提交审核' : '确认保存草稿') : state.mode === 'publish' ? '确认保存并铺货' : '确认开始';
   $('run-secondary').textContent = '返回调整'; $('run-secondary').disabled = false; $('run-secondary').classList.remove('stop');
   openDialog('run-dialog');
 };
@@ -486,7 +567,11 @@ async function poll() {
 async function boot() {
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem('kuaimai.workbench') || '{}'); } catch (_) {}
-  if (Array.isArray(saved.selected)) state.selected = [...new Set(saved.selected.filter(id=>platform(id)))];
+  if (saved.operation === 'bilibili' || (Array.isArray(saved.selected) && saved.selected.length === 1 && saved.selected[0] === 'bilibili')) {
+    state.operation = 'bilibili'; state.selected = ['bilibili'];
+  } else if (saved.operation === 'dewu' || (Array.isArray(saved.selected) && saved.selected.length === 1 && saved.selected[0] === 'dewu')) {
+    state.operation = 'dewu'; state.selected = ['dewu'];
+  } else if (Array.isArray(saved.selected)) state.selected = [...new Set(saved.selected.filter(id=>platform(id) && !platform(id).independent))];
   // Every new session defaults to saving only; publishing needs a deliberate choice.
   state.mode = 'save';
   renderProduct(); renderPlatformSelection();

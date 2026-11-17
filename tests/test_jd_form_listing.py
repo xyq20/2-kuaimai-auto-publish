@@ -21,6 +21,7 @@ from jd_form_listing import (
     JdFormListingError,
     _category_parts,
     _jd_category_matches,
+    _required_excel_value,
     classify_image_indices_by_color,
     _expand_cascader_candidates,
     _kilograms,
@@ -36,6 +37,25 @@ from taobao_listing import parse_taobao_materials, selection_value_groups
 
 
 class JdFormListingHelperTests(unittest.TestCase):
+    def test_belt_keeps_authored_paths_and_matches_platform_group(self):
+        paths = ("服装 > 服装配饰 > 腰带/皮带/腰链",
+                 "服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带")
+        hints, target = jd_category_target({"商品分类": "/".join(paths)}, category_hints=paths)
+        self.assertEqual(hints, paths)
+        self.assertEqual(target, "腰带/皮带/腰链")
+        self.assertTrue(_jd_category_matches("服饰内衣 > 服饰配件 > 腰带/腰链", hints, target))
+        for path in ("服饰内衣 > 服饰配件", "服饰内衣 > 服饰配件 > 领带", "女装 > 女士皮带"):
+            self.assertFalse(_jd_category_matches(path, hints, target))
+
+    def test_belt_prices_ignore_unit_only_template_but_keep_conflicts_blocking(self):
+        fields = {"商品分类": "服装 > 服装配饰 > 腰带/皮带/腰链",
+                  "吊牌价/价格/基本售价/商品价格": "元", "价格/京东价/市场价/售价": "298"}
+        self.assertEqual(_required_excel_value(fields, ("京东价", "价格", "基本售价", "商品价格"), "京东价", money=True), "298")
+        with self.assertRaises(JdFormListingError):
+            _required_excel_value({**fields, "京东价": "299"}, ("京东价", "价格"), "京东价", money=True)
+        with self.assertRaises(JdFormListingError):
+            _required_excel_value({**fields, "商品分类": "男装 > 牛仔裤"}, ("京东价", "价格"), "京东价", money=True)
+
     def test_mens_shoe_current_category_accepts_excel_alternative(self):
         hints, target = jd_category_target({"商品分类": "流行男鞋 > 时尚单鞋 >休闲皮鞋/正装皮鞋/男士德比鞋/皮鞋"})
         self.assertTrue(_jd_category_matches("鞋靴 > 流行男鞋 > 男士商务/正装皮鞋", hints, target))
@@ -102,13 +122,33 @@ class JdFormListingHelperTests(unittest.TestCase):
             [(item.name, item.percentage) for item in _jd_material_components("棉（100%）")],
             [("棉", 100)],
         )
-        self.assertEqual(_jd_material_components("棉"), ())
+        self.assertEqual(
+            [(item.name, item.percentage) for item in _jd_material_components("棉")],
+            [("棉", 100)],
+        )
         self.assertEqual(
             _material_option_desired("氨纶"),
             "氨纶/聚氨酯弹性纤维(氨纶)/氨纶(聚氨酯弹性纤维)",
         )
         with self.assertRaisesRegex(JdFormListingError, "京东"):
             _jd_material_components("棉60%,涤纶30%")
+
+    def test_material_parser_preserves_historical_compositions(self):
+        # 历史产品表通常提供比例；轰炸机的“羊皮”仍需兼容单材质 100%。
+        cases = (
+            ("棉100%/棉", [("棉", 100)]),
+            ("涤纶/涤纶100%", [("涤纶", 100)]),
+            ("羊毛100%", [("羊毛", 100)]),
+            ("羊毛50%，腈纶50%", [("羊毛", 50), ("腈纶", 50)]),
+            ("羊皮", [("羊皮", 100)]),
+            ("棉（95.4%），聚脂钎维（4.6%）", [("棉", 95.4), ("聚脂钎维", 4.6)]),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(
+                    [(item.name, item.percentage) for item in _jd_material_components(source)],
+                    expected,
+                )
 
     def test_kilograms(self):
         self.assertEqual(_kilograms("430g"), "0.43")
@@ -1101,7 +1141,8 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(actual)
         self.assertEqual(len(resolve_calls), 1)
         request = resolve_calls[0]
-        self.assertTrue(request.custom_allowed)
+        self.assertFalse(request.custom_allowed)
+        self.assertTrue(request.evidence["selection_only"])
         self.assertEqual(request.excel_value, "通用")
         self.assertEqual(request.field_label, "适用人群")
         self.assertNotIn(
@@ -1112,6 +1153,69 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await item.locator("input").first.input_value(), "长裤"
         )
+
+    async def test_searchable_valueid_field_only_reviews_persistable_candidates(self):
+        await self.page.set_content(
+            '<div class="el-select"><input class="el-input__inner" value="外穿"></div>'
+        )
+        select = self.page.locator('.el-select')
+        await select.evaluate("""element => {
+          element.__vue__ = {filterable: true, allowCreate: false, multiple: false};
+        }""")
+        runtime = SimpleNamespace(resolve=AsyncMock(return_value=None),
+                                  reusable_choice=lambda request: None)
+        listing = JdFormListing(self.page, self.page.locator('body'), None,
+                                attribute_runtime=runtime)
+        for label in ('穿着方式', '其他类目的新属性'):
+            with self.subTest(label=label):
+                field = parse_jd_attribute_fields({'properties': [{
+                    'propId': 'wear', 'propertyName': label, 'canNote': True,
+                    'propertyValues': [
+                        {'valueId': '101', 'valueName': '套头'},
+                        {'valueId': '102', 'valueName': '开衫'},
+                    ],
+                }]})[0]
+                listing._captured_api_field = AsyncMock(return_value=(field, 'vest'))
+                listing._open_select = AsyncMock()
+                listing._dismiss_select_dropdown = AsyncMock()
+                listing._visible_dom_options = AsyncMock(return_value=(object(), [
+                    {'value': '101', 'name': '套头'},
+                    {'value': '102', 'name': '开衫'},
+                    {'value': '外穿', 'name': '外穿', 'created': True},
+                ]))
+                listing._set_select_values_directly = AsyncMock(
+                    side_effect=AssertionError('搜索文字不能作为平台新值提交'))
+
+                self.assertIsNone(await listing._resolve_learning_select_value(
+                    label, select, '外穿'))
+                request = runtime.resolve.await_args.args[0]
+                self.assertFalse(request.custom_allowed)
+                self.assertTrue(request.evidence['selection_only'])
+                self.assertEqual(tuple(c.label for c in request.candidates), ('套头', '开衫'))
+                listing._set_select_values_directly.assert_not_awaited()
+
+    async def test_shared_custom_input_policy_distinguishes_search_from_create_and_text(self):
+        from platform_candidate_source import select_supports_custom_value
+        await self.page.set_content(
+            '<div class="el-select"><input class="el-input__inner"></div>'
+            '<div class="el-form-item" id="plain-text">'
+            '<div class="el-form-item__content"><input class="el-input__inner"></div></div>'
+        )
+        select = self.page.locator('.el-select')
+        await select.evaluate("""element => {
+          element.__vue__ = {filterable: true, allowCreate: false};
+        }""")
+        self.assertFalse(await select_supports_custom_value(select))
+        self.assertTrue(await select_supports_custom_value(select, schema_allowed=True))
+        await select.evaluate('element => { element.__vue__.allowCreate = true; }')
+        self.assertTrue(await select_supports_custom_value(select))
+        self.assertFalse(await select_supports_custom_value(select, save_rejected=True))
+        self.assertFalse(await select_supports_custom_value(select, requires_candidate_id=True))
+
+        listing = JdFormListing(self.page, self.page.locator('body'), None)
+        actual = await listing._fill_attribute_item(
+            '可保存的文本属性', self.page.locator('#plain-text'), '自定义内容', required=False)
+        self.assertEqual(actual, ('自定义内容',))
 
     async def test_learning_expands_elasticity_alias_before_excel_direct_input(self):
         await self.page.set_content(
@@ -1570,6 +1674,17 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["row_count"], 2)
         self.assertEqual(report["values"], ("棉", "氨纶"))
         self.assertEqual(report["percentages"], ("94", "6"))
+
+        actual = await listing._fill_attribute_item(
+            "材质", item, "棉95.4%，氨纶4.6%", required=True
+        )
+        self.assertEqual(actual, ("棉", "氨纶"))
+        self.assertEqual([await box.input_value() for box in await listing._editable_inputs(item)],
+                         ["95.4", "4.6"])
+        report = await listing._verify_single_material(
+            parse_jd_fields({"材质成分/材质": "棉95.4%，氨纶4.6%"})
+        )
+        self.assertEqual(report["percentages"], ("95.4", "4.6"))
 
     async def test_annotated_jd_material_beats_substring_option(self):
         # 2026-09-21 线上中断：京东候选同时有“氨纶(聚氨酯弹性纤维)”与独立的
@@ -2438,6 +2553,50 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["厚度"], "常规")
         self.assertTrue(await self.page.evaluate("window.skuAttributesRefreshed"))
 
+    def _sku_with_extra_required_fit(self):
+        fixture = SKU_ATTRIBUTE_HEADER_FIXTURE.replace(
+            'id="thickness-item" class="el-form-item" style="display:none"',
+            'id="thickness-item" class="el-form-item"',
+        )
+        extra = '''<div class="el-form-item is-required" id="sku-fit">
+          <label class="el-form-item__label">版型</label>
+          <div class="el-form-item__content"><div class="el-select">
+            <input class="el-input__inner" readonly onclick="this.parentElement.querySelector('.el-select-dropdown').style.display='block'">
+            <div class="el-select-dropdown" style="display:none"><ul>
+              <li class="el-select-dropdown__item" onclick="this.closest('.el-select').querySelector('input').value=this.textContent.trim();this.closest('.el-select-dropdown').style.display='none'">修身型</li>
+              <li class="el-select-dropdown__item" onclick="this.closest('.el-select').querySelector('input').value=this.textContent.trim();this.closest('.el-select-dropdown').style.display='none'">宽松型</li>
+            </ul></div>
+          </div></div>
+        </div><div class="el-form-item" id="sku-optional">
+          <label class="el-form-item__label">适用温度</label><div class="el-form-item__content"><input value="原值"></div>
+        </div>'''
+        return fixture.replace('<button onclick="closeSkuDialog()">取消</button>', extra + '<button onclick="closeSkuDialog()">取消</button>')
+
+    async def test_sku_batch_fills_all_required_fields_from_excel_in_order(self):
+        listing = await self._open(self._sku_with_extra_required_fit())
+        report = await listing.apply_sku_thickness({
+            '商品分类': '夹克', '裤脚口款式/服饰版型/版型': '宽松型/宽松',
+            '适用温度': '不要覆盖',
+        })
+        self.assertEqual(report, {'厚度': '常规', '版型': '宽松型'})
+        self.assertEqual(await self.page.locator('#sku-fit input').input_value(), '宽松型')
+        self.assertEqual(await self.page.locator('#sku-optional input').input_value(), '原值')
+
+    async def test_sku_required_field_missing_from_excel_stops_before_confirmation(self):
+        listing = await self._open(self._sku_with_extra_required_fit())
+        with self.assertRaisesRegex(JdFormListingError, '缺少京东SKU 属性.*版型'):
+            await listing.apply_sku_thickness({'商品分类': '夹克'})
+        self.assertTrue(await self.page.locator('#sku-dialog').is_visible())
+
+    async def test_sku_category_without_thickness_uses_its_required_fields(self):
+        fixture = self._sku_with_extra_required_fit().replace(
+            '<div id="thickness-item" class="el-form-item">',
+            '<div id="thickness-item" class="el-form-item" style="display:none">',
+        )
+        listing = await self._open(fixture)
+        report = await listing.apply_sku_thickness({'商品分类': '夹克', '服饰版型': '宽松型/宽松'})
+        self.assertEqual(report, {'版型': '宽松型'})
+
     async def test_mens_shoe_sku_uses_lining_instead_of_clothing_thickness(self):
         fixture = SKU_ATTRIBUTE_HEADER_FIXTURE.replace('>厚度<', '>内里材质<').replace('id="thickness-item" class="el-form-item" style="display:none"', 'id="thickness-item" class="el-form-item"')
         listing = await self._open(fixture)
@@ -2461,6 +2620,33 @@ class JdFormListingBrowserTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(candidates), 1)
         self.assertIn("男士休闲直筒裤", await candidates[0].inner_text())
+
+    async def test_belt_compatible_current_category_needs_no_search_or_review(self):
+        listing = await self._open('''
+          <button role="tab" aria-selected="true">京东资料</button>
+          <div role="tabpanel" aria-label="京东资料">
+            <div class="platform-category-input">商品分类：服饰内衣 > 服饰配件 > 腰带/腰链
+              <button onclick="window.modified=true">修改类目</button>
+            </div>
+          </div>
+        ''')
+        paths = ("服装 > 服装配饰 > 腰带/皮带/腰链",
+                 "服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带")
+        listing.category_hints = paths
+        listing._resolve_category_review = AsyncMock(side_effect=AssertionError("兼容当前类目无需审核"))
+        result = await listing.apply_category({"商品分类": "/".join(paths)})
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["selected"], "服饰内衣 > 服饰配件 > 腰带/腰链")
+        self.assertEqual(result["hints"], paths)
+        self.assertIsNone(await self.page.evaluate("window.modified"))
+
+    async def test_belt_buckle_alias_uses_style_and_keeps_material_separate(self):
+        listing = JdFormListing(self.page, self.page.locator("body"), None)
+        fields = {"商品分类": "服装 > 服装配饰 > 腰带/皮带/腰链",
+                  "带扣款式/腰带带扣款式": "针扣", "带扣材质": "铜"}
+        items = {"带扣": ("带扣", object())}
+        self.assertEqual(await listing._attribute_assignments(fields, items), {"带扣": ("带扣", "针扣")})
+        self.assertEqual(await listing._attribute_assignments({**fields, "商品分类": "男装 > 牛仔裤"}, items), {})
 
     async def test_category_search_advances_to_next_excel_alternative(self):
         searches = []

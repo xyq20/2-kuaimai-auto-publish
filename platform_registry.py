@@ -128,6 +128,30 @@ PLATFORM_SPECS: Tuple[PlatformSpec, ...] = (
         publish_allowed=True,
         discovery_adapter=None,
     ),
+    PlatformSpec(
+        cli_name="dewu",
+        platform_id="dewu",
+        display_name="得物独立上款",
+        tab_label="得物",
+        lifecycle="implemented",
+        enabled_in_all=False,
+        supports_inspect=False,
+        save_policy="allowed",
+        publish_allowed=False,
+        discovery_adapter=None,
+    ),
+    PlatformSpec(
+        cli_name="bilibili",
+        platform_id="bilibili",
+        display_name="bilibili独立上款",
+        tab_label="bilibili",
+        lifecycle="implemented",
+        enabled_in_all=False,
+        supports_inspect=False,
+        save_policy="allowed",
+        publish_allowed=True,
+        discovery_adapter=None,
+    ),
 )
 
 

@@ -30,7 +30,7 @@ REQUIRED_SERVICES = {
 # Never extend this list merely because another shop is visible on the page.
 FREIGHT_TEMPLATE_SHOPS = {
     "wxsph": ("NEIGBORL钊叔制鞋服",),
-    "xhs": ("钊叔的店", "啊亮製NEIGBORL的店", "钊叔制NEIGBORL的店"),
+    "xhs": ("Z钊叔制的店", "啊亮製NEIGBORL的店", "钊叔制NEIGBORL的店"),
 }
 
 

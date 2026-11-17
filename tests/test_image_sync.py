@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -182,6 +183,84 @@ class ImageSyncBrowserTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await page.locator(".file-img").count(), 1)
             self.assertEqual(await page.evaluate("window.deleteCount"), 0)
             self.assertEqual(await page.evaluate("window.inputChangeCount"), 1)
+            await page.close()
+
+    async def test_blocked_upload_button_falls_back_without_global_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.png"
+            path.write_bytes(b"image")
+            page = await self.browser.new_page()
+            page.set_default_timeout(60_000)
+            await page.set_content(fixture_html(0))
+            await page.locator("#scope").evaluate(
+                """scope => {
+                  const button = document.createElement('button');
+                  button.className = 'location-upload';
+                  button.disabled = true;
+                  button.textContent = '本地上传';
+                  scope.appendChild(button);
+                }"""
+            )
+
+            result = await asyncio.wait_for(
+                kuaimai_erp.sync_image_group(
+                    page, page.locator("#scope"), (path,), "天猫产品主图", 2
+                ),
+                timeout=9,
+            )
+
+            self.assertEqual(result, "replaced")
+            self.assertEqual(await page.locator(".file-img").count(), 1)
+            self.assertEqual(await page.evaluate("window.uploadNames"), [path.name])
+            await page.close()
+
+    async def test_force_replace_recovers_image_restored_during_upload_hover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "replacement.png"
+            path.write_bytes(b"image")
+            page = await self.browser.new_page()
+            await page.set_content(fixture_html(1))
+            await page.locator("#images").evaluate(
+                """images => {
+                  const remove = window.removeImage;
+                  window.removeImage = button => {
+                    remove(button);
+                    if (!document.querySelector('#upload')) {
+                      const input = document.createElement('input');
+                      input.id = 'upload';
+                      input.type = 'file';
+                      input.onchange = () => recordFiles(input);
+                      document.querySelector('#scope').appendChild(input);
+                    }
+                  };
+                  images.style.minHeight = '80px';
+                  images.addEventListener('mousemove', () => {
+                    if (images.querySelector('.file-img') || window.restored) return;
+                    window.restored = true;
+                    document.querySelector('#upload').remove();
+                    images.innerHTML = '<div class="file-img"><button class="del-btn" onclick="removeImage(this)">删除</button></div>';
+                  });
+                }"""
+            )
+            # Initial deletion hovers the existing image; restore only once
+            # the empty upload area is hovered after that deletion.
+            await page.locator("#images").evaluate(
+                """images => images.style.marginTop = '100px'"""
+            )
+
+            result = await asyncio.wait_for(
+                kuaimai_erp.sync_image_group(
+                    page, page.locator("#scope"), (path,), "天猫产品主图", 2,
+                    force_replace=True,
+                ),
+                timeout=8,
+            )
+
+            self.assertEqual(result, "replaced")
+            self.assertTrue(await page.evaluate("window.restored"))
+            self.assertEqual(await page.evaluate("window.deleteCount"), 2)
+            self.assertEqual(await page.evaluate("window.uploadNames"), [path.name])
+            self.assertEqual(await page.locator(".file-img").count(), 1)
             await page.close()
 
     async def test_jfif_is_uploaded_with_tmall_accepted_jpg_extension(self):

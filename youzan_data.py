@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from category_profile import is_footwear_category
+from category_profile import is_footwear_category, is_belt_category
 from category_profile import category_input_levels
 
 import re
@@ -102,7 +102,9 @@ def parse_youzan_fields(fields: Mapping[str, Any]) -> YouzanFields:
     has_pants = "裤" in category_text
     has_coat = any(token in category_text for token in ("外套", "皮衣"))
     garment_kind = (
-        "footwear"
+        "belt"
+        if is_belt_category(" > ".join(category_path))
+        else "footwear"
         if is_footwear_category(category_text)
         else "pants"
         if has_pants and not has_coat

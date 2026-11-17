@@ -1,6 +1,7 @@
 import unittest
 
 from platform_candidate_source import (
+    custom_value_allowed,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -10,6 +11,19 @@ from platform_schema import FieldOption
 
 
 class CandidateSourceTests(unittest.TestCase):
+    def test_custom_value_policy_preserves_supported_input_and_rejects_search_only(self):
+        self.assertFalse(custom_value_allowed())
+        self.assertTrue(custom_value_allowed(schema_allowed=True))
+        self.assertTrue(custom_value_allowed(dom_allowed=True))
+        self.assertTrue(custom_value_allowed(save_verified=True))
+        self.assertFalse(custom_value_allowed(
+            schema_allowed=True, dom_allowed=True, save_verified=True,
+            save_rejected=True,
+        ))
+        self.assertFalse(custom_value_allowed(
+            schema_allowed=True, dom_allowed=True, requires_candidate_id=True,
+        ))
+
     def test_api_ids_are_retained_in_current_dom_order(self):
         api = (
             FieldOption("long", "长裤", 0),

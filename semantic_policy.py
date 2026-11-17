@@ -39,9 +39,11 @@ def adoption_policy(answer, request, *, allow_auto=True):
     variants = _matched_excel_variants(request.excel_value, tuple(getattr(request, 'candidates', ())),
         control_type=request.control_type, field_label=getattr(request, 'field_label', '')) if request.control_type != 'category' else ()
     human_choice = request.evidence.get('failed_selection_source') in {'human_override', 'cross_product_human', 'review_learning'}
-    if not allow_auto or (request.evidence.get("selection_only") and not request.evidence.get("bounded_write_retry")):
-        reason = "已有审核冲突或页面操作失败，需要人工确认"
-    elif (request.evidence.get('bounded_write_retry')
+    if request.evidence.get('write_retry_exhausted'):
+        reason = "模型已核对候选，但页面重试仍未通过写入回读，需要人工处理操作异常"
+    elif not allow_auto:
+        reason = "本次模型结果仅供审核参考，不能自动填写"
+    elif ((request.evidence.get('bounded_write_retry') or request.evidence.get('selection_only'))
           and request.evidence.get('failed_selection_source') in {'human_override', 'cross_product_human', 'review_learning'}
           and set(answer.get('value_ids', [])) != set(request.evidence.get('failed_selection_value_ids', []))):
         reason = "模型建议与已有人工选择不同，需要人工确认"

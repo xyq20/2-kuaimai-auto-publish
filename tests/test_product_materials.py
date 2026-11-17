@@ -82,6 +82,32 @@ class MaterialPathTests(unittest.TestCase):
         with self.assertRaisesRegex(MaterialPathError, '找不到商品'):
             self.resolve(month, title='【轰炸机】皮衣', colors=('咖啡色',))
 
+    def test_selected_local_workbook_uses_its_own_style_suffix_directory(self):
+        month = self.month('26.10')
+        folder = month/'10.24【殿堂.高】低帮'
+        folder.mkdir()
+        (month/'10.24【殿堂.高】高帮').mkdir()
+        excel = folder/'产品信息.xlsx'
+        excel.write_bytes(b'workbook')
+        with patch('product_materials.current_month_directory', return_value=month):
+            selected = resolve_product_materials(
+                self.root, excel, title='【殿堂·中】中帮工装靴',
+                style_code='ZS2026', colors=('咖啡色',), nickname='殿堂·中',
+            )
+        self.assertEqual(selected, folder)
+
+    def test_local_workbook_symlink_cannot_escape_its_material_folder(self):
+        month = self.month('26.10')
+        folder = month/'10.24【殿堂.高】低帮'
+        folder.mkdir()
+        outside = self.root/'outside.xlsx'
+        outside.write_bytes(b'workbook')
+        excel = folder/'产品信息.xlsx'
+        excel.symlink_to(outside)
+        with patch('product_materials.current_month_directory', return_value=month):
+            with self.assertRaisesRegex(MaterialPathError, 'Excel 超出商品素材目录'):
+                resolve_product_materials(self.root, excel, style_code='ZS2026')
+
     def test_unique_style_code_takes_priority_over_nickname(self):
         month = self.month('26.10')
         expected = month/'10.9【新简称】+NGBL-2096'
@@ -150,15 +176,65 @@ class MaterialPathTests(unittest.TestCase):
         self.assertEqual(thumbnail, folder/'1：1主图/1.png')
         self.assertEqual([p.name for p in product.detail_images], ['1.png', '2_2.jpg', '2_10.jpg'])
 
-    def test_configured_source_reaches_cli_and_workbench_jobs(self):
+    def test_short_artwork_folder_names_are_supported(self):
+        excel, folder = self.workbook_and_artwork()
+        (folder/'1：1主图').rename(folder/'1：1')
+        (folder/'3：4主图').rename(folder/'3：4')
+        (folder/'详情页图').rename(folder/'详情页')
+        with patch('product_materials.current_month_directory', return_value=folder.parent):
+            product = erp.read_product_data(excel, include_douyin=False, materials_root=self.root)
+        self.assertEqual(product.main_images, [folder/'1：1/1.png'])
+        self.assertEqual(product.main_images_34, [folder/'3：4/1.png'])
+        self.assertEqual([path.name for path in product.detail_images], ['1.png', '2_2.jpg', '2_10.jpg'])
+
+    def test_price_ignores_unit_placeholder_and_uses_next_numeric_alias(self):
+        excel, folder = self.workbook_and_artwork()
+        workbook = Workbook()
+        sheet = workbook.active
+        for row in (('属性', '内容'), ('商品标题', '【轰炸机】羊皮夹克'), ('货号', 'NGBL-2096'),
+                    ('基本售价/吊牌价/商品价格/价格', '元'), ('价格/京东价/市场价/售卖价/售价', 298),
+                    ('颜色', '咖啡色'), ('尺码', 'S/M/L')):
+            sheet.append(row)
+        workbook.save(excel)
+        workbook.close()
+        with patch('product_materials.current_month_directory', return_value=folder.parent):
+            product = erp.read_product_data(excel, include_douyin=False, materials_root=self.root)
+        self.assertEqual(product.base_price, '298')
+
+    def test_default_readers_keep_all_assets_beside_the_original_workbook(self):
+        excel, artwork = self.workbook_and_artwork()
+        for name in ('1：1主图', '3：4主图', '详情页图', 'SKU图'):
+            directory = excel.parent/name
+            directory.mkdir()
+            (directory/'original.png').write_bytes(b'original-image')
+        with patch('kuaimai_erp.resolve_product_materials', side_effect=AssertionError('must not scan artwork')):
+            product = erp.read_product_data(excel, include_douyin=False, identity_only=True)
+            seed = erp.read_new_product_seed(excel)
+        self.assertEqual(product.product_dir, excel.parent)
+        self.assertNotEqual(product.product_dir, artwork)
+        for images in (product.main_images, product.main_images_34, product.detail_images, product.sku_images):
+            self.assertEqual(len(images), 1)
+            self.assertTrue(images[0].is_relative_to(excel.parent))
+            self.assertEqual(images[0].name, 'original.png')
+        self.assertEqual(seed.main_images, product.main_images)
+
+    def test_artwork_environment_cannot_redirect_default_cli_or_workbench_jobs(self):
         with patch.dict('os.environ', {'KUAIMAI_MATERIALS_ROOT': str(self.root)}):
-            self.assertEqual(erp.build_parser().parse_args([]).materials_root, self.root)
+            self.assertIsNone(erp.build_parser().parse_args([]).materials_root)
             settings = Settings.from_env()
-            self.assertEqual(settings.materials_root, self.root)
-        command = build_command(self.root/'产品信息.xlsx',
-                                {'mode':'preview', 'platforms':['tmall'], 'learning':False},
-                                'run', self.root/'output', settings)
-        self.assertEqual(command[command.index('--materials-root') + 1], str(self.root))
+            self.assertIsNone(settings.materials_root)
+            # Even an old configured workbench must keep using the product folder.
+            from dataclasses import replace
+            settings = replace(settings, materials_root=self.root)
+            for operation in ('platforms', 'base', 'create'):
+                with self.subTest(operation=operation):
+                    command = build_command(self.root/'产品信息.xlsx',
+                                            {'operation':operation, 'mode':'save', 'platforms':['tmall'], 'learning':False},
+                                            'run', self.root/'output', settings)
+                    self.assertNotIn('--materials-root', command)
+                    self.assertIsNone(erp.build_parser().parse_args(command[3:]).materials_root)
+        explicit = erp.build_parser().parse_args(['--materials-root', str(self.root)])
+        self.assertEqual(explicit.materials_root, self.root)
 
 
 if __name__ == '__main__':

@@ -347,6 +347,24 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(result['status'],'interrupted')
             kill.assert_not_called()
 
+    def test_skipped_stage_stays_skipped_after_checkpoint_progress_and_completion(self):
+        first = self.fake_start()
+        stored = json.loads((self.launcher.root / first['id'] / 'job.json').read_text())
+        output = Path(stored['output_dir'])
+        output.mkdir(parents=True, exist_ok=True)
+        atomic_json(output / 'all-platform-result.json', [{'platform': 'jd', 'status': 'skipped'}])
+        with transaction(self.settings) as db:
+            now = utc_now()
+            db.execute("INSERT INTO products(product_version,style_code,title,created_at,updated_at) VALUES('p','1001','test',?,?)", (now, now))
+            db.execute("INSERT INTO run_checkpoints(run_id,product_version,device_id,execution_mode,platform_order_json,current_index,status,updated_at) VALUES(?,'p','device','save_only','[\"base\",\"jd\",\"xhs\"]',2,'running',?)", (first['id'], now))
+        for status in ('running', 'completed'):
+            with self.subTest(status=status):
+                body = self.launcher._public({**stored, 'status': status})
+                stages = {row['platform']: row['status'] for row in body['stages']}
+                self.assertEqual(stages['jd'], 'skipped')
+                self.assertEqual(stages['base'], 'success')
+                self.assertEqual(stages['xhs'], 'running' if status == 'running' else 'success')
+
     def test_stop_signals_only_owned_group_and_waits_for_actual_exit(self):
         first = self.fake_start()
         with patch.object(self.launcher,'_owned',return_value=True), patch('local_review.launcher.os.killpg') as kill:

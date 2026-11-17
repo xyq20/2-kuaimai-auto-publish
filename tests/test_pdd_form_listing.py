@@ -328,6 +328,145 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ('宽松',))
         self.assertEqual(await self.page.locator('input[value="保持原样"]').input_value(), '保持原样')
 
+    async def test_conditional_material_and_percentage_are_discovered_until_stable(self):
+        listing = await self._listing()
+        await self.page.locator('.complex-wrap').evaluate("""root => {
+          root.insertAdjacentHTML('afterbegin', `
+            <div class="el-form-item" id="fabric-parent">
+              <label class="el-form-item__label">面料俗称</label>
+              <div class="el-form-item__content"><div class="el-select">
+                <input class="el-input__inner" readonly onclick="openSelect(this)">
+                <div class="el-select-dropdown" style="display:none"><ul>
+                  <li class="el-select-dropdown__item" onclick="choose(this)">棉</li>
+                </ul></div>
+              </div></div>
+            </div>`);
+          const originalChoose = window.choose;
+          window.fabricClicks = 0;
+          window.materialClicks = 0;
+          window.choose = option => {
+            const item = option.closest('.el-form-item');
+            originalChoose(option);
+            if (item.id === 'fabric-parent') {
+              window.fabricClicks++;
+              item.insertAdjacentHTML('afterend', `
+                <div class="el-form-item is-required" id="material-child">
+                  <label class="el-form-item__label">材质</label>
+                  <div class="el-form-item__content"><div class="el-select">
+                    <input class="el-input__inner" readonly onclick="openSelect(this)">
+                    <div class="el-select-dropdown" style="display:none"><ul>
+                      <li class="el-select-dropdown__item" onclick="choose(this)">棉</li>
+                    </ul></div>
+                  </div></div>
+                </div>`);
+            } else if (item.id === 'material-child') {
+              window.materialClicks++;
+              item.insertAdjacentHTML('afterend', `
+                <div class="el-form-item" id="percentage-child">
+                  <label class="el-form-item__label">成分含量</label>
+                  <div class="el-form-item__content"><input></div>
+                </div>`);
+            }
+          };
+        }""")
+
+        report = await listing.fill_category_attributes(PddFields(fields={
+            '面料俗称': '棉100%/棉', '材质成分/材质': '棉100%/棉',
+            '成分含量': '100', '版型': '宽松', '货号': '7100',
+            '运费设置': '不得填写物流区',
+        }))
+
+        self.assertEqual(report['attributes']['材质'], ('棉',))
+        self.assertEqual(report['attributes']['成分含量'], ('100',))
+        self.assertEqual(await self.page.locator('#percentage-child input').input_value(), '100')
+        self.assertEqual(await self.page.evaluate('[fabricClicks, materialClicks]'), [1, 1])
+        self.assertEqual(await self.page.locator('#freight').input_value(), '0')
+
+    async def test_single_select_material_fields_use_first_excel_component(self):
+        listing = await self._listing()
+        await self.page.locator('.complex-wrap').evaluate("""root => {
+          root.insertAdjacentHTML('afterbegin', `
+            <div class="complex-item"><div class="el-form-item" id="fabric-nickname">
+              <label class="el-form-item__label">面料俗称</label>
+              <div class="el-form-item__content"><div class="el-select">
+                <input class="el-input__inner" readonly onclick="openSelect(this)">
+                <div class="el-select-dropdown" style="display:none"><ul>
+                  <li class="el-select-dropdown__item" onclick="choose(this)">棉</li>
+                  <li class="el-select-dropdown__item" onclick="choose(this)">其他</li>
+                </ul></div>
+              </div></div>
+            </div></div>
+            <div class="complex-item"><div class="el-form-item" id="material-name">
+              <label class="el-form-item__label">材质</label>
+              <div class="el-form-item__content"><div class="el-select">
+                <input class="el-input__inner" readonly onclick="openSelect(this)">
+                <div class="el-select-dropdown" style="display:none"><ul>
+                  <li class="el-select-dropdown__item" onclick="choose(this)">棉</li>
+                  <li class="el-select-dropdown__item" onclick="choose(this)">其他</li>
+                </ul></div>
+              </div></div>
+            </div></div>`);
+        }""")
+
+        components = '棉（95.4%），聚酯纤维（4.6%）'
+        report = await listing.fill_category_attributes(PddFields(fields={
+            '面料俗称': components,
+            '材质成分/材质': components,
+        }))
+
+        self.assertEqual(report['attributes']['面料俗称'], ('棉',))
+        self.assertEqual(report['attributes']['材质'], ('棉',))
+        self.assertEqual(
+            await self.page.locator('#fabric-nickname input').input_value(), '棉'
+        )
+        self.assertEqual(
+            await self.page.locator('#material-name input').input_value(), '棉'
+        )
+
+    async def test_multi_select_material_still_uses_all_excel_components(self):
+        listing = await self._listing()
+        await self.page.locator('.complex-wrap').evaluate("""root => {
+          root.insertAdjacentHTML('afterbegin', `
+            <div class="complex-item"><div class="el-form-item" id="fabric">
+              <label class="el-form-item__label">面料俗称</label>
+              <div class="el-form-item__content"><div class="el-select is-multiple">
+                <input class="el-input__inner" readonly onclick="openSelect(this)">
+              </div></div>
+            </div></div>`);
+        }""")
+        fill_fabric = AsyncMock(return_value=('棉', '聚酯纤维'))
+        listing._fill_fabric_attribute = fill_fabric
+
+        report = await listing.fill_category_attributes(PddFields(fields={
+            '面料俗称': '棉（95.4%），聚酯纤维（4.6%）',
+        }))
+
+        self.assertEqual(report['attributes']['面料俗称'], ('棉', '聚酯纤维'))
+        fill_fabric.assert_awaited_once()
+        self.assertEqual(fill_fabric.await_args.args[1], ('棉', '聚酯纤维'))
+
+    async def test_conditional_field_discovery_is_not_limited_to_material_labels(self):
+        listing = await self._listing()
+        original = listing.fill_attribute
+
+        async def fill(label, *args, **kwargs):
+            actual = await original(label, *args, **kwargs)
+            if label == '版型':
+                await self.page.locator('.complex-wrap').evaluate("""root => {
+                  root.insertAdjacentHTML('beforeend', `
+                    <div class="el-form-item"><label class="el-form-item__label">新增工艺</label>
+                      <div class="el-form-item__content"><input id="new-process"></div>
+                    </div>`);
+                }""")
+            return actual
+
+        listing.fill_attribute = fill
+        report = await listing.fill_category_attributes(PddFields(fields={
+            '版型': '宽松', '新增工艺': '水洗',
+        }))
+        self.assertEqual(report['attributes']['新增工艺'], ('水洗',))
+        self.assertEqual(await self.page.locator('#new-process').input_value(), '水洗')
+
     async def test_material_uses_unique_platform_synonym(self):
         listing = await self._listing()
         await self.page.locator(".complex-wrap").evaluate(
@@ -439,6 +578,65 @@ class PddFormListingTests(unittest.IsolatedAsyncioTestCase):
         }""")
 
         return listing
+
+    async def test_belt_current_composite_is_kept_without_search_or_review(self):
+        runtime = SimpleNamespace(resolve=AsyncMock())
+        listing = await self._listing(attribute_runtime=runtime)
+        path = '服饰配件 > 腰带/皮带/腰链/背带 > 腰带/皮带/腰链/背带'
+        listing.category_hints = ('服装 > 服装配饰 > 腰带/皮带/腰链',
+                                  '服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带')
+        await self.page.locator('.current').evaluate('(node, text) => node.textContent = text', path)
+        listing._apply_excel_category_search = AsyncMock(side_effect=AssertionError('无需重搜'))
+
+        self.assertEqual(await listing.apply_recommended_category(), path)
+        self.assertEqual(listing._normalize_category_path(path), path)
+        listing._apply_excel_category_search.assert_not_awaited()
+        runtime.resolve.assert_not_awaited()
+
+    async def test_belt_manual_search_preserves_slashes_in_all_cascader_levels(self):
+        listing = await self._jeans_category_search_fixture()
+        listing.category_hints = ('服装 > 服装配饰 > 腰带/皮带/腰链',)
+        path = '服饰配件 > 腰带/皮带/腰链/背带 > 腰带/皮带/腰链/背带'
+        await self.page.evaluate("""path => {
+          const nodes = document.querySelectorAll('.el-cascader-node');
+          nodes[0].textContent = '服饰配件';
+          nodes[1].textContent = nodes[2].textContent = '腰带/皮带/腰链/背带';
+          document.querySelector('#suggestions li').textContent = path;
+          nodes[2].onclick = () => {
+            document.querySelector('#selected').textContent = '已选：' + path;
+            document.querySelector('.current').textContent = path;
+          };
+        }""", path)
+        listing._resolve_category_uncertainty = AsyncMock(side_effect=AssertionError('无需审核'))
+
+        self.assertEqual(await listing._apply_excel_category_search(), path)
+        listing._resolve_category_uncertainty.assert_not_awaited()
+
+    async def test_category_search_status_is_not_a_review_candidate(self):
+        listing = await self._jeans_category_search_fixture()
+        for content in ('<ul><li>暂无结果</li></ul>', '<div class="empty">暂无结果</div>',
+                        '<ul><li aria-disabled="true">男装 &gt; 牛仔裤</li></ul>'):
+            with self.subTest(content=content):
+                await self.page.locator('#suggestions').evaluate("""(node, html) => {
+                  node.style.display = 'block'; node.innerHTML = html;
+                }""", content)
+                self.assertEqual(await listing._visible_category_result_nodes(), ())
+
+    async def test_category_review_preserves_composite_and_excludes_status_and_known_parent(self):
+        runtime = SimpleNamespace(resolve=AsyncMock())
+        listing = await self._listing(attribute_runtime=runtime)
+        parent = '服饰配件 > 腰带/皮带/腰链/背带'
+        leaf = parent + ' > 腰带/皮带/腰链/背带'
+        async def resolve(request):
+            self.assertEqual([value.label for value in request.candidates], [leaf])
+            self.assertEqual(request.evidence['candidate_paths'], [leaf])
+            candidate = request.candidates[0]
+            return ResolvedAttribute(candidate.value_id, candidate.label, 'operator', 'snapshot')
+        runtime.resolve.side_effect = resolve
+
+        self.assertEqual(await listing._resolve_category_uncertainty(
+            ('暂无结果', parent, leaf, parent + ' > 暂无结果', '加载中...')
+        ), leaf)
 
     async def test_wrong_current_and_recommended_category_use_excel_manual_search(self):
         listing = await self._jeans_category_search_fixture()

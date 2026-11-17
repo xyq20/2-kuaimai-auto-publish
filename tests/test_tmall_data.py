@@ -58,6 +58,56 @@ class TmallAssetsTests(unittest.TestCase):
             with self.assertRaises(tmall_data.TmallDataError):
                 tmall_data.read_tmall_assets(root)
 
+    def test_accessory_uses_optional_product_parameter_image_without_size_chart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transparent = self._image(root / "透明素材图")
+            parameter = self._image(root / "产品参数图")
+
+            result = tmall_data.read_tmall_assets(root, garment_kind="accessory")
+
+        self.assertIsNone(result.vertical_image)
+        self.assertEqual(result.transparent_image, transparent)
+        self.assertEqual(result.parameter_image, parameter)
+
+    def test_accessory_without_parameter_or_size_chart_is_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._image(root / "透明素材图")
+
+            result = tmall_data.read_tmall_assets(root, garment_kind="accessory")
+
+        self.assertIsNone(result.parameter_image)
+
+    def test_transparent_upload_is_800_square_and_preserves_source_and_alpha(self):
+        import cv2
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for width, height in ((1200, 1200), (1200, 600), (400, 400), (800, 800)):
+                with self.subTest(size=(width, height)):
+                    source = root / "source.png"
+                    pixels = np.full((height, width, 4), (10, 40, 90, 128), dtype=np.uint8)
+                    cv2.imwrite(str(source), pixels)
+                    before = source.read_bytes()
+
+                    target = tmall_data.prepare_tmall_transparent_image(source, root / "upload.png")
+
+                    actual = cv2.imread(str(target), cv2.IMREAD_UNCHANGED)
+                    self.assertEqual(actual.shape, (800, 800, 4))
+                    self.assertEqual(tuple(actual[400, 400]), (10, 40, 90, 128))
+                    self.assertEqual(source.read_bytes(), before)
+                    if width != height:
+                        self.assertEqual(actual[0, 400, 3], 0)
+
+    def test_transparent_upload_rejects_unreadable_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "invalid.png"
+            source.write_bytes(b"invalid")
+            with self.assertRaisesRegex(tmall_data.TmallDataError, "无法读取"):
+                tmall_data.prepare_tmall_transparent_image(source, Path(directory) / "upload.png")
+
     @staticmethod
     def _image(directory: Path, name: str = "1.jpg") -> Path:
         directory.mkdir(parents=True, exist_ok=True)

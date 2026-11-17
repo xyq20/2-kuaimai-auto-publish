@@ -116,7 +116,7 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.value_id,result.label,result.source),('young,middle','青年,中年','human_override'))
         self.client.semantic_judge.assert_not_called()
 
-    async def test_failed_confirmed_write_retries_human_choice_without_model(self):
+    async def test_failed_confirmed_write_asks_model_with_human_choice_and_original_excel(self):
         from learning_models import CandidateSnapshot
         snapshot = CandidateSnapshot(self.request.platform_id, self.request.category_leaf_id,
             self.request.field_id, self.request.field_label, self.request.candidates,
@@ -132,8 +132,11 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
             platform_id='wxsph', field_label='版型', error='选择后页面仍为空')
         await self.runtime.drain()
 
-        self.assertEqual((recovered.label, recovered.source), ('直筒', 'human_override'))
-        self.client.semantic_judge.assert_not_called()
+        self.assertEqual((recovered.label, recovered.source), ('直筒', 'deepseek'))
+        self.client.semantic_judge.assert_called_once()
+        evidence = self.client.semantic_judge.call_args.args[0]['evidence']
+        self.assertEqual(evidence['failed_selection_source'], 'human_override')
+        self.assertEqual(evidence['validation_error'], '选择后页面仍为空')
         self.assertEqual(self.runtime._write_recovery_requests[('wxsph', '版型')].excel_value, '平直廓形')
 
     async def test_write_recovery_does_not_silently_replace_human_choice(self):
@@ -145,31 +148,28 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         result = await self.runtime.recover_failed_write(
             platform_id='wxsph', field_label='版型', error='候选点击失败')
         await self.runtime.drain()
-        self.assertEqual((result.label, result.source), ('宽松', 'human_override'))
-        self.client.semantic_judge.assert_not_called()
-        self.assertFalse(self.runtime.deferred_reviews)
+        self.assertIsNone(result)
+        self.client.semantic_judge.assert_called_once()
+        self.assertEqual(len(self.runtime.deferred_reviews), 1)
+        self.assertIn('已有人工选择不同', self.runtime.model_decisions[0]['treatment_reason'])
 
-    async def test_exact_write_recovery_retries_without_model_or_review(self):
+    async def test_exact_write_recovery_asks_model_then_retries_verified_excel_choice(self):
         await self.runtime.resolve(dataclasses.replace(self.request, excel_value='直筒'))
         self.runtime.begin_review_collection('wxsph')
         self.suggestion(.7)
         result = await self.runtime.recover_failed_write(
             platform_id='wxsph', field_label='版型', error='回读为空')
         await self.runtime.drain()
-        self.assertEqual((result.label, result.source), ('直筒', 'explicit_text'))
-        self.client.semantic_judge.assert_not_called()
+        self.assertEqual((result.label, result.source), ('直筒', 'deepseek'))
+        self.client.semantic_judge.assert_called_once()
         self.assertFalse(self.runtime.deferred_reviews)
 
-    async def test_failed_exact_retry_queues_operation_review_without_model(self):
+    async def test_failed_exact_retry_includes_latest_error_in_final_model_fallback(self):
         await self.runtime.resolve(dataclasses.replace(self.request, excel_value='直筒'))
         self.runtime.begin_review_collection('wxsph')
         self.suggestion()
         await self.runtime.recover_failed_write(
             platform_id='wxsph', field_label='版型', error='候选点击失败')
-        # A second API request would now fail: retry failure must reuse the
-        # judgment already made and queue review, rather than loop.
-        self.client.semantic_judge.side_effect = AssertionError('unexpected second model request')
-
         result = await self.runtime.recover_failed_write(
             platform_id='wxsph', field_label='版型', error='重试回读仍为空', force_review=True)
         await self.runtime.drain()
@@ -181,8 +181,84 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(row[0])
         self.assertEqual(payload['suggested_value_id'], 'straight')
         self.assertEqual(payload['evidence_json']['validation_error'], '重试回读仍为空')
-        self.assertFalse(self.runtime.model_decisions)
-        self.client.semantic_judge.assert_not_called()
+        self.assertEqual(self.client.semantic_judge.call_count, 2)
+        last = self.client.semantic_judge.call_args.args[0]
+        self.assertEqual(last['evidence']['first_validation_error'], '候选点击失败')
+        self.assertEqual(last['evidence']['validation_error'], '重试回读仍为空')
+        self.assertTrue(last['evidence']['write_retry_exhausted'])
+        self.assertEqual(self.runtime.model_decisions[-1]['status'], 'review_required')
+
+    async def test_learning_conflict_runs_model_and_adopts_instead_of_queueing_review(self):
+        self.client.review_learning.return_value = {
+            'status': 'review_required', 'reason_code': 'review_learning_conflict',
+            'conflicting_labels': ['直筒', '宽松']}
+        self.suggestion(api_called=True)
+        result = await self.runtime.resolve(self.request)
+        await self.runtime.drain()
+        self.assertEqual(result.source, 'deepseek')
+        payload = self.client.semantic_judge.call_args.args[0]
+        self.assertEqual(payload['evidence']['review_reason_code'], 'review_learning_conflict')
+        self.assertEqual(payload['evidence']['review_learning_result']['conflicting_labels'], ['直筒', '宽松'])
+        self.assertFalse(self.store.connection.execute(
+            "SELECT 1 FROM sync_outbox WHERE event_type='review.created'").fetchone())
+
+    async def test_suggested_rule_and_rejected_rule_cannot_bypass_model(self):
+        request = dataclasses.replace(self.request, field_label='裤长')
+        for response in (
+            {'status': 'review_required', 'reason_code': 'evidence_conflict', 'value_id': 'loose'},
+            {'status': 'auto_fill_ready', 'source': 'mature_rule', 'value_id': 'loose',
+             'snapshot_version': 'stale', 'evidence_kinds': ['visual']},
+        ):
+            with self.subTest(response=response):
+                self.runtime._model_judgments.clear()
+                self.client.semantic_judge.reset_mock()
+                self.client.decide.return_value = response
+                self.suggestion(api_called=True)
+                result = await self.runtime.resolve(request)
+                self.assertEqual(result.value_id, 'straight')
+                self.client.semantic_judge.assert_called_once()
+                payload = self.client.semantic_judge.call_args.args[0]
+                self.assertEqual(payload['evidence']['prior_suggested_value_id'], 'loose')
+                self.assertEqual(payload['evidence']['prior_decision'], response)
+        await self.runtime.drain()
+
+    async def test_force_review_request_can_be_resolved_automatically_by_model(self):
+        self.suggestion(api_called=True)
+        request = dataclasses.replace(self.request, evidence={
+            'force_review': True, 'selection_only': True, 'validation_error': '候选文本有歧义'})
+        result = await self.runtime.resolve(request)
+        await self.runtime.drain()
+        self.assertEqual(result.label, '直筒')
+        self.client.semantic_judge.assert_called_once()
+
+    async def test_empty_candidates_still_request_model_before_review(self):
+        request = dataclasses.replace(self.request, candidates=(), control_type='input')
+        self.client.semantic_judge.return_value = {
+            'status': 'review_required', 'reason_code': 'deepseek_uncertain',
+            'api_called': True, 'reason': '没有页面候选且缺少尺码原始资料，无法补造数值'}
+        with self.assertRaises(ReviewRequired):
+            await self.runtime.resolve(request)
+        self.client.semantic_judge.assert_called_once()
+        row = self.store.connection.execute(
+            "SELECT payload_json FROM sync_outbox WHERE event_type='review.created'").fetchone()
+        evidence = json.loads(row[0])['evidence_json']
+        self.assertTrue(evidence['model_fallback']['api_called'])
+        self.assertIn('无法补造', evidence['model_fallback']['reason'])
+
+    async def test_large_dictionary_still_calls_model_and_preserves_review_explanation(self):
+        request = dataclasses.replace(self.request, candidates=self.request.candidates + tuple(
+            CandidateValue('extra-' + str(i), '其他候选' + str(i)) for i in range(999)))
+        self.suggestion(api_called=True)
+        with self.assertRaises(ReviewRequired):
+            await self.runtime.resolve(request)
+        self.client.semantic_judge.assert_called_once()
+        self.assertEqual(len(self.client.semantic_judge.call_args.args[0]['options']), 1000)
+        row = self.store.connection.execute(
+            "SELECT payload_json FROM sync_outbox WHERE event_type='review.created'").fetchone()
+        review = json.loads(row[0])
+        self.assertEqual(review['suggested_value_id'], 'straight')
+        self.assertTrue(review['evidence_json']['model_fallback']['api_called'])
+        self.assertEqual(review['evidence_json']['model_fallback']['status'], 'review_required')
 
     async def test_category_requires_excel_or_confirmed_library_evidence(self):
         self.request = dataclasses.replace(self.request, field_id='__category__', field_label='商品类目',
@@ -262,6 +338,50 @@ class SemanticJudgmentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SemanticEndpointTests(unittest.TestCase):
+    def test_pre_review_calls_model_even_with_exact_human_history_and_cached_rule(self):
+        from local_review.semantic import judge_attribute
+        settings = Settings(Path('unused'), 'device', deepseek_api_key='private')
+        payload = {'product_version': 'p', 'platform_id': 'tm', 'category_leaf_id': 'c',
+            'field_id': 'cut', 'field_label': '版型', 'control_type': 'select',
+            'snapshot_version': 's', 'excel_value': '修身型',
+            'options': [{'value_id': 'slim', 'label': '修身'}],
+            'evidence': {'pre_review_fallback': True, 'review_reason_code': 'review_learning_conflict'}}
+        human = {'review_id': 'r', 'same_product': True, 'same_category': True,
+                 'control_type': 'select', 'excel_candidates': ['修身型'], 'selected_labels': ['修身']}
+        context = {'title': '修身上衣', 'product_info': {}, 'human_examples': [human],
+                   'history_summary': {'human_records_supplied': 1}}
+        answer = {'value_ids': ['slim'], 'confidence': .99, 'reason': '结合本商品人工记录确认修身',
+            'evidence_kinds': ['excel', 'human_learning'],
+            'assessment': {'relation': 'equivalent', 'source_text': '修身型',
+                           'assumptions': [], 'conflicts': [], 'competing_value_ids': []}}
+        with patch('local_review.semantic.judgment_context', return_value=context), \
+             patch('local_review.model_rules.reuse') as reuse, \
+             patch('local_review.model_rules.learned_guidance', return_value=[]), \
+             patch('local_review.semantic.request_json', return_value=answer) as call:
+            result = judge_attribute(settings, payload)
+        call.assert_called_once()
+        reuse.assert_not_called()
+        self.assertTrue(result['api_called'])
+        sent = call.call_args.args[2]
+        self.assertEqual(sent['product_and_learning']['human_examples'], [human])
+        self.assertTrue(sent['execution_state']['pre_review_fallback'])
+
+    def test_empty_candidate_review_gets_model_diagnosis_without_inventing_values(self):
+        from local_review.semantic import judge_attribute
+        settings = Settings(Path('unused'), 'device', deepseek_api_key='private')
+        payload = {'product_version': 'p', 'platform_id': 'tm', 'category_leaf_id': 'c',
+            'field_id': 'size', 'field_label': '脚长', 'control_type': 'input',
+            'snapshot_version': 's', 'excel_value': '', 'options': [],
+            'evidence': {'pre_review_fallback': True}}
+        context = {'title': '男靴', 'product_info': {}, 'human_examples': []}
+        with patch('local_review.semantic.judgment_context', return_value=context), \
+             patch('local_review.semantic.request_json', return_value={
+                 'value_ids': [], 'reason': '缺少尺码原始资料，无法推断脚长'}) as call:
+            result = judge_attribute(settings, payload)
+        call.assert_called_once()
+        self.assertEqual(result['reason_code'], 'deepseek_uncertain')
+        self.assertTrue(result['api_called'])
+
     def test_style_operator_assessment_keeps_multiple_acceptable_candidates(self):
         from local_review.semantic import judge_attribute
         from semantic_policy import adoption_policy

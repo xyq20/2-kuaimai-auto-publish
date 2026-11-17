@@ -62,11 +62,18 @@ func invertedImage(_ image: CGImage) -> CGImage? {
 
 func merge(_ tokens: [OCRToken], into merged: inout [OCRToken]) {
     for token in tokens {
-        let overlapsExisting = merged.contains {
-            overlapRatio($0, token) >= overlapThreshold
+        let overlappingIndices = merged.indices.filter {
+            overlapRatio(merged[$0], token) >= overlapThreshold
         }
-        if !overlapsExisting {
+        if overlappingIndices.isEmpty {
             merged.append(token)
+        } else if overlappingIndices.count == 1,
+                  let index = overlappingIndices.first,
+                  token.confidence > merged[index].confidence {
+            // Later scales/inversion can correct a low-confidence glyph
+            // (for example, 7 -> L). Keep the stronger result at that position.
+            // A box spanning multiple existing cells is ambiguous; leave it out.
+            merged[index] = token
         }
     }
 }

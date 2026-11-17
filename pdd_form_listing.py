@@ -23,6 +23,7 @@ from money_values import MoneyValueError, normalize_money_value
 from pdd_listing import parse_pdd_attribute_fields
 from platform_candidate_source import (
     select_supports_multiple,
+    select_supports_custom_value,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -30,6 +31,7 @@ from platform_candidate_source import (
 )
 from platform_schema import FieldSchema
 from taobao_listing import (
+    CATEGORY_SEARCH_SECONDS,
     TaobaoListing,
     TaobaoListingError,
     reviewed_selection_labels,
@@ -48,6 +50,19 @@ class PddFormListingError(RuntimeError):
     """A PDD form issue that can be shown directly to the operator."""
 
 
+_CATEGORY_SEARCH_STATUS_TEXTS = {"暂无结果", "暂无数据", "无数据", "无匹配结果", "加载中", "搜索中"}
+
+
+def _pdd_category_path_parts(value: object) -> Tuple[str, ...]:
+    # 平台路径用 > 分级，类目名中的 / 是文字，不能截掉后半段。
+    return tuple(normalize_label(part) for part in re.split(r"[>＞]", str(value or "")) if normalize_label(part))
+
+
+def _is_category_result(value: object) -> bool:
+    parts = _pdd_category_path_parts(value)
+    return bool(parts) and all(part.rstrip(".…") not in _CATEGORY_SEARCH_STATUS_TEXTS for part in parts)
+
+
 # 拼多多已确认新增“男装 > 牛仔裤 > 牛仔裤”叶类目。页面在不同
 # 商品/店铺状态下可能回读旧的两级路径，因此两种路径都作为同一类目
 # 的兼容写法保留；不硬编码平台 ID，也不跨平台套用。
@@ -62,8 +77,8 @@ def _pdd_category_search_terms(hints: Sequence[str]) -> Tuple[str, ...]:
 
 
 def _pdd_recommended_path_matches(expected: str, actual: str) -> bool:
-    expected_parts = category_path_parts(expected)
-    actual_parts = category_path_parts(actual)
+    expected_parts = _pdd_category_path_parts(expected)
+    actual_parts = _pdd_category_path_parts(actual)
     return bool(expected_parts and actual_parts) and (
         actual_parts == expected_parts
         or actual_parts in PDD_CATEGORY_PATH_COMPATIBILITY.get(expected_parts, ())
@@ -407,6 +422,9 @@ class PddFormListing(TaobaoListing):
                 ],
             }
         )
+        custom_allowed = await select_supports_custom_value(
+            select, schema_allowed=field.custom_allowed
+        )
         resolved_groups = []
         for group in normalized_groups:
             request_candidates, excel_value = await self._excel_before_review(
@@ -416,7 +434,7 @@ class PddFormListing(TaobaoListing):
                     field_id=str(field.source_id), field_label=page_label,
                     candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
                     excel_value="/".join(group), evidence={},
-                    custom_allowed=bool(field.custom_allowed), schema_version=schema_version,
+                    custom_allowed=custom_allowed, schema_version=schema_version,
                     control_type="multi_select" if multi else "select",
                 ),
             )
@@ -429,7 +447,7 @@ class PddFormListing(TaobaoListing):
                     candidates=request_candidates,
                     excel_value=excel_value,
                     evidence={"excel": bool(excel_value)},
-                    custom_allowed=bool(field.custom_allowed),
+                    custom_allowed=custom_allowed,
                     schema_version=schema_version,
                     control_type="multi_select" if multi else "select",
                 )
@@ -494,7 +512,7 @@ class PddFormListing(TaobaoListing):
     @staticmethod
     def _normalize_category_path(value: object) -> str:
         # Preserve level boundaries, including adjacent identical labels.
-        return " > ".join(category_path_parts(value))
+        return " > ".join(_pdd_category_path_parts(value))
 
     async def _resolve_category_uncertainty(
         self, paths: Sequence[str], *, parent_path: Sequence[str] = ()
@@ -503,7 +521,11 @@ class PddFormListing(TaobaoListing):
         runtime = self.attribute_runtime
         if runtime is None:
             raise PddFormListingError("拼多多类目候选不明确，需要启用审核中心后选择")
-        normalized = sorted({self._normalize_category_path(path) for path in paths if path.strip()})
+        normalized = sorted({self._normalize_category_path(path) for path in paths
+                             if _is_category_result(path)})
+        normalized = [path for path in normalized if not any(
+            other.startswith(path + " > ") for other in normalized
+        )]
         if not normalized:
             raise PddFormListingError("拼多多类目搜索未返回可审核候选，请检查 Excel 类目")
         candidates = tuple(CandidateValue("path:" + canonical_sha256(path)[:24], path)
@@ -545,11 +567,17 @@ class PddFormListing(TaobaoListing):
             ".el-autocomplete-suggestion:visible li:visible"
         )
         if not await rows.count():
-            return await super()._visible_category_result_nodes()
+            return tuple((text, node) for text, node in await super()._visible_category_result_nodes()
+                         if _is_category_result(text))
         result = []
         for index in range(await rows.count()):
             row = rows.nth(index)
-            result.append((re.sub(r"\s+", " ", await row.inner_text()).strip(), row))
+            if (await row.get_attribute("aria-disabled") == "true"
+                    or "is-disabled" in (await row.get_attribute("class") or "").split()):
+                continue
+            text = re.sub(r"\s+", " ", await row.inner_text()).strip()
+            if _is_category_result(text):
+                result.append((text, row))
         return tuple(result)
 
     async def _apply_excel_category_search(self) -> str:
@@ -591,7 +619,7 @@ class PddFormListing(TaobaoListing):
             await search.fill(hint)
             if self.logger is not None:
                 self.logger.info("拼多多类目按 Excel 顺序搜索：%s", hint)
-            deadline = asyncio.get_running_loop().time() + 10
+            deadline = asyncio.get_running_loop().time() + CATEGORY_SEARCH_SECONDS
             while asyncio.get_running_loop().time() < deadline:
                 nodes = await self._visible_category_result_nodes()
                 for text, _node in nodes:
@@ -623,7 +651,7 @@ class PddFormListing(TaobaoListing):
                                   if self._normalize_category_path(text) == chosen), "")
             if selected_hint:
                 await search.fill(selected_hint)
-                deadline = asyncio.get_running_loop().time() + 10
+                deadline = asyncio.get_running_loop().time() + CATEGORY_SEARCH_SECONDS
                 while asyncio.get_running_loop().time() < deadline:
                     matches = [(text, node) for text, node in await self._visible_category_result_nodes()
                                if self._normalize_category_path(text) == chosen]
@@ -699,11 +727,7 @@ class PddFormListing(TaobaoListing):
             if last_error is not None:
                 raise last_error
 
-        path_parts = [
-            part.strip()
-            for part in re.split(r"\s*[>＞/／]\s*", selected_text)
-            if part.strip()
-        ]
+        path_parts = list(_pdd_category_path_parts(selected_text))
         target_terms = {
             normalize_label(category_path_parts(term)[-1])
             for term in category_search_terms(hints) if category_path_parts(term)
@@ -1042,8 +1066,11 @@ class PddFormListing(TaobaoListing):
             groups = await self._resolve_learning_groups(page_label, select, groups)
             if not groups:
                 if self.logger is not None:
+                    omitted = getattr(self.attribute_runtime, "intentionally_omitted", None)
                     self.logger.info(
-                        "拼多多属性“%s”已加入本平台待审核汇总，继续填写后续字段",
+                        "拼多多属性“%s”已按人工审核保持不填写，继续填写后续字段"
+                        if callable(omitted) and omitted("pdd", page_label)
+                        else "拼多多属性“%s”已加入本平台待审核汇总，继续填写后续字段",
                         page_label,
                     )
                 return None
@@ -1093,6 +1120,13 @@ class PddFormListing(TaobaoListing):
             current = await self._category_text()
         except PddFormListingError:
             current = ""
+
+        if current and self.category_hints:
+            chosen, strategy = choose_category_candidate((current,), self.category_hints)
+            if chosen:
+                if self.logger is not None:
+                    self.logger.info("拼多多当前类目已匹配 Excel，保留完整路径：%s（%s）", current, strategy)
+                return current
 
         deadline = asyncio.get_running_loop().time() + 45
         recommended: List[Tuple[Any, str]] = []
@@ -1211,6 +1245,12 @@ class PddFormListing(TaobaoListing):
                 )
         return assignments
 
+    async def _visible_form_labels(self) -> Tuple[str, ...]:
+        """Detect conditional fields in one DOM read without repeated full scans."""
+        return tuple(await self.panel.locator(
+            ".el-form-item__label:visible"
+        ).all_text_contents())
+
     async def fill_category_attributes(self, fields: PddFields) -> Mapping[str, Any]:
         category = await self.apply_recommended_category()
         page_items = without_color_attributes(await self._attribute_items())
@@ -1218,63 +1258,115 @@ class PddFormListing(TaobaoListing):
         applied: Dict[str, Tuple[str, ...]] = {}
         skipped: Dict[str, str] = {}
         ignored = []
-        for normalized_page, (page_label, item) in page_items.items():
-            base = normalized_page.split("#", 1)[0]
-            report_label = page_label if "#" not in normalized_page else "{0}#{1}".format(
-                page_label, normalized_page.split("#", 1)[1]
-            )
-            if base in PDD_INHERITED_FIELDS:
-                continue
-            if base in PDD_IGNORED_CATEGORY_FIELDS:
-                ignored.append(report_label)
-                continue
-            assignment = assignments.get(normalized_page)
-            if assignment is None:
-                continue
-            # Parent selections may remove dependent fields (e.g. material
-            # "其它" removes composition percentage). Never wait on a stale
-            # locator or redirect its value to the following field.
-            if not await item.count() or not await item.is_visible():
-                ignored.append(report_label)
+        processed = set()
+        layout = await self._visible_form_labels()
+        # 类目控件会随上游选项新增（例如面料选“棉”后才出现“材质”）。
+        # 每轮只填写尚未处理的字段，标签集合变化时重建清单，直到联动稳定。
+        # 待审核字段也记为已处理，避免一轮联动重复请求审核。
+        for _round in range(8):
+            for normalized_page, (page_label, item) in page_items.items():
+                if normalized_page in processed:
+                    continue
+                base = normalized_page.split("#", 1)[0]
+                report_label = page_label if "#" not in normalized_page else "{0}#{1}".format(
+                    page_label, normalized_page.split("#", 1)[1]
+                )
+                if base in PDD_INHERITED_FIELDS:
+                    continue
+                if base in PDD_IGNORED_CATEGORY_FIELDS:
+                    ignored.append(report_label)
+                    continue
+                assignment = assignments.get(normalized_page)
+                if assignment is None:
+                    continue
+                # Parent selections may remove dependent fields (e.g. material
+                # "其它" removes composition percentage). Never wait on a stale
+                # locator or redirect its value to the following field.
+                if not await item.count() or not await item.is_visible():
+                    ignored.append(report_label)
+                    if self.logger:
+                        self.logger.info("拼多多属性“%s”已因上游选项联动隐藏，跳过填写", page_label)
+                    continue
                 if self.logger:
-                    self.logger.info("拼多多属性“%s”已因上游选项联动隐藏，跳过填写", page_label)
-                continue
-            if self.logger:
-                self.logger.info("正在填写拼多多属性：%s", page_label)
-            _source_label, expected = assignment
-            exact_values = _special_category_values(
-                fields.fields, page_label, expected
-            )
-            try:
-                if (
-                    normalize_label(page_label)
-                    in {
+                    self.logger.info("正在填写拼多多属性：%s", page_label)
+                _source_label, expected = assignment
+                exact_values = _special_category_values(
+                    fields.fields, page_label, expected
+                )
+                try:
+                    material_field = normalize_label(page_label) in {
                         normalize_label("面料"),
                         normalize_label("面料俗称"),
                         normalize_label("材质"),
                     }
-                    and exact_values is not None
-                    and len(exact_values) >= 2
-                ):
-                    actual = await self._fill_fabric_attribute(
-                        page_label, exact_values, item=item,
-                        writer=lambda value, values: self.fill_attribute(
-                            page_label, value, exact_values=values, item=item
-                        ),
-                    )
+                    if material_field and exact_values is not None and len(exact_values) >= 2:
+                        selects = item.locator(
+                            ":scope > .el-form-item__content .el-select"
+                        )
+                        multi = (
+                            await select_supports_multiple(selects.first)
+                            if await selects.count() == 1
+                            else False
+                        )
+                        if self.logger is not None:
+                            self.logger.info(
+                                "拼多多属性“%s”控件识别为%s，Excel 面料成分数：%s",
+                                page_label,
+                                "多选" if multi else "单选",
+                                len(exact_values),
+                            )
+                        if not multi:
+                            # A single-select field can store only the first
+                            # material component, so review and verify one value.
+                            exact_values = exact_values[:1]
+                            if self.logger is not None:
+                                self.logger.info(
+                                    "拼多多属性“%s”为单选，按顺序使用第一个面料成分：%s",
+                                    page_label,
+                                    exact_values[0],
+                                )
+                            actual = await self.fill_attribute(
+                                page_label,
+                                expected,
+                                exact_values=exact_values,
+                                item=item,
+                            )
+                        else:
+                            actual = await self._fill_fabric_attribute(
+                                page_label, exact_values, item=item,
+                                writer=lambda value, values: self.fill_attribute(
+                                    page_label, value, exact_values=values, item=item
+                                ),
+                            )
+                    else:
+                        actual = await self.fill_attribute(
+                            page_label,
+                            expected,
+                            exact_values=exact_values,
+                            item=item,
+                        )
+                except TaobaoListingError as exc:
+                    raise PddFormListingError(str(exc).replace("淘宝", "拼多多")) from exc
+                processed.add(normalized_page)
+                if actual is None:
+                    skipped[report_label] = expected
                 else:
-                    actual = await self.fill_attribute(
-                        page_label,
-                        expected,
-                        exact_values=exact_values,
-                        item=item,
-                    )
-            except TaobaoListingError as exc:
-                raise PddFormListingError(str(exc).replace("淘宝", "拼多多")) from exc
-            if actual is None:
-                skipped[report_label] = expected
-            else:
-                applied[report_label] = actual
+                    applied[report_label] = actual
+            updated_layout = await self._visible_form_labels()
+            if updated_layout == layout:
+                break
+            layout = updated_layout
+            page_items = without_color_attributes(await self._attribute_items())
+            assignments = await self._attribute_assignments(fields.fields, page_items)
+            new_labels = [label for key, (label, _value) in assignments.items()
+                          if key not in processed]
+            if not new_labels:
+                break
+            if self.logger is not None:
+                self.logger.info("拼多多属性联动后新增待填字段：%s", "、".join(new_labels))
+        else:
+            raise PddFormListingError("拼多多类目属性连续联动超过 8 轮，字段未稳定；已停止保存")
+        ignored = list(dict.fromkeys(ignored))
         if self.logger is not None:
             self.logger.info(
                 "拼多多类目属性填写完成：已填 %s 项，跳过 %s 项，按规则留空 %s 项",

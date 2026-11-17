@@ -8,17 +8,19 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 MATERIAL_COMPONENT_PATTERN = re.compile(
-    r"\s*(?P<name>[^/()（）]+?)\s*(?:[（(]\s*(?P<parenthesized>\d+)\s*%\s*[）)]|/\s*(?P<slashed>\d+)\s*%)"
+    r"\s*(?P<name>[^/()（）]+?)\s*(?:[（(]\s*(?P<parenthesized>\d+(?:\.\d+)?)\s*[%％]\s*[）)]|/\s*(?P<slashed>\d+(?:\.\d+)?)\s*[%％])"
 )
 COMPACT_MATERIAL_COMPONENT_PATTERN = re.compile(
     r"\s*(?P<name>[^/()（）\d]+?)\s*"
-    r"(?:[（(]\s*(?P<parenthesized>\d+)\s*%\s*[）)]|(?P<bare>\d+)\s*%)\s*"
+    r"(?:[（(]\s*(?P<parenthesized>\d+(?:\.\d+)?)\s*[%％]\s*[）)]|(?P<bare>\d+(?:\.\d+)?)\s*[%％])\s*"
 )
+MaterialPercentage = Union[int, float]
+
 
 # 不应作为抖音商品属性匹配的业务输入字段。每项均为 Excel 键中可能出现的别名。
 RESERVED_FIELD_ALIAS_NAMES = frozenset(
@@ -61,6 +63,22 @@ class DouyinDataError(ValueError):
     """可直接向用户展示的抖音资料输入错误。"""
 
 
+def normalize_material_percentage(value: Any) -> MaterialPercentage:
+    """保留小数含量；整数仍输出整数，兼容现有报告和 JSON。"""
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise DouyinDataError("面料材质百分比必须是有效数字") from exc
+    if not number.is_finite() or not 0 <= number <= 100:
+        raise DouyinDataError("面料材质百分比必须在 0 到 100 之间")
+    return int(number) if number == number.to_integral_value() else float(number)
+
+
+def material_percentage_total(values: Iterable[MaterialPercentage]) -> Decimal:
+    """按十进制相加，不用二进制浮点数判定是否合计 100%。"""
+    return sum((Decimal(str(value)) for value in values), Decimal(0))
+
+
 class FrozenAttributes(Mapping[str, str]):
     """可按字典读取、但不可变的抖音商品属性映射。"""
 
@@ -94,7 +112,7 @@ class FrozenAttributes(Mapping[str, str]):
 @dataclass(frozen=True)
 class MaterialComponent:
     name: str
-    percentage: int
+    percentage: MaterialPercentage
 
 
 @dataclass(frozen=True)
@@ -185,6 +203,27 @@ def _normalize_price(value: Any) -> str:
     return format(number.normalize(), "f")
 
 
+def _price_from_aliases(fields: Dict[str, Any]) -> str:
+    """Use the first numeric price when one Excel row is only a unit label."""
+    aliases = {normalize_key(alias) for alias in (
+        "价格", "京东价", "市场价", "售卖价", "售价", "基本售价", "吊牌价"
+    )}
+    first_error: Optional[DouyinDataError] = None
+    for key, value in fields.items():
+        if not aliases.intersection(key_aliases(key)):
+            continue
+        if not _cell_text(value):
+            continue
+        try:
+            return _normalize_price(value)
+        except DouyinDataError as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+    raise DouyinDataError("Excel 中缺少必填抖音字段：价格")
+
+
 def _parse_stock(value: Any, label: str) -> int:
     number = _normalized_decimal(value, label)
     if number < 0 or number != number.to_integral_value():
@@ -216,9 +255,7 @@ def parse_materials(value: Any) -> Tuple[MaterialComponent, ...]:
         )
         if percentage_text is None:
             return None
-        percentage = int(percentage_text)
-        if not 0 <= percentage <= 100:
-            raise DouyinDataError("面料材质百分比必须在 0 到 100 之间")
+        percentage = normalize_material_percentage(percentage_text)
         return MaterialComponent(name, percentage)
 
     def first_candidate(part: str) -> Optional[MaterialComponent]:
@@ -253,18 +290,18 @@ def parse_materials(value: Any) -> Tuple[MaterialComponent, ...]:
         # value and lets the platform's live candidate validation decide
         # whether that material is available.  Never invent percentages for
         # multiple plain names.
-        if component is None and len(parts) == 1 and not re.search(r"\d\s*%", part):
+        if component is None and len(parts) == 1 and not re.search(r"\d\s*[%％]", part):
             plain = part.strip()
             if plain and "/" not in plain and not re.search(r"[()（）]", plain):
                 component = MaterialComponent(plain, 100)
         if component is None:
             raise DouyinDataError(
                 f"面料材质格式不正确：{original_text!r}，请使用“棉（100%）”、"
-                "“棉/100%”或“棉94%，氨纶6%”"
+                "“棉/100%”、“棉94%，氨纶6%”或“棉95.4%，聚酯纤维4.6%”"
             )
         components.append(component)
 
-    if sum(component.percentage for component in components) != 100:
+    if material_percentage_total(component.percentage for component in components) != 100:
         raise DouyinDataError(
             f"面料材质百分比合计必须为 100：{original_text!r}"
         )
@@ -290,7 +327,9 @@ def _douyin_attributes(fields: Dict[str, Any]) -> FrozenAttributes:
     return FrozenAttributes(attributes)
 
 
-def parse_douyin_fields(fields: Dict[str, Any]) -> DouyinFields:
+def parse_douyin_fields(
+    fields: Dict[str, Any], *, require_size: bool = True
+) -> DouyinFields:
     """从 Excel 键值映射提取并校验抖音表单所需的业务字段。"""
     short_title = _cell_text(_required_value(fields, "导购短标题", "导购短标题"))
     materials_source = field_lookup(
@@ -298,10 +337,12 @@ def parse_douyin_fields(fields: Dict[str, Any]) -> DouyinFields:
     )
     materials_text = _cell_text(materials_source[1]) if materials_source else ""
     materials = parse_materials(materials_text) if materials_text else ()
-    sizes = _split_nonempty(_required_value(fields, "尺码", "尺码"), "/", "尺码")
-    price = _normalize_price(
-        _required_value(fields, "价格", "价格", "京东价", "市场价", "售卖价", "售价")
-    )
+    size_source = field_lookup(fields, "尺码")
+    if size_source is None and not require_size:
+        sizes = ()
+    else:
+        sizes = _split_nonempty(_required_value(fields, "尺码", "尺码"), "/", "尺码")
+    price = _price_from_aliases(fields)
     spot_stock = _parse_stock(_required_value(fields, "现货库存", "现货库存"), "现货库存")
     presale_stock = _parse_stock(_required_value(fields, "预售库存", "预售库存"), "预售库存")
     freight_aliases = _split_nonempty(
@@ -350,7 +391,7 @@ def read_douyin_assets(product_dir: Path, *, garment_kind: str = "clothing") -> 
     匹配；因此 ``1.png``、``吊牌正面.jpg`` 或其他任意图片文件名都等价。
     """
     wash_label_images = _images_in(product_dir / "水洗标图片")
-    needs_recommendations = garment_kind in {"pants", "clothing"}
+    needs_recommendations = garment_kind in {"pants", "clothing", "vest"}
     return DouyinAssets(
         wash_label_images=wash_label_images,
         size_chart_image=(

@@ -41,6 +41,13 @@ select_product_excel() {
   [[ -d "$default_products_root" ]] || default_products_root="$HOME/Desktop/共享文件/谭/products"
   local products_root="${KUAIMAI_PRODUCTS_ROOT:-$default_products_root}"
   local last_product_file="${KUAIMAI_LAST_PRODUCT_FILE:-$SCRIPT_DIR/.local-state/last-product-path}"
+  if [[ "$selected_platform" == "dewu" ]]; then
+    products_root="${DEWU_PRODUCTS_ROOT:-/Volumes/美工文件/得物上款}"
+    last_product_file="${DEWU_LAST_PRODUCT_FILE:-$SCRIPT_DIR/.local-state/last-dewu-product-path}"
+  elif [[ "$selected_platform" == "bilibili" ]]; then
+    products_root="${BILIBILI_PRODUCTS_ROOT:-/Volumes/美工文件/B站上款}"
+    last_product_file="${BILIBILI_LAST_PRODUCT_FILE:-$SCRIPT_DIR/.local-state/last-bilibili-product-path}"
+  fi
   local last_product=""
   local selected_excel=""
   local default_index=""
@@ -100,7 +107,6 @@ select_product_excel() {
 # 双击本脚本时统一在当前终端选择平台和执行模式；带参数调用时保留
 # 命令行入口，便于测试、定时任务和已有自动化调用。
 if (( $# == 0 )); then
-  select_product_excel
   print ""
   print "快麦一键铺货｜统一启动器"
   print "========================================"
@@ -117,10 +123,12 @@ if (( $# == 0 )); then
   print "  9) 京东（填写、保存、铺货）"
   print " 10) 一键新增链接（按视频固定填法，仅创建快麦商品）"
   print " 11) 全平台（有赞除外：基础资料 + 抖音 + 淘宝 + 天猫 + 拼多多 + 微信小店 + 小红书 + 京东）"
+  print " 12) 得物（独立网页上款，仅生成/保存草稿）"
+  print " 13) bilibili（B 站后台独立上款，使用当前商品资料）"
   print "平台编号可多选：直接输入 2,9,7 或 2 9 7，依次运行抖音 → 京东 → 小红书。"
-  print "多选支持 2-9；0、1、10、11 请单独选择。"
+  print "多选支持 2-9；0、1、10、11、12、13 请单独选择。"
   while true; do
-    read "platform_choice?平台编号 [0-11，可多选]: " || exit 1
+    read "platform_choice?平台编号 [0-13，可多选]: " || exit 1
     case "$platform_choice" in
       0) selected_platform="all"; break ;;
       1) selected_platform="base"; break ;;
@@ -134,22 +142,33 @@ if (( $# == 0 )); then
       9) selected_platform="jd"; break ;;
       10) selected_platform="create"; break ;;
       11) selected_platform="all"; PYTHON_ARGS+=(--all-platform-skip youzan); break ;;
+      12) selected_platform="dewu"; break ;;
+      13) selected_platform="bilibili"; break ;;
       *)
         if parse_platform_choices "$platform_choice"; then break; fi
-        print "请输入 0-11 的编号；多选请输入 2-9 的平台编号，用逗号或空格分隔。"
+        print "请输入 0-13 的编号；多选请输入 2-9 的平台编号，用逗号或空格分隔。"
         ;;
     esac
   done
+  select_product_excel
 
   print ""
   print "请选择执行模式："
-  if [[ "$selected_platform" == "create" ]]; then
+  if [[ "$selected_platform" == "dewu" ]]; then
+    print "  1) 创建初始草稿并填写，不再次保存"
+    print "  2) 完整填写并保存草稿（不提交审核）"
+    print "  3) 完整填写并提交得物审核（需要再次输入 REVIEW）"
+  elif [[ "$selected_platform" == "bilibili" ]]; then
+    print "  1) 仅填写和校验 B 站表单"
+    print "  2) 保存 B 站草稿"
+    print "  3) 发布到当前 B 站店铺（需要再次输入 PUBLISH）"
+  elif [[ "$selected_platform" == "create" ]]; then
     print "  1) 填写新增页面，不保存"
   else
     print "  1) 平台仅填写/检查，不保存、不铺货（不会改动基础资料）"
   fi
-  print "  2) 保存，但不铺货"
-  if [[ "$selected_platform" != "create" ]]; then
+  if [[ "$selected_platform" != "dewu" && "$selected_platform" != "bilibili" ]]; then print "  2) 保存，但不铺货"; fi
+  if [[ "$selected_platform" != "create" && "$selected_platform" != "dewu" && "$selected_platform" != "bilibili" ]]; then
     print "  3) 保存并铺货（需要再次输入 PUBLISH）"
   fi
   while true; do
@@ -162,8 +181,18 @@ if (( $# == 0 )); then
         ;;
       3)
         if [[ "$selected_platform" == "create" ]]; then
-          print "新增链接仅创建快麦商品，请选择 1 或 2。"
+          print "当前入口只支持填写或保存草稿，请选择 1 或 2。"
           continue
+        fi
+        if [[ "$selected_platform" == "dewu" ]]; then
+          read "review_confirmation?确认提交得物审核请输入大写 REVIEW，其他输入改为保存草稿： "
+          if [[ "$review_confirmation" == "REVIEW" ]]; then
+            selected_mode="submit_review"
+          else
+            print "未确认提交审核，已改为保存草稿。"
+            selected_mode="save_only"
+          fi
+          break
         fi
         print ""
         print "警告：此选项会真实保存，并向所选平台的指定店铺提交铺货。"
@@ -181,6 +210,7 @@ if (( $# == 0 )); then
   done
 
   case "$selected_platform:$selected_mode" in
+    bilibili:publish) PYTHON_ARGS+=(--platform bilibili --bilibili-publish) ;;
     create:preview) PYTHON_ARGS+=(--platform base --create-product --no-save) ;;
     create:save_only) PYTHON_ARGS+=(--platform base --create-product --save-only) ;;
     wxsph:preview)
@@ -251,6 +281,7 @@ if (( $# == 0 )); then
       case "$selected_mode" in
         preview) PYTHON_ARGS+=(--no-save) ;;
         save_only) PYTHON_ARGS+=(--save-only) ;;
+        submit_review) PYTHON_ARGS+=(--dewu-submit-review) ;;
         publish) PYTHON_ARGS+=(--save) ;;
       esac
       ;;

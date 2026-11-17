@@ -6,6 +6,34 @@ from local_review.ui import SCRIPT, page as review_page
 
 
 class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_all_platform_custom_input_ui_follows_persistence_capability(self):
+        from playwright.async_api import async_playwright
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel='chrome', headless=True)
+            try:
+                tab = await browser.new_page()
+                html = re.sub(r'<script[^>]+src="[^"]+"[^>]*></script>', '', review_page(False))
+                await tab.set_content(html)
+                await tab.add_script_tag(content=SCRIPT)
+                for platform in ('douyin', 'tb', 'tm', 'pdd', 'wxsph', 'xhs', 'yz', 'jd'):
+                    with self.subTest(platform=platform):
+                        await tab.evaluate('''platform => {
+                          current={id:'capability',field_id:'field',title:'测试商品',
+                            platform_id:platform,field_label:'测试属性',control_type:'select',
+                            options:[{value_id:'101',label:'已有候选'}],asset_ids:[],
+                            evidence:{},custom_allowed:true};render(current);
+                        }''', platform)
+                        self.assertTrue(await tab.locator('#custom-value-label').is_visible())
+                        await tab.locator('#custom-value').fill('可保存的新值')
+                        self.assertEqual(await tab.evaluate('selectedParts'), ['可保存的新值'])
+                        await tab.evaluate('current={...current,custom_allowed:false};render(current)')
+                        self.assertFalse(await tab.locator('#custom-value-label').is_visible())
+                        self.assertIn('仅限候选', await tab.locator('#option-search-label').inner_text())
+                        self.assertEqual(await tab.locator('#custom-value').input_value(), '')
+                        self.assertEqual(await tab.evaluate('selectedParts'), [])
+            finally:
+                await browser.close()
+
     async def test_ocr_card_explains_question_source_and_allows_only_one_meaning(self):
         from playwright.async_api import async_playwright
         from local_review.ui import STYLES
@@ -53,7 +81,7 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                         self.assertLessEqual(box['x'] + box['width'], width)
                         self.assertLessEqual(box['y'] + box['height'], height)
                 # Switching back to a normal attribute restores its existing multiple selection.
-                await tab.evaluate("current={...current,field_id:'style',field_label:'风格',evidence:{}};render(current)")
+                await tab.evaluate("current={...current,field_id:'style',field_label:'风格',control_type:'multi_select',evidence:{}};render(current)")
                 self.assertFalse(await tab.locator('#review-context').is_visible())
                 self.assertEqual(await tab.locator('#no-fill').inner_text(), '不填写')
                 await tab.get_by_role('button', name='裤长', exact=True).click()
@@ -249,7 +277,7 @@ class ReviewUiTests(unittest.IsolatedAsyncioTestCase):
                 await tab.goto('https://review.test/review?run_id=failed-run&review_id=target')
                 await tab.evaluate('''() => {
                   window.requests=[];
-                  const task={id:'target',version:1,run_status:'failed',title:'商品',platform_id:'xhs',field_label:'细分风格',
+                  const task={id:'target',version:1,run_status:'failed',title:'商品',platform_id:'xhs',field_label:'细分风格',control_type:'multi_select',
                     options:[{value_id:'young',label:'18-24岁'},{value_id:'adult',label:'25-34岁'}],
                     suggested_value_id:'young,adult',evidence:{},asset_ids:[],custom_allowed:false};
                   window.fetch=async path=>{

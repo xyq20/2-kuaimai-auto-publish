@@ -73,6 +73,17 @@ def resolve_product_materials(
     nickname: str = "",
 ) -> Path:
     month_dir = current_month_directory(root)
+    excel_path = Path(excel_path).expanduser()
+    # 当工作台选中的 Excel 就放在当月商品素材目录中时，该目录本身
+    # 是明确的商品选择；目录末尾也可能是“低帮”等款式描述而非颜色。
+    # 跨目录的旧资料仍使用下面的货号、名称和颜色匹配规则。
+    if excel_path.is_file() and excel_path.parent.parent.resolve() == month_dir.resolve():
+        selected = excel_path.parent.resolve()
+        if selected.parent != month_dir.resolve():
+            raise MaterialPathError(f"商品素材目录超出当月目录：{excel_path.parent}")
+        if not excel_path.resolve().is_relative_to(selected):
+            raise MaterialPathError(f"商品 Excel 超出商品素材目录：{excel_path}")
+        return selected
     folder_name = excel_path.parent.name
     if style_code:
         folder_name = re.sub(

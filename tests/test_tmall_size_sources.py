@@ -296,6 +296,22 @@ class TmallSizeSourceResolutionTests(unittest.TestCase):
         self.assertEqual(result.category_kind, "generic")
         self.assertEqual(result.rows, ({"尺码": "均码"},))
 
+    def test_generic_category_without_excel_size_has_no_synthetic_size_rows(self):
+        fields = parse_tmall_fields({"长度/总长度": "100-110cm"})
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "tmall_size_sources.recognize_size_lengths"
+        ) as recognize_lengths:
+            result = tmall_size_sources.resolve_tmall_size_sources(
+                fields,
+                "服装配饰/服饰配件/腰带/腰链/男士皮带",
+                product_dir=Path(directory),
+            )
+
+        recognize_lengths.assert_not_called()
+        self.assertEqual(result.category_kind, "generic")
+        self.assertEqual(result.sizes, ())
+        self.assertEqual(result.rows, ())
+
     def test_ocr_failure_is_exposed_as_review_required(self):
         with tempfile.TemporaryDirectory() as directory:
             product_dir = Path(directory)

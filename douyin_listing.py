@@ -17,6 +17,10 @@ import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import date
+from douyin_data import (
+    DouyinDataError, MaterialPercentage, material_percentage_total,
+    normalize_material_percentage,
+)
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,6 +34,7 @@ from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from platform_candidate_source import (
     select_supports_multiple,
+    select_supports_custom_value,
     select_multiple_limit,
     CandidateSourceError,
     DomCandidate,
@@ -83,13 +88,31 @@ def normalize_option(value: object) -> str:
     return re.sub(r"[\s，,;；、・·\-_（）()]", "", text).casefold()
 
 
+def _option_identity(value: object) -> str:
+    """Keep parentheses that distinguish separate platform candidates."""
+    text = unicodedata.normalize("NFKC", "" if value is None else str(value))
+    return re.sub(r"[\s，,;；、・·\-_]", "", text).casefold()
+
+
+def _option_matches(expected: str, options: Sequence[Mapping[str, str]]) -> List[Mapping[str, str]]:
+    """Prefer exact labels before ignoring punctuation shared by distinct IDs."""
+    exact = [item for item in options if str(item.get('name', '')).strip() == expected.strip()]
+    if exact:
+        return exact
+    identity = _option_identity(expected)
+    width_matches = [item for item in options if _option_identity(item.get('name', '')) == identity]
+    if width_matches:
+        return width_matches
+    normalized = normalize_option(expected)
+    return [item for item in options if normalize_option(item.get('name', '')) == normalized]
+
+
 def choose_unique_option(
     expected: str,
     options: Sequence[Mapping[str, str]],
 ) -> Mapping[str, str]:
-    """仅在规范化后恰好有一个同名选项时返回它。"""
-    normalized = normalize_option(expected)
-    matches = [item for item in options if normalize_option(item.get("name", "")) == normalized]
+    """精确文案优先，再尝试排版归一化；真实重名仍需消歧。"""
+    matches = _option_matches(expected, options)
     if len(matches) != 1:
         names = "、".join(str(item.get("name", "")) for item in options) or "<无>"
         raise DouyinListingError(
@@ -1312,6 +1335,9 @@ class DouyinListing:
                 return None
             return resolved.label, ()
 
+        custom_allowed = await select_supports_custom_value(
+            select, save_rejected=direct_input_failed
+        )
         api_property = await self._api_property(label)
         if api_property is None:
             if direct_input_failed:
@@ -1426,7 +1452,7 @@ class DouyinListing:
             field_id=field_id, field_label=label,
             candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
             excel_value="/".join(str(v) for v in alternatives), evidence={},
-            custom_allowed=False, schema_version=preflight_schema,
+            custom_allowed=custom_allowed, schema_version=preflight_schema,
             control_type="multi_select" if multi else "select",
         )) if callable(reuse) else None
         if not exact_alternatives and not direct_input_failed and reusable is None:
@@ -1468,7 +1494,7 @@ class DouyinListing:
                 ),
                 excel_value=excel_value,
                 evidence={"excel": bool(excel_value.strip())},
-                custom_allowed=False,
+                custom_allowed=custom_allowed,
                 schema_version=schema_version,
                 control_type="multi_select" if multi else "select",
             )
@@ -2021,7 +2047,7 @@ class DouyinListing:
         require_committed_direct_value: bool = False,
     ) -> Tuple[str, ...]:
         current = await self._read_select_values(select, multi=multi)
-        if sequences_match(current, expected_values, normalize_option):
+        if sequences_match(current, expected_values, _option_identity):
             if self.logger is not None:
                 self.logger.info("抖音属性“%s”已匹配，跳过选择", label)
             return current
@@ -2032,11 +2058,7 @@ class DouyinListing:
             if api_options:
                 # API 只作为优先索引；远程搜索型下拉的初始接口可能只返回
                 # 部分候选，零匹配时继续搜索真实 DOM，重名仍立即报错。
-                api_matches = [
-                    item
-                    for item in api_options
-                    if normalize_option(item.get("name", "")) == normalize_option(expected)
-                ]
+                api_matches = _option_matches(expected, api_options)
                 if len(api_matches) > 1:
                     choose_unique_option(expected, api_options)
             if self.logger is not None:
@@ -2075,11 +2097,7 @@ class DouyinListing:
                     len(dom_options),
                 )
             initial_dom_options = tuple(dom_options)
-            matches = [
-                item
-                for item in dom_options
-                if normalize_option(item.get("name", "")) == normalize_option(expected)
-            ]
+            matches = _option_matches(expected, dom_options)
             if len(matches) > 1:
                 await self._dismiss_select_dropdown(select)
                 choose_unique_option(expected, dom_options)
@@ -2169,12 +2187,7 @@ class DouyinListing:
                             )
                         except DouyinListingError:
                             continue
-                        matches = [
-                            item
-                            for item in dom_options
-                            if normalize_option(item.get("name", ""))
-                            == normalize_option(expected)
-                        ]
+                        matches = _option_matches(expected, dom_options)
                         if len(matches) > 1:
                             await self._dismiss_select_dropdown(select)
                             choose_unique_option(expected, dom_options)
@@ -2276,10 +2289,10 @@ class DouyinListing:
             await self._dismiss_select_dropdown(select)
         actual = await self._read_select_values(select, multi=multi)
         expected_counter = Counter(
-            normalize_option(value)
+            _option_identity(value)
             for value in (realized_expected_values or list(expected_values))
         )
-        actual_counter = Counter(normalize_option(value) for value in actual)
+        actual_counter = Counter(_option_identity(value) for value in actual)
         if actual_counter != expected_counter:
             raise DouyinListingError(
                 f"属性选择后校验失败：期望 {list(expected_values)!r}，页面为 {list(actual)!r}"
@@ -2351,7 +2364,7 @@ class DouyinListing:
 
             # 当前值符合第一套完整方案时复用；备用方案先核对实际候选优先级。
             current = await self._read_select_values(select, multi=multi)
-            if plans and sequences_match(current, plans[0], normalize_option):
+            if plans and sequences_match(current, plans[0], _option_identity):
                 if self.attribute_runtime is not None:
                     await self._resolve_learning_select_value(
                         label,
@@ -2642,8 +2655,8 @@ class DouyinListing:
                 actual = (await self.read_plain_text_field(str(label)),)
             else:
                 actual = await self.read_field_values(str(label))
-            if Counter(normalize_option(value) for value in actual) != Counter(
-                normalize_option(value) for value in expected
+            if Counter(_option_identity(value) for value in actual) != Counter(
+                _option_identity(value) for value in expected
             ):
                 raise DouyinListingError(
                     f"保存后字段“{label}”不一致：期望 {list(expected)!r}，页面为 {list(actual)!r}"
@@ -2837,7 +2850,9 @@ class DouyinListing:
             if await rows.count() == expected:
                 return
             await asyncio.sleep(0.05)
-        raise DouyinListingError(f"面料材质行数未变为 {expected}")
+        raise DouyinListingError(
+            f"面料材质行数未变为 {expected}（当前 {await rows.count()} 行）"
+        )
 
     async def _percentage_input(self, row: Any) -> Any:
         preferred = row.locator(".el-input.el-input-digit > input.el-input__inner")
@@ -2858,7 +2873,7 @@ class DouyinListing:
         materials: Sequence[Any],
         wash_label_paths: Sequence[Path],
         source_text: Optional[str] = None,
-    ) -> Tuple[Tuple[str, int], ...]:
+    ) -> Tuple[Tuple[str, MaterialPercentage], ...]:
         if self.panel is None:
             raise DouyinListingError("抖音资料面板尚未打开")
         labels = self.panel.locator(".el-form-item__label")
@@ -2896,26 +2911,25 @@ class DouyinListing:
         materials: Sequence[Any],
         wash_label_paths: Sequence[Path],
         source_text: Optional[str] = None,
-    ) -> Tuple[Tuple[str, int], ...]:
+    ) -> Tuple[Tuple[str, MaterialPercentage], ...]:
         """填写面料材质并同步水洗标图片。
 
-        多个逗号分隔的材质优先使用页面的“智能填充”，把 Excel 原始值
-        原样交给页面解析，避免逐行操作时漏掉第二条材质。
+        多个逗号分隔的材质优先使用页面的“智能填充”。将已解析的成分
+        转为页面支持的“材质95.4% 材质4.6%”格式；页面不接受括号或
+        斜杠格式，解析为空时会清空原有材质行。
         """
         if not materials:
             raise DouyinListingError("面料材质不能为空")
         percentages = []
         for component in materials:
             try:
-                percentage = int(component.percentage)
-            except (TypeError, ValueError) as exc:
-                raise DouyinListingError("面料百分比必须是整数") from exc
-            if not 0 <= percentage <= 100:
-                raise DouyinListingError("面料百分比必须在 0 到 100 之间")
+                percentage = normalize_material_percentage(component.percentage)
+            except DouyinDataError as exc:
+                raise DouyinListingError(str(exc)) from exc
             percentages.append(percentage)
-        if sum(percentages) != 100:
+        if material_percentage_total(percentages) != 100:
             raise DouyinListingError(
-                f"面料百分比合计必须为 100，当前为 {sum(percentages)}"
+                f"面料百分比合计必须为 100，当前为 {material_percentage_total(percentages)}"
             )
 
         if self.panel is None:
@@ -3003,11 +3017,19 @@ class DouyinListing:
                     break
             if editor is None:
                 raise DouyinListingError("智能填充弹窗中找不到可编辑输入框")
-            raw_material_text = str(source_text).strip()
+            smart_material_text = " ".join(
+                f"{str(component.name).strip()}{percentage}%"
+                for component, percentage in zip(materials, percentages)
+            )
+            if self.logger is not None:
+                self.logger.info(
+                    "面料材质智能填充：Excel 原文=%s；页面输入=%s；目标 %s 行",
+                    source_text, smart_material_text, len(materials),
+                )
             if await editor.get_attribute("contenteditable") == "true":
-                await editor.fill(raw_material_text)
+                await editor.fill(smart_material_text)
             else:
-                await editor.fill(raw_material_text)
+                await editor.fill(smart_material_text)
 
             confirms = overlay.locator("button")
             visible_confirms = []
@@ -3029,7 +3051,7 @@ class DouyinListing:
             if self.logger is not None:
                 self.logger.info(
                     "面料材质包含多个逗号分隔成分，已使用智能填充并确认：%s",
-                    raw_material_text,
+                    smart_material_text,
                 )
 
         if not smart_filled:
@@ -3045,7 +3067,7 @@ class DouyinListing:
                 await delete_button.click()
                 await self._wait_row_count(rows, before - 1)
 
-        actual: List[Tuple[str, int]] = []
+        actual: List[Tuple[str, MaterialPercentage]] = []
         for index, component in enumerate(materials):
             row = rows.nth(index)
             selects = row.locator(".el-select")
@@ -3130,8 +3152,8 @@ class DouyinListing:
                     "面料材质第 %s 行百分比已匹配，跳过填写", index + 1
                 )
             try:
-                page_percentage = int(raw_percentage)
-            except ValueError as exc:
+                page_percentage = normalize_material_percentage(raw_percentage)
+            except DouyinDataError as exc:
                 raise DouyinListingError(
                     f"第 {index + 1} 个面料百分比回读失败：{raw_percentage!r}"
                 ) from exc
@@ -3150,7 +3172,7 @@ class DouyinListing:
             self.logger.warning(
                 "当前商品未提供水洗标图片；保留页面已有图片，最终由页面必填校验判定"
             )
-        if sum(percentage for _name, percentage in actual) != 100:
+        if material_percentage_total(percentage for _name, percentage in actual) != 100:
             raise DouyinListingError("面料百分比页面回读合计不是 100")
         return tuple(actual)
 

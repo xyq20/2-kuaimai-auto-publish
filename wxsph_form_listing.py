@@ -20,12 +20,13 @@ from urllib.parse import parse_qs, urlsplit
 from playwright.async_api import Error as PlaywrightError
 
 from attribute_runtime import AttributeRequest, ResolvedAttribute
-from category_profile import category_profile, category_path_parts, category_search_terms, choose_category_candidate
+from category_profile import category_profile, category_path_parts, category_search_terms, choose_category_candidate, is_category_search_result, is_belt_category
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from platform_candidate_source import (
     select_supports_multiple,
+    select_supports_custom_value,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -33,6 +34,7 @@ from platform_candidate_source import (
 from wxsph_listing import parse_wxsph_attribute_fields
 
 from taobao_listing import (
+    CATEGORY_SEARCH_SECONDS,
     TaobaoListingError,
     excel_aliases,
     material_name_groups,
@@ -91,6 +93,9 @@ WXSPH_FIELD_ALIASES: Mapping[str, Tuple[str, ...]] = {
     ),
     normalize_label("里料材质"): (normalize_label("里料"),),
     normalize_label("材质成分"): (normalize_label("材质"),),
+    normalize_label("主体材质"): tuple(
+        normalize_label(value) for value in ("主材质", "材质", "材质成分")
+    ),
 }
 WXSPH_ATTRIBUTE_END_HEADINGS = re.compile(
     r"^\s*\*?\s*(?:规格明细|价格库存|图文信息|运费模板|上架设置|更多设置)\s*[：:]?\s*$"
@@ -124,6 +129,13 @@ def _required_excel_value(
         for key, value in fields.items()
         if wanted.intersection(excel_aliases(key)) and str(value).strip()
     ]
+    if money and any(
+        "商品分类" in excel_aliases(key) and is_belt_category(value)
+        for key, value in fields.items()
+    ):
+        # A unit-only template cell supplies no amount. Keep real prices and
+        # let the required-value check reject an entirely empty price source.
+        matches = [(key, value) for key, value in matches if value != "元"]
     if not matches:
         raise WxsphFormListingError(
             "Excel 中缺少微信小店{0}字段（可识别：{1}）".format(
@@ -620,6 +632,9 @@ class WxsphFormListing(YouzanFormListing):
                 ],
             }
         )
+        custom_allowed = await select_supports_custom_value(
+            select, schema_allowed=field.custom_allowed
+        )
         candidate_labels = tuple(value.label for value in candidates)
         resolved_values = []
         resolved_options: Dict[str, Tuple[str, str]] = {}
@@ -628,7 +643,7 @@ class WxsphFormListing(YouzanFormListing):
                 platform_id="wxsph", category_leaf_id=category_id,
                 field_id=str(field.source_id), field_label=page_label,
                 candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
-                excel_value="", evidence={}, custom_allowed=bool(field.custom_allowed),
+                excel_value="", evidence={}, custom_allowed=custom_allowed,
                 schema_version=schema_version,
                 control_type="multi_select" if multi else "select",
             )
@@ -685,7 +700,7 @@ class WxsphFormListing(YouzanFormListing):
                     field_id=str(field.source_id), field_label=page_label,
                     candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
                     excel_value="/".join(group), evidence={},
-                    custom_allowed=bool(field.custom_allowed), schema_version=schema_version,
+                    custom_allowed=custom_allowed, schema_version=schema_version,
                     control_type="multi_select" if multi else "select",
                 ),
             )
@@ -698,7 +713,7 @@ class WxsphFormListing(YouzanFormListing):
                     candidates=request_candidates,
                     excel_value=excel_value,
                     evidence={"excel": bool(excel_value.strip())},
-                    custom_allowed=bool(field.custom_allowed),
+                    custom_allowed=custom_allowed,
                     schema_version=schema_version,
                     control_type="multi_select" if multi else "select",
                 )
@@ -1061,12 +1076,13 @@ class WxsphFormListing(YouzanFormListing):
             platform_id="wxsph", category_leaf_id=category_id,
             field_id=str(field.source_id), field_label=page_label,
             candidates=tuple(CandidateValue(label, label) for label in labels),
-            excel_value="", custom_allowed=False,
+            excel_value=("," if multi else "/").join(expected), custom_allowed=False,
             schema_version=canonical_sha256({"field": str(field.source_id),
                 "category": category_id, "dom_labels": labels, "write_recovery": 1}),
             evidence={"force_review": True, "selection_only": True,
-                "failed_value": " / ".join(expected), "write_error": error,
+                "failed_value": " / ".join(expected), "validation_error": error,
                 "summary": "程序选择及手填未能通过回读，无法手填，请从页面候选中选择。运营确认值将覆盖 Excel 原值。"},
+            control_type="multi_select" if multi else "select",
         )
         resolved = await self.attribute_runtime.resolve(request)
         if resolved is None or getattr(resolved, "is_no_fill", False):
@@ -1254,6 +1270,7 @@ class WxsphFormListing(YouzanFormListing):
             # Legacy callers that only operate on attributes have no category
             # intent to validate. Production callers always pass Excel hints.
             return ""
+        belt = any(is_belt_category(hint) for hint in hints)
         await self._wait_for_loading_masks()
         predictions = await self._prediction_candidates()
         current = await self._category_text()
@@ -1274,10 +1291,13 @@ class WxsphFormListing(YouzanFormListing):
                 self.category_clicked = True
                 await self._wait_for_loading_masks()
                 await self._validate_category_readback(expected)
-            self.category_selection.update(source="validated_recommendation", selected=expected)
+            self.category_selection.update(source="validated_recommendation", selected=expected, strategy=strategy)
             return expected
-        if choose_category_candidate((current,), hints)[0]:
-            self.category_selection.update(source="validated_current", selected=current)
+        chosen, strategy = choose_category_candidate((current,), hints)
+        if chosen:
+            self.category_selection.update(source="validated_current", selected=current, strategy=strategy)
+            if self.logger is not None:
+                self.logger.info("微信小店当前类目已匹配 Excel，保留完整路径：%s（%s）", current, strategy)
             return current
         modify = self.panel.get_by_role("button", name="修改类目", exact=True)
         await modify.click()
@@ -1290,17 +1310,10 @@ class WxsphFormListing(YouzanFormListing):
             await search.fill(term)
             if self.logger is not None:
                 self.logger.info("微信小店类目按 Excel 顺序搜索：%s", term)
-            deadline = asyncio.get_running_loop().time() + 10
+            deadline = asyncio.get_running_loop().time() + CATEGORY_SEARCH_SECONDS
             candidates = []
             while asyncio.get_running_loop().time() < deadline:
-                rows = self.page.locator(
-                    ".el-popper:visible .categoryList-wrap .item:visible, "
-                    ".el-autocomplete-suggestion:visible li:visible"
-                )
-                candidates = []
-                for index in range(await rows.count()):
-                    row = rows.nth(index)
-                    candidates.append((re.sub(r"\s+", " ", await row.inner_text()).strip(), row))
+                candidates = await self._category_search_result_nodes(belt=belt)
                 for text, _row in candidates:
                     observed_terms.setdefault(text, term)
                 chosen, strategy = choose_category_candidate([text for text, _ in candidates], hints)
@@ -1311,32 +1324,62 @@ class WxsphFormListing(YouzanFormListing):
                 await asyncio.sleep(0.1)
             if selected is not None:
                 break
-        if selected is None and observed_terms and self.attribute_runtime is not None:
-            paths = list(observed_terms)
-            resolved = await self.attribute_runtime.resolve(AttributeRequest(
-                platform_id="wxsph", category_leaf_id="category-selection",
-                field_id="category_path", field_label="商品类目",
-                candidates=tuple(CandidateValue("path:" + canonical_sha256(path)[:24], path) for path in paths),
-                excel_value=" / ".join(hints),
-                evidence={"excel": True, "live_dom": True, "recommendations": self.category_selection["recommendations"],
-                          "candidate_paths": paths, "excel_category_hints": list(hints)},
-                custom_allowed=False, schema_version=canonical_sha256(paths), control_type="category"))
-            if resolved is None:
-                self.attribute_runtime.raise_deferred_reviews()
+        review_paths = tuple(dict.fromkeys(path for path in
+            (current if belt else "", *observed_terms,
+             *(text for _, text in predictions if belt))
+            if is_category_search_result(path)))
+        if selected is None and review_paths and self.attribute_runtime is not None:
+            if belt:
+                reviewed = await self._resolve_category_review(
+                    tuple(dict.fromkeys((*observed_terms, *(text for _, text in predictions)))),
+                    source="current_recommendation_and_search",
+                    current_category=current,
+                    evidence={"recommendations": self.category_selection["recommendations"],
+                              "search_terms": list(search_terms)},
+                )
+            else:
+                paths = list(observed_terms)
+                resolved = await self.attribute_runtime.resolve(AttributeRequest(
+                    platform_id="wxsph", category_leaf_id="category-selection",
+                    field_id="category_path", field_label="商品类目",
+                    candidates=tuple(CandidateValue("path:" + canonical_sha256(path)[:24], path) for path in paths),
+                    excel_value=" / ".join(hints),
+                    evidence={"excel": True, "live_dom": True,
+                              "recommendations": self.category_selection["recommendations"],
+                              "candidate_paths": paths, "excel_category_hints": list(hints)},
+                    custom_allowed=False, schema_version=canonical_sha256(paths), control_type="category"))
+                if resolved is None:
+                    self.attribute_runtime.raise_deferred_reviews()
+                    raise WxsphFormListingError("微信小店类目等待审核")
+                reviewed = resolved.label if resolved.value_id == "path:" + canonical_sha256(resolved.label)[:24] else ""
+            if belt and not reviewed:
                 raise WxsphFormListingError("微信小店类目等待审核")
-            if resolved.label in observed_terms:
-                await search.fill(observed_terms[resolved.label])
-                deadline = asyncio.get_running_loop().time() + 10
+            if belt and self._normalize_category_path(reviewed) == self._normalize_category_path(current):
+                await self._cancel_category_dialog(dialog)
+                actual = await self._validate_category_readback(current)
+                self.category_selection.update(source="semantic_current", selected=actual)
+                if self.logger is not None:
+                    self.logger.info("微信小店当前类目经商品资料与完整路径语义核对通过，保留：%s", actual)
+                return actual
+            recommended = [(button, path) for button, path in predictions if path == reviewed]
+            if belt and len(recommended) == 1:
+                await self._cancel_category_dialog(dialog)
+                button, expected = recommended[0]
+                self._api_observations.pop("/wxsph/getCategoryProperties.json", None)
+                self._resolved_api_options.clear()
+                await button.click()
+                self.category_clicked = True
+                await self._wait_for_loading_masks()
+                actual = await self._validate_category_readback(expected)
+                self.category_selection.update(source="semantic_recommendation", selected=actual)
+                return actual
+            if reviewed in observed_terms:
+                await search.fill(observed_terms[reviewed])
+                deadline = asyncio.get_running_loop().time() + CATEGORY_SEARCH_SECONDS
                 while asyncio.get_running_loop().time() < deadline:
-                    rows = self.page.locator(
-                        ".el-popper:visible .categoryList-wrap .item:visible, "
-                        ".el-autocomplete-suggestion:visible li:visible"
-                    )
                     matches = []
-                    for index in range(await rows.count()):
-                        row = rows.nth(index)
-                        text = re.sub(r"\s+", " ", await row.inner_text()).strip()
-                        if text == resolved.label and resolved.value_id == "path:" + canonical_sha256(text)[:24]:
+                    for text, row in await self._category_search_result_nodes(belt=belt):
+                        if text == reviewed:
                             matches.append((text, row))
                     if len(matches) == 1:
                         selected = matches[0]
@@ -1367,6 +1410,32 @@ class WxsphFormListing(YouzanFormListing):
         if self.logger is not None:
             self.logger.info("微信小店类目已按 Excel 校验并修改：%s", actual)
         return actual
+
+    async def _category_search_result_nodes(self, *, belt: bool) -> Tuple[Tuple[str, Any], ...]:
+        if belt:
+            return await self._visible_category_result_nodes()
+        # Keep the existing non-belt row locator and candidate protocol.
+        rows = self.page.locator(
+            ".el-popper:visible .categoryList-wrap .item:visible, "
+            ".el-autocomplete-suggestion:visible li:visible"
+        )
+        result = []
+        for index in range(await rows.count()):
+            row = rows.nth(index)
+            text = re.sub(r"\s+", " ", await row.inner_text()).strip()
+            if (is_category_search_result(text)
+                    and await row.get_attribute("aria-disabled") != "true"
+                    and "is-disabled" not in (await row.get_attribute("class") or "").split()):
+                result.append((text, row))
+        return tuple(result)
+
+    async def _cancel_category_dialog(self, dialog: Any) -> None:
+        cancel = dialog.get_by_role("button", name=re.compile(r"^\s*取\s*消\s*$"))
+        if await cancel.count() == 1:
+            await cancel.click()
+        else:
+            await dialog.locator(".el-dialog__headerbtn").click()
+        await dialog.wait_for(state="hidden")
 
     async def _attribute_vertical_bounds(self) -> Tuple[Optional[float], Optional[float]]:
         if self.panel is None:
@@ -1507,6 +1576,8 @@ class WxsphFormListing(YouzanFormListing):
         page_items: Mapping[str, Tuple[str, Any]],
     ) -> Dict[str, Tuple[str, str]]:
         sources: Dict[str, List[Tuple[str, str]]] = {}
+        belt = any("商品分类" in excel_aliases(key) and is_belt_category(value)
+                   for key, value in fields.items())
         page_items = without_color_attributes(page_items)
         for excel_key, raw_value in fields.items():
             excel_names = set(excel_aliases(excel_key))
@@ -1514,6 +1585,8 @@ class WxsphFormListing(YouzanFormListing):
                 base = normalized_page.split("#", 1)[0]
                 accepted = {base}
                 explicit_aliases = WXSPH_FIELD_ALIASES.get(base)
+                if base == normalize_label("主体材质") and not belt:
+                    explicit_aliases = None
                 if explicit_aliases is None:
                     accepted.update(excel_aliases(page_label))
                 else:

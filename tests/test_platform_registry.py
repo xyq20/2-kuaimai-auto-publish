@@ -42,6 +42,8 @@ class PlatformRegistryTests(unittest.TestCase):
                 ("xhs", "xhs", "小红书资料", "小红书资料", "implemented", True, True, "allowed", True, "xhs_listing:XhsListing"),
                 ("youzan", "yz", "有赞资料", "有赞资料", "implemented", True, False, "allowed", True, None),
                 ("jd", "jd", "京东资料", "京东资料", "implemented", True, False, "allowed", True, None),
+                ("dewu", "dewu", "得物独立上款", "得物", "implemented", False, False, "allowed", False, None),
+                ("bilibili", "bilibili", "bilibili独立上款", "bilibili", "implemented", False, False, "allowed", True, None),
             ],
         )
 
@@ -50,7 +52,7 @@ class PlatformRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             registry.platform_cli_choices(),
-            ("all", "base", "douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd"),
+            ("all", "base", "douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "youzan", "jd", "dewu", "bilibili"),
         )
 
     def test_lookup_supports_public_name_and_unique_platform_id(self):

@@ -7,6 +7,12 @@ from wxsph_data import parse_wxsph_fields
 from wxsph_form_listing import WxsphFormListing, WxsphFormListingError
 from taobao_listing import TaobaoListingError
 
+BELT_HINTS = (
+    "服装 > 服装配饰 > 腰带/皮带/腰链",
+    "服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带",
+)
+WXSPH_BELT_PATH = "箱包皮具 > 箱包皮具配件 > 男士皮带"
+
 
 def select_markup(options):
     rendered = "".join(
@@ -30,16 +36,23 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
           </div></section>
           <div role="dialog" aria-label="修改类目" style="display:none">
             <input placeholder="请输入类目关键词，支持模糊查询" oninput="showCategory(this.value)">
-            <div id="chosen">已选：</div>
+            <div id="chosen">已选：</div><div id="menus"></div>
             <button onclick="document.querySelector('.current').textContent=window.chosen;this.parentElement.style.display='none'">确定</button>
+            <button onclick="this.parentElement.style.display='none'">取消</button>
           </div>
           <div class="el-autocomplete-suggestion"><ul id="results"></ul></div>
           <script>
             window.searches=[];
+            function renderMenus(path) {
+              const parts=path.split(' > ');
+              document.querySelector('#menus').innerHTML=parts.map((name,i)=>
+                '<div class="el-cascader-menu"><div class="el-cascader-node" '+
+                (i<parts.length-1?'aria-haspopup="true"':'')+'><span class="el-cascader-node__label">'+name+'</span></div></div>').join('');
+            }
             function showCategory(value) {
               window.searches.push(value);
               const row=document.createElement('li');row.textContent='男装 > '+value;
-              row.onclick=()=>{window.chosen=row.textContent;document.getElementById('chosen').textContent='已选：'+row.textContent;};
+              row.onclick=()=>{window.chosen=row.textContent;document.getElementById('chosen').textContent='已选：'+row.textContent;renderMenus(row.textContent);};
               document.getElementById('results').replaceChildren(row);
             }
           </script>
@@ -53,6 +66,76 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         listing = await self._category_search_listing("男装 > 牛仔裤/男士直筒牛仔裤")
         self.assertEqual(await listing.apply_recommended_category(), "男装 > 牛仔裤")
         self.assertEqual(await self.page.evaluate('window.searches'), ['牛仔裤'])
+
+    async def test_category_keeps_explicit_composite_member_without_search_or_review(self):
+        runtime = type('Runtime', (), {'resolve': AsyncMock()})()
+        listing = await self._category_search_listing(BELT_HINTS[0], runtime)
+        listing.category_hints = BELT_HINTS
+        await self.page.locator('.current').evaluate('(node, path) => node.textContent=path', WXSPH_BELT_PATH)
+        self.assertEqual(await listing.apply_recommended_category(), WXSPH_BELT_PATH)
+        self.assertEqual(await self.page.evaluate('window.searches'), [])
+        self.assertEqual(listing.category_selection['strategy'], 'composite_member_exact')
+        runtime.resolve.assert_not_called()
+
+    async def test_category_semantic_comparison_retains_current_path_across_taxonomies(self):
+        cases = ((BELT_HINTS[:1], WXSPH_BELT_PATH),)
+        for hints, current in cases:
+            with self.subTest(current=current):
+                async def resolve(request):
+                    self.assertEqual(request.evidence['current_category'], current)
+                    self.assertEqual([c.label for c in request.candidates], [current])
+                    c = request.candidates[0]
+                    return ResolvedAttribute(c.value_id, c.label, 'deepseek', 'snapshot')
+                runtime = type('Runtime', (), {})()
+                runtime.resolve = AsyncMock(side_effect=resolve)
+                listing = await self._category_search_listing(hints[0], runtime)
+                listing.category_hints = hints
+                await self.page.locator('.current').evaluate('(node, path) => node.textContent=path', current)
+                await self.page.evaluate('''() => {
+                  window.showCategory = value => {
+                    window.searches.push(value);
+                    document.getElementById('results').innerHTML='<li>暂无结果</li>';
+                  };
+                }''')
+                self.assertEqual(await listing.apply_recommended_category(), current)
+                self.assertEqual(listing.category_selection['source'], 'semantic_current')
+                self.assertFalse(listing.category_clicked)
+                runtime.resolve.assert_awaited_once()
+
+    async def test_category_semantic_choice_can_select_search_result_with_different_taxonomy(self):
+        runtime = type('Runtime', (), {})()
+        async def resolve(request):
+            self.assertEqual({c.label for c in request.candidates}, {'男装 > 衬衫', WXSPH_BELT_PATH})
+            c = next(c for c in request.candidates if c.label == WXSPH_BELT_PATH)
+            return ResolvedAttribute(c.value_id, c.label, 'deepseek', 'snapshot')
+        runtime.resolve = AsyncMock(side_effect=resolve)
+        listing = await self._category_search_listing(BELT_HINTS[0], runtime)
+        listing.category_hints = BELT_HINTS[:1]
+        await self.page.evaluate('''path => {
+          window.showCategory = value => {
+            window.searches.push(value);
+            const row=document.createElement('li');row.textContent=path;
+            row.onclick=()=>{window.chosen=path;document.getElementById('chosen').textContent='已选：'+path;renderMenus(path);};
+            document.getElementById('results').replaceChildren(row);
+          };
+        }''', WXSPH_BELT_PATH)
+        self.assertEqual(await listing.apply_recommended_category(), WXSPH_BELT_PATH)
+        self.assertEqual(await self.page.evaluate('window.searches'),
+                         ['腰带/皮带/腰链', '腰带/皮带/腰链'])
+
+    async def test_empty_category_search_does_not_submit_unselectable_review(self):
+        runtime = type('Runtime', (), {'resolve': AsyncMock()})()
+        listing = await self._category_search_listing('男装 > 牛仔裤', runtime)
+        await self.page.locator('.current').evaluate("node => node.textContent=''")
+        await self.page.evaluate('''() => {
+          window.showCategory = value => {
+            window.searches.push(value);
+            document.getElementById('results').innerHTML='<li>暂无结果</li><li class="is-disabled">男装 > 牛仔裤</li>';
+          };
+        }''')
+        with self.assertRaisesRegex(WxsphFormListingError, '未找到唯一可用候选'):
+            await listing.apply_recommended_category()
+        runtime.resolve.assert_not_called()
 
     async def test_category_review_waits_for_all_terms_and_restores_earlier_result(self):
         runtime = type('Runtime', (), {})()
@@ -70,7 +153,7 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
             window.searches.push(value);
             const row=document.createElement('li');
             row.textContent=value==='牛仔裤' ? '男装 > 工装裤' : '男装 > 西裤';
-            row.onclick=()=>{window.chosen=row.textContent;document.getElementById('chosen').textContent='已选：'+row.textContent;};
+            row.onclick=()=>{window.chosen=row.textContent;document.getElementById('chosen').textContent='已选：'+row.textContent;renderMenus(row.textContent);};
             document.getElementById('results').replaceChildren(row);
           };
         }""")
@@ -111,6 +194,41 @@ class WxsphFormListingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(WxsphFormListingError):
             await listing._verify_persisted_attributes(
                 fields, expected_attributes={'面料材质': ('棉',)})
+
+    async def test_body_material_uses_excel_main_material_without_mixing_buckle(self):
+        listing = object.__new__(WxsphFormListing)
+        assignments = await listing._attribute_assignments({
+            '商品分类': BELT_HINTS[0],
+            '材质成分/材质/主材质': '头层牛皮/头层牛皮（革）',
+            '带扣材质': '铜',
+        }, {'主体材质': ('主体材质', None), '带扣材质': ('带扣材质', None)})
+        self.assertEqual(assignments['主体材质'][1], '头层牛皮/头层牛皮（革）')
+        self.assertEqual(assignments['带扣材质'][1], '铜')
+        with self.assertRaisesRegex(WxsphFormListingError, '匹配到多个 Excel 值'):
+            await listing._attribute_assignments({'商品分类': BELT_HINTS[0], '主材质': '牛皮', '主体材质': '帆布'},
+                                                {'主体材质': ('主体材质', None)})
+        self.assertEqual(await listing._attribute_assignments(
+            {'商品分类': '男装 > 休闲裤', '主材质': '牛皮'},
+            {'主体材质': ('主体材质', None)}), {})
+
+    def test_sku_prices_skip_unit_template_and_require_unambiguous_real_prices(self):
+        fields = {'吊牌价/价格/基本售价/商品价格': '元',
+                  '价格/京东价/市场价/售卖价/售价': '298元', '数量': '100', '商品分类': BELT_HINTS[0]}
+        self.assertEqual(WxsphFormListing._expected_sku_values(fields),
+                         {'售卖价': '298', '市场价': '298', '库存': '100'})
+        for placeholder, price, message in (
+            ('元', '元', '缺少微信小店售卖价'),
+            ('元起', '298', '不是有效金额'),
+            ('299', '298', '匹配到多个 Excel 字段'),
+        ):
+            with self.subTest(placeholder=placeholder, price=price):
+                values = dict(fields)
+                values['吊牌价/价格/基本售价/商品价格'] = placeholder
+                values['价格/京东价/市场价/售卖价/售价'] = price
+                with self.assertRaisesRegex(WxsphFormListingError, message):
+                    WxsphFormListing._expected_sku_values(values)
+        with self.assertRaisesRegex(WxsphFormListingError, '不是有效金额'):
+            WxsphFormListing._expected_sku_values(dict(fields, 商品分类='男装 > 休闲裤'))
 
     async def test_persisted_readback_honors_reviewed_no_fill(self):
         class Runtime:

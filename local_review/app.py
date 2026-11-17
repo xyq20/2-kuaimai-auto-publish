@@ -368,7 +368,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     def launcher_config(request: Request):
         user = _require_user(request)
         return _response({"user": {"username": user["username"], "role": user["role"]},
-                          "platforms": PLATFORMS, "learning_available": bool(configured.device_token)})
+                          "platforms": PLATFORMS, "independent_platforms": {'dewu': '得物'},
+                          "learning_available": bool(configured.device_token)})
 
     @app.get("/api/health")
     def health(request: Request):
@@ -382,17 +383,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/api/launcher/products")
     def launcher_products(request: Request):
         _require_user(request)
-        return _response({"products": request.app.state.launcher.catalog.listing()})
+        catalog = request.app.state.launcher.catalog_for(request.query_params.get('source', 'default'))
+        return _response({"products": catalog.listing()})
 
     @app.get("/api/launcher/products/{product_id}")
     def launcher_product(product_id: str, request: Request):
         _require_user(request)
-        return _response(request.app.state.launcher.catalog.detail(product_id))
+        catalog = request.app.state.launcher.catalog_for(request.query_params.get('source', 'default'))
+        return _response(catalog.detail(product_id))
 
     @app.get("/api/launcher/products/{product_id}/image")
     def launcher_image(product_id: str, request: Request):
         _require_user(request)
-        path = request.app.state.launcher.catalog.image(product_id)
+        catalog = request.app.state.launcher.catalog_for(request.query_params.get('source', 'default'))
+        path = catalog.image(product_id)
         require(path is not None, 404, "image_not_found")
         return FileResponse(path, headers={"cache-control": "private, max-age=60", "x-content-type-options": "nosniff"})
 
@@ -400,7 +404,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def launcher_open_folder(product_id: str, request: Request):
         _same_origin(request)
         _require_admin(_require_user(request))
-        return _response(await run_in_threadpool(request.app.state.launcher.catalog.open_folder, product_id))
+        catalog = request.app.state.launcher.catalog_for(request.query_params.get('source', 'default'))
+        return _response(await run_in_threadpool(catalog.open_folder, product_id))
 
     @app.get("/api/launcher/jobs")
     def launcher_jobs(request: Request):

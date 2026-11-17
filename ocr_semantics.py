@@ -12,6 +12,7 @@ from learning_models import canonical_sha256
 
 MEANINGS = {
     "clothing": {"length": "衣长", "chest": "胸围", "shoulder": "肩宽", "sleeve": "袖长", "cuff": "袖口", "other": "其他测量项"},
+    "vest": {"length": "衣长", "chest": "胸围", "shoulder": "肩宽", "hem": "下摆", "other": "其他测量项"},
     "pants": {"length": "裤长", "waist": "腰围", "hip": "臀围", "foot_opening": "脚围", "other": "其他测量项"},
 }
 CURRENT_SESSION: ContextVar = ContextVar("ocr_semantic_session", default=None)

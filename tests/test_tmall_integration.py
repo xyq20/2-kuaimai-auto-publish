@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import ExitStack, contextmanager
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,11 +10,61 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import kuaimai_erp
 from model_judgments import summarize
-from tmall_form_listing import TmallFormListingError, TmallProductWriteRequired
+from tmall_form_listing import (
+    TmallFormListingError, TmallProductIdentityNotReady, TmallProductWriteRequired,
+)
 from tmall_size_sources import TmallSizeReviewRequired
 
 
 LOGGER = logging.getLogger("tmall-integration-tests")
+
+
+class ErpRedirectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_erpb_entry_takes_over_scmb_product_center(self):
+        context = SimpleNamespace(pages=[])
+        center_label = SimpleNamespace(first=object())
+        scm = SimpleNamespace(
+            url="https://scmb.superboss.cc/supplier/index", context=context,
+            wait_for_load_state=AsyncMock(), get_by_text=Mock(return_value=center_label),
+        )
+        page = SimpleNamespace(
+            url="https://erpb.superboss.cc/index.html#/index/", frames=[],
+            context=context, goto=AsyncMock(),
+        )
+        context.pages.append(page)
+        entry = SimpleNamespace(evaluate=AsyncMock(side_effect=lambda _script: context.pages.append(scm)))
+        with patch.object(kuaimai_erp, "visible_text_across_frames", new=AsyncMock(return_value=None)), patch.object(
+            kuaimai_erp, "dismiss_erp_blocking_dialogs", new=AsyncMock()
+        ), patch.object(kuaimai_erp, "wait_for_erp_entry_stable", new=AsyncMock(return_value=entry)), patch.object(
+            kuaimai_erp, "wait_for_scm_api_session", new=AsyncMock()
+        ) as api_check, patch.object(kuaimai_erp, "open_product_center_from_supplier", new=AsyncMock()), patch.object(
+            kuaimai_erp, "visible", new=AsyncMock(return_value=True)
+        ), patch.object(kuaimai_erp, "settle_scm_first_entry_dialog", new=AsyncMock()):
+            result = await kuaimai_erp.enter_kuaimai_from_erp(
+                page, 1, True, LOGGER, style_code="ZH0222皮带"
+            )
+
+        self.assertIs(result, scm)
+        api_check.assert_awaited_once_with(scm, "ZH0222皮带", 1, LOGGER)
+
+    async def test_authenticated_erpb_home_continues_without_waiting_for_login(self):
+        page = SimpleNamespace(
+            url="https://erpb.superboss.cc/index.html#/index/",
+            frames=[], context=object(), goto=AsyncMock(),
+        )
+        class EntryReached(Exception):
+            pass
+
+        with patch.object(kuaimai_erp, "visible_text_across_frames", new=AsyncMock(return_value=None)), patch.object(
+            kuaimai_erp, "try_erp_login_with_agreement", new=AsyncMock(return_value=False)
+        ) as login, patch.object(kuaimai_erp, "dismiss_erp_blocking_dialogs", new=AsyncMock()), patch.object(
+            kuaimai_erp, "wait_for_erp_entry_stable", new=AsyncMock(side_effect=EntryReached)
+        ) as entry:
+            with self.assertRaises(EntryReached):
+                await kuaimai_erp.enter_kuaimai_from_erp(page, 0, True, LOGGER)
+
+        login.assert_not_awaited()
+        entry.assert_awaited_once_with(page, 0)
 
 
 class _ValueInput:
@@ -96,6 +147,7 @@ def _listing(require_full_form_error=None):
         restore_product_season=AsyncMock(return_value="2026年秋季"),
         fill_leather_shoe_listing_date=AsyncMock(return_value=None),
         fill_initial_product_materials=AsyncMock(return_value={}),
+        fill_initial_footwear_attributes=AsyncMock(return_value={}),
         require_full_form=AsyncMock(),
         inspect_initial_product_images=AsyncMock(
             return_value={"count": 1, "expected_count": 1, "decoded": True}
@@ -492,6 +544,28 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         controls.prepare_taobao_publish_dialog.assert_not_awaited()
         controls.submit_taobao_publish_dialog.assert_not_awaited()
 
+    async def test_belt_without_size_source_fills_form_and_skips_size_cleanup(self):
+        listing = _listing()
+        listing.apply_recommended_category.return_value = "服饰配件 > 腰带/皮带/腰链"
+        product = _product()
+        product.tmall_fields.fields.pop("尺码")
+        with tempfile.TemporaryDirectory() as directory, self._patched_flow(
+            listing
+        ) as controls:
+            controls.resolve_tmall_size_sources.return_value = SimpleNamespace(
+                category_kind="generic", sizes=(), headers=(), rows=(), evidence=()
+            )
+            await kuaimai_erp.run_browser_automation(
+                self._args(), product, Path(directory), LOGGER
+            )
+
+        listing.fill_attributes.assert_awaited_once_with(product.tmall_fields)
+        listing.fill_sku_batch.assert_awaited_once()
+        listing.fill_size_chart.assert_not_awaited()
+        listing.clean_size_chart_integer_displays.assert_not_awaited()
+        listing.validate_remaining_required_fields.assert_awaited_once()
+        controls.click_save_and_confirm.assert_not_awaited()
+
     async def test_shared_flow_reuses_current_editor_without_reload_or_reopen(self):
         listing = _listing()
         shared_drawer = SimpleNamespace(wait_for=AsyncMock())
@@ -521,6 +595,107 @@ class TmallBrowserPreviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         controls.wait_for_base_form_ready_after_save.assert_not_awaited()
         controls.form_item.assert_not_awaited()
         listing.open.assert_awaited_once()
+
+    async def test_blank_identity_reloads_once_and_continues_with_new_schema(self):
+        first, recovered = _listing(), _listing()
+        first.fill_product_identity.side_effect = TmallProductIdentityNotReady("货号、品牌未显示")
+        with tempfile.TemporaryDirectory() as directory, self._patched_flow(first) as controls:
+            controls.listing_factory.side_effect = (first, recovered)
+            await kuaimai_erp.run_browser_automation(
+                self._args(), _product(), Path(directory), LOGGER,
+            )
+            before = json.loads((Path(directory) / "tmall-product-identity-retry.json").read_text())
+            final = json.loads((Path(directory) / "tmall-before-save.json").read_text())
+            self.assertEqual(before["status"], "retrying_product_identity")
+            self.assertEqual(final["product_identity_recovery"], {"attempts": 1, "status": "recovered"})
+
+        controls.page.reload.assert_awaited_once()
+        self.assertEqual(controls.open_product_editor.await_count, 2)
+        factory_calls = controls.listing_factory.call_args_list
+        self.assertIsNot(factory_calls[0].kwargs["api_index"], factory_calls[1].kwargs["api_index"])
+        first.fill_attributes.assert_not_awaited()
+        recovered.fill_attributes.assert_awaited_once()
+        recovered.publish_product_information.assert_not_awaited()
+        controls.click_save_and_confirm.assert_not_awaited()
+
+    async def test_persistent_blank_identity_stops_after_one_reload(self):
+        first, second = _listing(), _listing()
+        for listing in (first, second):
+            listing.fill_product_identity.side_effect = TmallProductIdentityNotReady("货号、品牌仍未显示")
+        with tempfile.TemporaryDirectory() as directory, self._patched_flow(first) as controls:
+            controls.listing_factory.side_effect = (first, second)
+            with self.assertRaisesRegex(TmallProductIdentityNotReady, "仍未显示"):
+                await kuaimai_erp.run_browser_automation(
+                    self._args(), _product(), Path(directory), LOGGER,
+                )
+            report = json.loads((Path(directory) / "tmall-review-required.json").read_text())
+            self.assertEqual(report["product_identity_recovery"], {"attempts": 1, "status": "failed"})
+            self.assertEqual(report["reason_code"], "tmall_product_identity_review_required")
+
+        controls.page.reload.assert_awaited_once()
+        self.assertEqual(controls.listing_factory.call_count, 2)
+        for listing in (first, second):
+            listing.fill_attributes.assert_not_awaited()
+            listing.publish_product_information.assert_not_awaited()
+        controls.click_save_and_confirm.assert_not_awaited()
+
+    async def test_identity_data_or_validation_errors_do_not_reload(self):
+        for reason in ("Excel 缺少品牌", "品牌选择后回读失败", "货号不是唯一项：2"):
+            with self.subTest(reason=reason):
+                listing = _listing()
+                listing.fill_product_identity.side_effect = TmallFormListingError(reason)
+                with tempfile.TemporaryDirectory() as directory, self._patched_flow(listing) as controls:
+                    with self.assertRaisesRegex(TmallFormListingError, reason):
+                        await kuaimai_erp.run_browser_automation(
+                            self._args(), _product(), Path(directory), LOGGER,
+                        )
+                controls.page.reload.assert_not_awaited()
+                controls.listing_factory.assert_called_once()
+                controls.click_save_and_confirm.assert_not_awaited()
+
+    async def test_shared_saved_flow_updates_editor_and_does_not_retry_later_errors(self):
+        first, recovered = _listing(), _listing()
+        first.fill_product_identity.side_effect = TmallProductIdentityNotReady("首批字段为空")
+        recovered.fill_attributes.side_effect = TmallFormListingError("风格字段缺失")
+        args = self._args()
+        args.save = True
+        args.save_only = True
+        with tempfile.TemporaryDirectory() as directory, self._patched_flow(first) as controls:
+            controls.listing_factory.side_effect = (first, recovered)
+            shared = {
+                "playwright": object(), "context": controls.page.context,
+                "page": controls.page, "drawer": SimpleNamespace(wait_for=AsyncMock()),
+                "record": {"baseItemId": "BASE-TMALL"},
+                "style_code": "STYLE-TMALL", "owns_context": False,
+            }
+            with self.assertRaisesRegex(TmallFormListingError, "风格字段缺失"):
+                await kuaimai_erp.run_browser_automation(
+                    args, _product(), Path(directory), LOGGER, shared_session=shared,
+                )
+            self.assertIs(shared["drawer"], controls.open_product_editor.return_value)
+
+        controls.page.reload.assert_awaited_once()
+        controls.open_product_editor.assert_awaited_once()
+        controls.click_save_and_confirm.assert_not_awaited()
+        recovered.fill_product_identity.assert_awaited_once()
+
+    async def test_shared_unsaved_preview_does_not_reload_and_lose_other_platform_edits(self):
+        listing = _listing()
+        listing.fill_product_identity.side_effect = TmallProductIdentityNotReady("首批字段为空")
+        with tempfile.TemporaryDirectory() as directory, self._patched_flow(listing) as controls:
+            shared = {
+                "playwright": object(), "context": controls.page.context,
+                "page": controls.page, "drawer": SimpleNamespace(wait_for=AsyncMock()),
+                "record": {"baseItemId": "BASE-TMALL"},
+                "style_code": "STYLE-TMALL", "owns_context": False,
+            }
+            with self.assertRaises(TmallProductIdentityNotReady):
+                await kuaimai_erp.run_browser_automation(
+                    self._args(), _product(), Path(directory), LOGGER, shared_session=shared,
+                )
+        controls.page.reload.assert_not_awaited()
+        controls.open_product_editor.assert_not_awaited()
+        controls.click_save_and_confirm.assert_not_awaited()
 
     async def test_tmall_formal_save_and_publish_selects_only_target_shop(self):
         listing = _listing()

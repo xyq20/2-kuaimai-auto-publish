@@ -24,6 +24,7 @@ from platform_registry import PLATFORM_SPECS, canonical_platform_name
 from product_materials import MaterialPathError, current_month_directory, resolve_product_materials
 
 PLATFORMS = {s.cli_name: s.display_name.replace("资料", "") for s in PLATFORM_SPECS if s.enabled_in_all}
+PLATFORM_LABELS = {**PLATFORMS, 'dewu': '得物', 'bilibili': 'bilibili'}
 ACTIVE = {"running", "waiting_review", "stopping"}
 IDENTIFIER = re.compile(r"^[0-9a-f]{32}$")
 
@@ -187,7 +188,7 @@ class ProductCatalog:
                 "id": product_id,
                 "title": value("商品标题", "商品名称", "宝贝标题") or path.parent.name,
                 "style_code": value("货号", "商家外部编码", "款式编码") or path.parent.name,
-                "category": value("商品分类") or "以 Excel 类目为准",
+                "category": value("商品分类", "商品类目") or "以 Excel 类目为准",
                 "folder": path.parent.name,
                 "image": f"/api/launcher/products/{product_id}/image" if self.image(product_id, fields=fields) else None,
             }
@@ -249,6 +250,116 @@ class ProductCatalog:
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             raise ApiError(503, "folder_open_failed") from None
         return {"opened": True}
+
+
+class DewuProductCatalog(ProductCatalog):
+    """Dewu keeps its product discovery and saved drafts separate from ERP."""
+
+    def paths(self) -> dict:
+        if not self.root.is_dir():
+            raise ApiError(503, 'dewu_products_unavailable')
+        from dewu_data import natural_key
+        try:
+            paths = sorted((path for path in self.root.glob('*/产品信息.xlsx')
+                            if path.is_file() and self._safe(path)), key=natural_key)
+            return {hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:32]: path for path in paths}
+        except OSError:
+            raise ApiError(503, 'dewu_products_unavailable') from None
+
+    def _progress(self):
+        saved = set()
+        if self.runs_root is not None:
+            for path in self.runs_root.rglob('dewu-result.json'):
+                report = read_json(path, {})
+                if not isinstance(report, dict) or report.get('status') not in {'draft_saved', 'already_saved', 'submitted_for_review', 'already_submitted'}:
+                    continue
+                excel_path = report.get('excel_path')
+                if not excel_path:
+                    summary = read_json(path.parent / 'input-summary.json', {})
+                    excel_path = summary.get('excel_path') if isinstance(summary, dict) else None
+                if excel_path:
+                    saved.add(self._folder_key(Path(excel_path).parent))
+        return saved
+
+    def listing(self) -> list:
+        saved = self._progress()
+        return [{'id': key, 'title': path.parent.name, 'source': 'dewu',
+                 'processed': self._folder_key(path.parent) in saved,
+                 'processed_platforms': ['得物'] if self._folder_key(path.parent) in saved else [],
+                 'base_saved': False, 'runnable': True}
+                for key, path in self.paths().items()]
+
+    def detail(self, product_id: str) -> dict:
+        path = self.path(product_id)
+        try:
+            signature = (path.stat().st_mtime_ns, path.stat().st_size)
+            cached = self._cache.get(product_id)
+            if cached and cached[0] == signature:
+                detail = dict(cached[1])
+            else:
+                from openpyxl import load_workbook
+                from kuaimai_erp import read_excel_fields, normalize_cell
+                from douyin_data import field_lookup
+                workbook = load_workbook(path, read_only=True, data_only=True)
+                try:
+                    fields = read_excel_fields(workbook.worksheets[0].iter_rows(values_only=True))
+                finally:
+                    workbook.close()
+                def value(*aliases):
+                    match = field_lookup(fields, *aliases)
+                    return normalize_cell(match[1]) if match else ''
+                detail = {'id': product_id, 'title': value('卖点提炼', '商品标题', '商品名称') or path.parent.name,
+                          'style_code': value('货号', '款式编码') or path.parent.name,
+                          'category': value('类目', '商品类目', '商品分类') or '以 Excel 类目为准',
+                          'folder': path.parent.name, 'source': 'dewu', 'base_saved': False, 'runnable': True}
+                self._cache[product_id] = (signature, dict(detail))
+            detail['image'] = f'/api/launcher/products/{product_id}/image?source=dewu' if self.image(product_id) else None
+            detail['processed'] = self._folder_key(path.parent) in self._progress()
+            detail['processed_platforms'] = ['得物'] if detail['processed'] else []
+            return detail
+        except (OSError, ValueError, KeyError, BadZipFile):
+            raise ApiError(422, 'product_unreadable') from None
+
+    def image(self, product_id: str, *, fields=None):
+        from dewu_data import natural_key
+        folder = self.path(product_id).parent.resolve()
+        directory = folder / '白底图'
+        if not directory.is_dir() or not directory.resolve().is_relative_to(folder):
+            return None
+        paths = sorted((path for path in directory.rglob('*')
+                        if path.is_file() and path.suffix.lower() in {'.jpg', '.jpeg', '.png'}
+                        and path.resolve().is_relative_to(directory.resolve())
+                        and not any(part.startswith('.') for part in path.relative_to(directory).parts)), key=natural_key)
+        return paths[0] if paths else None
+
+
+class BilibiliProductCatalog(ProductCatalog):
+    """Product workbooks and adjacent assets from the dedicated B 站 share."""
+
+    def _progress(self):
+        saved = set()
+        if self.runs_root is not None:
+            for path in self.runs_root.glob('*/bilibili-result.json'):
+                report = read_json(path, {})
+                if (isinstance(report, dict) and report.get('status') in {'draft_saved', 'already_saved', 'published', 'already_published'}
+                        and report.get('steps', {}).get('persisted_readback', {}).get('verified') and report.get('excel_path')):
+                    saved.add(self._folder_key(Path(report['excel_path']).parent))
+        return saved
+
+    def listing(self):
+        saved = self._progress()
+        return [{'id': key, 'title': path.parent.name, 'source': 'bilibili', 'base_saved': False,
+                 'processed': self._folder_key(path.parent) in saved,
+                 'processed_platforms': ['bilibili'] if self._folder_key(path.parent) in saved else []}
+                for key, path in self.paths().items()]
+
+    def detail(self, product_id):
+        detail = super().detail(product_id)
+        detail.update(source='bilibili', base_saved=False)
+        detail['processed'] = self._folder_key(self.path(product_id).parent) in self._progress()
+        detail['processed_platforms'] = ['bilibili'] if detail['processed'] else []
+        detail['image'] = f'/api/launcher/products/{product_id}/image?source=bilibili' if self.image(product_id) else None
+        return detail
 
 
 class MonthlyProductCatalog(ProductCatalog):
@@ -424,7 +535,7 @@ class MonthlyProductCatalog(ProductCatalog):
 
 def build_command(product: Path, config: dict, run_id: str, output_dir: Path, settings: Settings) -> list:
     operation = config.get("operation", "platforms")
-    require(operation in {"platforms", "base", "create"}, 422, "invalid_operation")
+    require(operation in {"platforms", "base", "create", "dewu", "bilibili"}, 422, "invalid_operation")
     mode = config.get("mode")
     require(mode in {"preview", "save", "publish"}, 422, "invalid_mode")
     names = config.get("platforms")
@@ -440,6 +551,38 @@ def build_command(product: Path, config: dict, run_id: str, output_dir: Path, se
         "invalid_include_base",
     )
     require(type(config.get("learning")) is bool, 422, "invalid_learning")
+    if operation == 'bilibili':
+        require(names == ['bilibili'], 422, 'invalid_platforms')
+        require(product.resolve().is_relative_to(settings.bilibili_products_root.expanduser().resolve()),
+                422, 'product_not_found')
+        require(not include_base, 422, 'invalid_include_base')
+        require(mode != 'publish' or config.get('confirm_publish') is True,
+                422, 'publish_confirmation_required')
+        require(not config['learning'] or settings.device_token, 503, 'review_not_configured')
+        command = [sys.executable, '-u', str(PROJECT_DIR / 'kuaimai_erp.py'),
+                   '--excel-url', str(product), '--platform', 'bilibili',
+                   '--bilibili-root', str(settings.bilibili_products_root),
+                   {'preview': '--no-save', 'save': '--save-only', 'publish': '--bilibili-publish'}[mode],
+                   '--run-id', run_id, '--output-dir', str(output_dir)]
+        if config['learning']:
+            command += ['--learning-enabled', '--learning-api-url', f'http://127.0.0.1:{settings.review_port}']
+        return command
+    if operation == 'dewu':
+        require(names == ['dewu'], 422, 'invalid_platforms')
+        require(mode in {'save', 'publish'}, 422, 'invalid_mode')
+        require(mode != 'publish' or config.get('confirm_publish') is True,
+                422, 'review_submission_confirmation_required')
+        require(not config['learning'] or settings.device_token, 503, 'review_not_configured')
+        require(product.resolve().is_relative_to(settings.dewu_products_root.expanduser().resolve()),
+                422, 'product_not_found')
+        command = [sys.executable, '-u', str(PROJECT_DIR / 'kuaimai_erp.py'),
+                '--excel-url', str(product), '--platform', 'dewu',
+                '--dewu-root', str(settings.dewu_products_root),
+                '--dewu-submit-review' if mode == 'publish' else '--save-only',
+                '--run-id', run_id, '--output-dir', str(output_dir)]
+        if config['learning']:
+            command += ['--learning-enabled', '--learning-api-url', f'http://127.0.0.1:{settings.review_port}']
+        return command
     # Base editing currently saves as part of its workflow. Never expose it as a preview.
     require(operation == "platforms" or mode == "save", 422, "base_requires_save")
     require(mode != "publish" or config.get("confirm_publish") is True, 422, "publish_confirmation_required")
@@ -450,8 +593,6 @@ def build_command(product: Path, config: dict, run_id: str, output_dir: Path, se
                "--excel-url", str(product), "--platform", ",".join(command_platforms) if operation == "platforms" else "base",
                "--run-id", run_id, "--output-dir", str(output_dir),
                {"preview": "--no-save", "save": "--save-only", "publish": "--save"}[mode]]
-    if settings.materials_root is not None:
-        command += ["--materials-root", str(settings.materials_root)]
     if operation == "create":
         command.append("--create-product")
     if names == ["taobao"] and operation == "platforms" and mode != "preview" and not include_base:
@@ -481,13 +622,17 @@ def external_runner_active() -> bool:
 class Launcher:
     def __init__(self, settings: Settings):
         self.settings = settings
-        catalog_class = MonthlyProductCatalog if settings.materials_root is not None else ProductCatalog
-        self.catalog = catalog_class(settings.products_root, PROJECT_DIR / "output/kuaimai/runs",
-                                     materials_root=settings.materials_root)
+        self.catalog = ProductCatalog(settings.products_root, PROJECT_DIR / "output/kuaimai/runs")
+        self.dewu_catalog = DewuProductCatalog(settings.dewu_products_root, PROJECT_DIR / 'output/dewu/runs')
+        self.bilibili_catalog = BilibiliProductCatalog(settings.bilibili_products_root, PROJECT_DIR / 'output/bilibili/runs')
         self.root = settings.data_dir.resolve() / "launcher"
         self.root.mkdir(parents=True, exist_ok=True)
         self._mutex = threading.Lock()
         self._children = {}
+
+    def catalog_for(self, source='default'):
+        require(source in {'default', 'dewu', 'bilibili'}, 422, 'invalid_product_source')
+        return {'default': self.catalog, 'dewu': self.dewu_catalog, 'bilibili': self.bilibili_catalog}[source]
 
     @contextmanager
     def locked(self):
@@ -555,9 +700,10 @@ class Launcher:
         current = checkpoint["current_index"] if checkpoint else next((i for i, s in enumerate(stages.values()) if s != "success"), len(stages))
         if checkpoint:
             for name in list(stages)[:current]:
-                stages[name] = "success"
+                if stages[name] != "skipped":
+                    stages[name] = "success"
         if job["status"] == "completed":
-            stages = {name: "success" for name in stages}
+            stages = {name: "skipped" if status == "skipped" else "success" for name, status in stages.items()}
         elif job["status"] in ACTIVE and current < len(stages):
             waiting = pending > 0 and checkpoint and checkpoint["status"] == "waiting_review"
             result["status"] = "stopping" if job["status"] == "stopping" else "waiting_review" if waiting else "running"
@@ -567,6 +713,28 @@ class Launcher:
         for task in review_tasks:
             task["platform_id"] = canonical_platform_name(task["platform_id"])
         result.update(stages=[{"platform": name, "status": status} for name, status in stages.items()], pending_reviews=pending)
+        if job.get('operation') == 'bilibili':
+            from bilibili_listing import valid_edit_url
+            report = read_json(Path(job['output_dir']) / 'bilibili-result.json', {})
+            if isinstance(report, dict):
+                result['bilibili_status'] = report.get('status')
+                result['error'] = str(report.get('error') or '')
+                draft_url = report.get('draft_url')
+                if valid_edit_url(draft_url, draft_only=True):
+                    result['draft_url'] = draft_url
+        if job.get('operation') == 'dewu':
+            from dewu_listing import valid_draft_url
+            report = read_json(Path(job['output_dir']) / 'dewu-result.json', {})
+            if isinstance(report, dict):
+                result['dewu_status'] = report.get('status')
+                result['dewu_error'] = str(report.get('error') or '')
+                draft_url = report.get('draft_url')
+                try:
+                    valid_url = isinstance(draft_url, str) and valid_draft_url(draft_url)
+                except ValueError:
+                    valid_url = False
+                if valid_url:
+                    result['draft_url'] = draft_url
         if logs:
             result["review_tasks"] = review_tasks
             report = read_json(Path(job["output_dir"]) / "model-judgments.json", {})
@@ -612,7 +780,7 @@ class Launcher:
                         job.get("created_by", ""), job.get("created_at", ""),
                         job.get("status", ""), job.get("mode", ""),
                         *(job.get("platforms") or ()),
-                        *(PLATFORMS.get(name, name) for name in job.get("platforms") or ()),
+                        *(PLATFORM_LABELS.get(name, name) for name in job.get("platforms") or ()),
                     )
                 )).casefold()
                 if all(term in haystack for term in terms):
@@ -635,23 +803,27 @@ class Launcher:
                 return self._public(existing)
             require(not any(job["status"] in ACTIVE for job in jobs), 409, "job_already_running")
             require(not external_runner_active(), 409, "external_job_running")
-            product = self.catalog.path(payload.get("product_id"))
-            detail = self.catalog.detail(payload["product_id"])
             operation = payload.get("operation", "platforms")
+            require(operation in {'platforms', 'base', 'create', 'dewu', 'bilibili'}, 422, 'invalid_operation')
+            if operation in {'dewu', 'bilibili'}:
+                require(payload.get('include_base', False) is False, 422, 'invalid_include_base')
+            catalog = self.catalog_for(operation if operation in {'dewu', 'bilibili'} else 'default')
+            product = catalog.path(payload.get("product_id"))
+            detail = catalog.detail(payload["product_id"])
             auto_base = (
                 operation == "platforms"
-                and payload["mode"] in {"save", "publish"}
+                and payload.get("mode") in {"save", "publish"}
                 and not detail.get("base_saved", False)
             )
             command_payload = {**payload, "include_base": auto_base}
             job_id = uuid.uuid4().hex
-            output_dir = PROJECT_DIR / "output/kuaimai/runs" / (datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + job_id[:8])
+            output_dir = PROJECT_DIR / (f'output/{operation}/runs' if operation in {'dewu', 'bilibili'} else 'output/kuaimai/runs') / (datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + job_id[:8])
             command = build_command(product, command_payload, job_id, output_dir, self.settings)
             directory = self.root / job_id
             directory.mkdir()
             atomic_json(directory / "launch.json", {"argv": command})
             job_platforms = ((["base"] if auto_base else []) + payload["platforms"]
-                             if operation == "platforms" else ["base"])
+                             if operation == "platforms" else [operation] if operation in {'dewu', 'bilibili'} else ["base"])
             job = {"id": job_id, "request_key": key, "product_id": detail["id"], "title": detail["title"],
                    "style_code": detail["style_code"], "platforms": job_platforms,
                    "base_auto_added": auto_base, "mode": payload["mode"], "operation": operation,

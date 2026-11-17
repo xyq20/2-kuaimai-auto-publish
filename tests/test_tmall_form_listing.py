@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import tempfile
 import unittest
 from datetime import date
@@ -11,8 +12,32 @@ from platform_schema import FieldOption
 from tmall_form_listing import (
     TmallFormListing,
     TmallFormListingError,
+    TmallProductIdentityNotReady,
     TmallProductWriteRequired,
+    _field_source,
 )
+from taobao_listing import parse_taobao_materials
+
+
+class TmallMoneySourceTests(unittest.TestCase):
+    def test_unit_in_hang_price_label_matches_excel_without_changing_other_fields(self):
+        fields = {"吊牌价/价格/基本售价/商品价格": "899元"}
+        self.assertEqual(_field_source(fields, "吊牌价（元）"),
+                         ("吊牌价/价格/基本售价/商品价格", "899"))
+        self.assertEqual(_field_source(fields, "吊牌价(元)")[1], "899")
+        self.assertEqual(_field_source({"吊牌价（元）": "899"}, "吊牌价")[1], "899")
+        self.assertIsNone(_field_source(fields, "商品价格（元）"))
+
+    def test_unit_only_template_does_not_override_real_selling_price(self):
+        fields = {
+            "吊牌价/价格/基本售价/商品价格": "元",
+            "价格/京东价/市场价/售卖价/售价": "298",
+        }
+        self.assertIsNone(_field_source(fields, "吊牌价"))
+        self.assertEqual(_field_source(fields, "商品价格")[1], "298")
+        self.assertEqual(_field_source(fields, "价格")[1], "298")
+        with self.assertRaisesRegex(TmallFormListingError, "有效金额"):
+            _field_source({"吊牌价": "298元起"}, "吊牌价")
 
 
 class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
@@ -23,6 +48,171 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         result = await listing.fill_initial_product_materials({'材质成分/材质': '棉/100%'})
         self.assertFalse(result['filled'])
         self.assertEqual(result['reason'], 'not_present_in_product_information')
+
+    async def test_absent_belt_material_component_does_not_parse_main_material_as_percentage(self):
+        listing = await self._listing('''<section class="tm-product-info">
+          <div class="el-form-item"><label class="el-form-item__label">货号</label><input></div>
+        </section>''')
+
+        result = await listing.fill_initial_product_materials({
+            '材质成分/材质/主材质': '头层牛皮/头层牛皮（革）',
+        })
+
+        self.assertFalse(result['filled'])
+        self.assertEqual(result['reason'], 'not_present_in_product_information')
+
+    async def test_belt_product_identity_and_image_restore_allow_absent_season(self):
+        listing = await self._listing('''<section class="tm-product-info">
+          <div class="el-form-item" id="code"><label class="el-form-item__label">货号</label>
+            <div class="el-form-item__content"><input></div></div>
+          <div class="el-form-item" id="brand"><label class="el-form-item__label">品牌</label>
+            <div class="el-form-item__content"><input></div></div>
+        </section>''')
+        listing._category_text = AsyncMock(return_value='服饰配件/皮带/帽子/围巾 > 腰带/皮带/腰链')
+        fields = {'货号': 'ZH0222皮带', '品牌': 'NEIGBORL'}
+        report = await listing.fill_product_identity(fields)
+        self.assertEqual(report['values'], fields)
+        self.assertIsNone(await listing.restore_product_season(fields))
+
+    async def test_belt_initial_product_attributes_are_filled_before_generation(self):
+        listing = await self._listing('''<form class="product-form">货号与品牌</form>
+          <section><div class="el-form-item"><label class="el-form-item__label">宽度</label>
+            <div class="el-form-item__content"><input></div></div></section>''')
+        listing._category_text = AsyncMock(return_value='服饰配件 > 腰带/皮带/腰链')
+        self.assertEqual(await listing.fill_initial_footwear_attributes({'宽度': '3.8CM/3.8'}),
+                         {'宽度': '3.8cm'})
+
+    async def test_initial_optional_attribute_honors_no_fill_review(self):
+        runtime = SimpleNamespace(
+            review_pending_or_omitted=Mock(side_effect=lambda platform, label: label == '材质工艺'),
+            has_deferred_reviews=False,
+        )
+        listing = await self._listing('''<form class="product-form">货号与品牌</form>
+          <section><div class="el-form-item"><label class="el-form-item__label">材质工艺</label>
+            <div class="el-form-item__content"><div class="el-select"><input readonly></div></div>
+          </div><div class="el-form-item"><label class="el-form-item__label">宽度</label>
+            <div class="el-form-item__content"><input></div></div></section>''',
+            attribute_runtime=runtime)
+        listing._category_text = AsyncMock(return_value='服饰配件 > 腰带/皮带/腰链')
+        listing._excel_groups_for_select = AsyncMock(return_value=())
+        listing._select_values = AsyncMock()
+
+        result = await listing.fill_initial_footwear_attributes({
+            '材质工艺': '镶嵌/铆钉', '宽度': '3.8cm',
+        })
+
+        self.assertEqual(result, {'宽度': '3.8cm'})
+        self.assertEqual(await self.page.locator('.el-select input').input_value(), '')
+        listing._select_values.assert_not_awaited()
+        runtime.review_pending_or_omitted.assert_called_with('tm', '材质工艺')
+
+    async def test_initial_required_attribute_rejects_no_fill_with_clear_reason(self):
+        runtime = SimpleNamespace(review_pending_or_omitted=Mock(return_value=True),
+                                  has_deferred_reviews=False)
+        listing = await self._listing('''<form class="product-form">货号与品牌</form>
+          <section><div class="el-form-item is-required"><label class="el-form-item__label">材质工艺</label>
+            <div class="el-form-item__content"><div class="el-select"><input readonly></div></div>
+          </div></section>''', attribute_runtime=runtime)
+        listing._category_text = AsyncMock(return_value='服饰配件 > 腰带/皮带/腰链')
+        listing._excel_groups_for_select = AsyncMock(return_value=())
+
+        with self.assertRaisesRegex(TmallFormListingError, '材质工艺.*必填.*审核选择不填写'):
+            await listing.fill_initial_footwear_attributes({'材质工艺': '镶嵌/铆钉'})
+
+    async def test_initial_attribute_honors_no_fill_resolved_during_selection(self):
+        decision = {'no_fill': False}
+        runtime = SimpleNamespace(
+            review_pending_or_omitted=Mock(side_effect=lambda _platform, _label: decision['no_fill']),
+            has_deferred_reviews=False,
+        )
+        listing = await self._listing('''<form class="product-form">货号与品牌</form>
+          <section><div class="el-form-item"><label class="el-form-item__label">材质工艺</label>
+            <div class="el-form-item__content"><div class="el-select"><input readonly></div></div>
+          </div></section>''', attribute_runtime=runtime)
+        listing._category_text = AsyncMock(return_value='服饰配件 > 腰带/皮带/腰链')
+        listing._excel_groups_for_select = AsyncMock(return_value=(("镶嵌", "铆钉"),))
+
+        async def resolve_no_fill(*_args, **_kwargs):
+            decision['no_fill'] = True
+            return None
+
+        listing._select_values = AsyncMock(side_effect=resolve_no_fill)
+        self.assertEqual(await listing.fill_initial_footwear_attributes(
+            {'材质工艺': '镶嵌/铆钉'}), {})
+        listing._select_values.assert_awaited_once()
+
+    async def test_initial_unresolved_review_pauses_before_product_publish(self):
+        runtime = SimpleNamespace(
+            review_pending_or_omitted=Mock(return_value=True),
+            has_deferred_reviews=True,
+            raise_deferred_reviews=Mock(side_effect=RuntimeError('等待人工审核')),
+        )
+        listing = await self._listing('''<form class="product-form">货号与品牌</form>
+          <section><div class="el-form-item"><label class="el-form-item__label">材质工艺</label>
+            <div class="el-form-item__content"><div class="el-select"><input readonly></div></div>
+          </div></section>''', attribute_runtime=runtime)
+        listing._category_text = AsyncMock(return_value='服饰配件 > 腰带/皮带/腰链')
+        listing._excel_groups_for_select = AsyncMock(return_value=())
+        with self.assertRaisesRegex(RuntimeError, '等待人工审核'):
+            await listing.fill_initial_footwear_attributes({'材质工艺': '镶嵌/铆钉'})
+        runtime.raise_deferred_reviews.assert_called_once()
+
+    async def test_initial_unmatched_attribute_without_review_still_errors(self):
+        listing = await self._listing('''<form class="product-form">货号与品牌</form>
+          <section><div class="el-form-item"><label class="el-form-item__label">材质工艺</label>
+            <div class="el-form-item__content"><div class="el-select"><input readonly></div></div>
+          </div></section>''')
+        listing._category_text = AsyncMock(return_value='服饰配件 > 腰带/皮带/腰链')
+        listing._excel_groups_for_select = AsyncMock(return_value=(("镶嵌", "铆钉"),))
+        listing._select_values = AsyncMock(return_value=None)
+
+        with self.assertRaisesRegex(TmallFormListingError, '材质工艺.*没有唯一精确候选'):
+            await listing.fill_initial_footwear_attributes({'材质工艺': '镶嵌/铆钉'})
+
+    async def test_belt_width_with_unit_selector_uses_lowercase_cm(self):
+        listing = await self._listing('''<form class="product-form">货号与品牌</form>
+          <section><div class="el-form-item"><label class="el-form-item__label">宽度</label>
+            <div class="el-form-item__content"><input type="number">
+              <div class="el-select"><input class="el-input__inner" placeholder="单位"></div></div></div></section>''')
+        listing._category_text = AsyncMock(return_value='服饰配件 > 腰带/皮带/腰链')
+        listing._open_select = AsyncMock()
+        listing._visible_dom_options = AsyncMock(return_value=(None, [{"name": "cm"}]))
+        listing._dismiss_select_dropdown = AsyncMock()
+        listing._read_select_values = AsyncMock(side_effect=[(), ("cm",)])
+        listing._select_values = AsyncMock(return_value=("cm",))
+
+        result = await listing.fill_initial_footwear_attributes({'宽度': '3.8CM/3.8'})
+
+        self.assertEqual(result, {'宽度': '3.8cm'})
+        self.assertEqual(listing._select_values.await_args.args[1], (("cm",),))
+        self.assertEqual(listing._select_values.await_args.kwargs, {
+            "label": "宽度单位", "multi": False, "allow_review": False,
+        })
+        self.assertEqual(await listing.page.locator('input[type="number"]').input_value(), "3.8")
+
+    async def test_tmall_write_failure_does_not_fall_through_to_slash_alternative(self):
+        from taobao_listing import TaobaoListing
+
+        listing = await self._listing('''<div class="useCategory-wrap"><div class="props-items">
+          <div class="complex-item" id="element"><div class="el-form-item">
+            <label class="el-form-item__label">带身元素</label>
+            <div class="el-form-item__content"><div class="el-select"><input readonly></div></div>
+          </div></div></div></div>''', attribute_runtime=SimpleNamespace())
+        listing._excel_select_plans = {
+            "带身元素": ((('铆钉',),), (('镶嵌',),), (('其他',),)),
+        }
+        listing._excel_groups_for_select = AsyncMock(return_value=(("铆钉",),))
+        listing._resolve_learning_select_groups = AsyncMock(return_value=("铆钉",))
+        with patch.object(
+            TaobaoListing, "fill_attribute", new=AsyncMock(return_value=("铆钉",))
+        ) as base_fill:
+            actual = await listing.fill_attribute(
+                "带身元素", "铆钉/镶嵌/其他", item=self.page.locator("#element")
+            )
+
+        self.assertEqual(actual, ("铆钉",))
+        self.assertEqual(listing._excel_select_plans, {})
+        self.assertEqual(base_fill.await_args.kwargs["exact_values"], ("铆钉",))
 
     async def test_initial_materials_uses_product_scope_not_full_form(self):
         listing = await self._listing('''<div class="tm-product-info">
@@ -168,7 +358,10 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
               </div></div>''')
         listing = await self._listing('<form class="product-form">货号与品牌</form>'
                                       '<section class="boot-properties">' + ''.join(controls) + '</section>'
-                                      '<div class="useCategory-wrap"><div class="el-form-item"><label class="el-form-item__label">靴筒材质</label><input value="keep-sale-value"></div></div>')
+                                      '<div class="useCategory-wrap"><div class="el-form-item"><label class="el-form-item__label">靴筒材质</label><input value="keep-sale-value"></div></div>'
+                                      '<div class="block-specification">' + ''.join(
+                                          '<div class="el-form-item"><label class="el-form-item__label">尺码备注</label><input></div>'
+                                          for _ in range(2)) + '</div>')
         listing._category_text = AsyncMock(return_value='流行男鞋 > 靴子 > 时装靴')
         result = await listing.fill_initial_footwear_attributes({
             '筒高/靴筒高度': '中筒/中帮', '靴筒材质/靴筒面材质': '牛反绒/反牛皮',
@@ -516,6 +709,37 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(actual, "男装 > 牛仔裤")
 
+    async def test_lower_priority_prediction_uses_shared_excel_search(self):
+        from taobao_listing import TaobaoListing
+        listing = await self._listing('''
+          <div class="platform-category-input"><span class="current">男装 > 打底衫</span>
+            <div><span>推荐</span><span>男装 &gt; 打底衫</span><button onclick="window.wrongPrediction=true">点击使用</button></div>
+            <button>修改类目</button>
+          </div>
+        ''')
+        listing.category_hints = ('男装 > 卫衣', '男装 > 打底衫')
+        with patch.object(TaobaoListing, 'apply_excel_category', new=AsyncMock(return_value='男装 > 卫衣')) as search:
+            self.assertEqual(await listing.apply_recommended_category(), '男装 > 卫衣')
+            search.assert_awaited_once()
+        self.assertFalse(await self.page.evaluate('Boolean(window.wrongPrediction)'))
+
+    async def test_recommendation_accepts_second_complete_belt_taxonomy(self):
+        from taobao_listing import TaobaoListing
+
+        second = '服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带'
+        listing = await self._listing('''
+          <div class="platform-category-input"><span class="current"></span>
+            <div class="recommendation">
+              <span>推荐</span><span>服饰内衣 &gt; 服饰配件 &gt; 腰带/腰链/男士皮带</span>
+              <button onclick="document.querySelector('.current').textContent='服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带';this.parentElement.remove()">点击使用</button>
+            </div><button>修改类目</button>
+          </div>
+        ''')
+        listing.category_hints = ('服装 > 服装配饰 > 腰带/皮带/腰链', second)
+        with patch.object(TaobaoListing, 'apply_excel_category', new=AsyncMock(side_effect=AssertionError('不应重新搜索已匹配的皮带类目'))):
+            self.assertEqual(await listing.apply_recommended_category(), second)
+        self.assertTrue(listing.category_clicked)
+
     async def test_waits_for_delayed_recommendation_when_stale_category_text_matches(self):
         listing = await self._listing(
             """
@@ -617,6 +841,126 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await items["货号"].get_attribute("id"), "synced-code")
         self.assertEqual(await items["品牌"].get_attribute("id"), "synced-brand")
+
+    async def test_reexpands_product_section_collapsed_by_category_sync(self):
+        listing = await self._listing('''
+          <section class="tm-product-info" id="product-info">
+            <button id="sync-category">同步平台类目</button>
+          </section>
+          <script>
+            document.querySelector('#sync-category').onclick = function() {
+              document.querySelector('#product-info').innerHTML = `
+                <button id="expand-product" onclick="
+                  window.expandClicks=(window.expandClicks||0)+1;
+                  this.remove();
+                  document.querySelector('#identity-fields').style.display='block';
+                ">展开</button>
+                <div id="identity-fields" style="display:none">
+                  <div class="el-form-item" id="sync-code">
+                    <label class="el-form-item__label">货号</label><input>
+                  </div>
+                  <div class="el-form-item" id="sync-brand">
+                    <label class="el-form-item__label">品牌</label><input>
+                  </div>
+                </div>`;
+            };
+          </script>
+        ''')
+
+        items = await listing._wait_for_product_identity_items(timeout_seconds=5)
+
+        self.assertEqual(await items["货号"].get_attribute("id"), "sync-code")
+        self.assertEqual(await items["品牌"].get_attribute("id"), "sync-brand")
+        self.assertEqual(await self.page.evaluate("window.expandClicks"), 1)
+
+    async def test_blank_identity_after_category_sync_is_recoverable(self):
+        listing = await self._listing('''
+          <section class="tm-product-info">
+            <span>商品分类：男装 &gt; 牛仔裤</span>
+            <button onclick="window.syncClicks=(window.syncClicks||0)+1">同步平台类目</button>
+          </section>
+        ''')
+
+        with self.assertRaisesRegex(TmallProductIdentityNotReady, "货号、品牌"):
+            await listing._wait_for_product_identity_items(timeout_seconds=2.3)
+
+        self.assertEqual(await self.page.evaluate("window.syncClicks"), 1)
+
+    async def test_partial_identity_schema_does_not_allow_editor_reload(self):
+        listing = await self._listing('''<section class="tm-product-info">
+          <div class="el-form-item"><label class="el-form-item__label">品牌</label><input></div>
+        </section>''')
+
+        with self.assertRaisesRegex(TmallFormListingError, "未显示：货号") as caught:
+            await listing._wait_for_product_identity_items(timeout_seconds=0.2)
+
+        self.assertNotIsInstance(caught.exception, TmallProductIdentityNotReady)
+
+    async def test_ambiguous_identity_is_not_treated_as_blank_schema(self):
+        listing = await self._listing('''<section class="tm-product-info">
+          <div class="el-form-item"><label class="el-form-item__label">品牌</label><input></div>
+          <div class="el-form-item"><label class="el-form-item__label">品牌</label><input></div>
+        </section>''')
+
+        with self.assertRaisesRegex(TmallFormListingError, "不是唯一项：2") as caught:
+            await listing._wait_for_product_identity_items(timeout_seconds=0.2)
+
+        self.assertNotIsInstance(caught.exception, TmallProductIdentityNotReady)
+
+    async def test_sync_category_confirms_configured_shop_before_waiting_for_fields(self):
+        listing = await self._listing('''
+          <section class="tm-product-info" id="product-info">
+            <button onclick="document.querySelector('#shop-dialog').style.display='block'">同步平台类目</button>
+          </section>
+          <div role="dialog" aria-label="选择店铺" id="shop-dialog" style="display:none">
+            <label class="el-radio"><input type="radio" name="shop" value="other">其他店铺</label>
+            <label class="el-radio"><input type="radio" name="shop" value="target">NEIGBORL批判家专卖店</label>
+            <button onclick="confirmShop()">确 定</button>
+          </div>
+          <script>
+            function confirmShop() {
+              window.confirmedShop=document.querySelector('input[name=shop]:checked')?.value;
+              document.querySelector('#shop-dialog').style.display='none';
+              document.querySelector('#product-info').innerHTML=['货号','品牌'].map(label =>
+                `<div class="el-form-item"><label class="el-form-item__label">${label}</label><input></div>`).join('');
+            }
+          </script>''')
+        listing.category_shop_name = 'NEIGBORL批判家专卖店'
+        items = await listing._wait_for_product_identity_items()
+        self.assertEqual(set(items), {'货号', '品牌'})
+        self.assertEqual(await self.page.evaluate('window.confirmedShop'), 'target')
+        await self.page.locator('#shop-dialog').evaluate("element => element.style.display='block'")
+        listing.category_shop_name = ''
+        with self.assertRaisesRegex(TmallFormListingError, '无法唯一确定店铺'):
+            await listing._confirm_category_shop_dialog()
+
+    async def test_required_field_review_uses_multiselect_and_restores_all_choices(self):
+        runtime = SimpleNamespace(resolve=AsyncMock(return_value=ResolvedAttribute(
+            'cloth,leather', '布，皮', 'review', 'snapshot',
+        )))
+        listing = await self._listing('''
+          <div class="el-form-item is-required"><label class="el-form-item__label">鞋面材质</label>
+            <div class="el-select"><div class="el-select__tags">
+              <input class="el-select__input" onclick="this.closest('.el-select').querySelector('ul').style.display='block'">
+            </div><input class="el-input__inner" readonly>
+              <ul class="el-select-dropdown" style="display:none">
+                <li class="el-select-dropdown__item" onclick="pickRequired(this)">布</li>
+                <li class="el-select-dropdown__item" onclick="pickRequired(this)">皮</li>
+              </ul>
+            </div>
+          </div>
+          <script>
+            function pickRequired(option) {
+              option.closest('.el-select').querySelector('.el-select__tags').insertAdjacentHTML(
+                'afterbegin', `<span class="el-tag">${option.textContent}</span>`);
+              option.parentElement.style.display='none';
+            }
+          </script>''', attribute_runtime=runtime)
+        result = await listing.validate_remaining_required_fields()
+        self.assertTrue(result['valid'])
+        request = runtime.resolve.call_args.args[0]
+        self.assertEqual(request.control_type, 'multi_select')
+        self.assertEqual(set(result['filled']['鞋面材质'].split('，')), {'布', '皮'})
 
     async def test_product_image_slots_can_be_outside_identity_form(self):
         listing = await self._listing('''
@@ -887,6 +1231,25 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator("#pattern").input_value(), "")
         self.assertEqual(set(report["attributes"]), {"风格", "吊牌价"})
 
+    async def test_unit_only_optional_hang_price_is_blank_but_required_is_blocked(self):
+        for required in (False, True):
+            with self.subTest(required=required):
+                listing = await self._listing(f"""
+                    <div class="conf"><div class="complex-wrap">
+                      <div class="complex-item"><div class="el-form-item {'is-required' if required else ''}">
+                        <label class="el-form-item__label">吊牌价</label>
+                        <div class="el-form-item__content"><input id="hang-price"></div>
+                      </div></div>
+                    </div></div>
+                """)
+                if required:
+                    with self.assertRaisesRegex(TmallFormListingError, "必填属性缺少 Excel 值"):
+                        await listing.fill_attributes({"吊牌价/价格": "元"})
+                else:
+                    result = await listing.fill_attributes({"吊牌价/价格": "元"})
+                    self.assertEqual(result["attributes"], {})
+                self.assertEqual(await self.page.locator("#hang-price").input_value(), "")
+
     async def test_fills_optional_waist_shape_from_excel_alias(self):
         listing = await self._listing(
             """
@@ -957,6 +1320,79 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator("#real-price input").input_value(), "586元")
         self.assertEqual(await self.page.locator("#real-pattern input").input_value(), "")
         self.assertEqual(set(report["attributes"]), {"风格", "吊牌价"})
+
+    async def test_footwear_hang_price_with_unit_label_and_heel_candidates(self):
+        listing = await self._listing('''
+          <form class="step3-form"><div class="useCategory-wrap"><div class="props-items">
+            <span><div class="el-form-item is-required" id="heel">
+              <label class="el-form-item__label">鞋跟高度</label>
+              <div class="el-form-item__content"><input type="text"></div>
+            </div></span>
+            <span><div class="el-form-item" id="hang-price">
+              <label class="el-form-item__label">吊牌价（元）</label>
+              <div class="el-form-item__content"><input type="text"></div>
+            </div></span>
+            <span><div class="el-form-item" id="other">
+              <label class="el-form-item__label">其他价格</label>
+              <div class="el-form-item__content"><input value="保留"></div>
+            </div></span>
+          </div></div></form>
+        ''')
+        listing._category_text = AsyncMock(return_value="流行男鞋 > 靴子 > 时装靴")
+
+        report = await listing.fill_attributes({
+            "鞋跟高度/鞋跟高": "5/中跟/中跟（3cm-5cm）",
+            "吊牌价/价格/基本售价/商品价格": "899元",
+            "其他价格": "100",
+        })
+
+        self.assertEqual(await self.page.locator("#heel input").input_value(), "5cm")
+        self.assertEqual(await self.page.locator("#hang-price input").input_value(), "899元")
+        self.assertEqual(await self.page.locator("#other input").input_value(), "保留")
+        self.assertEqual(report["attributes"]["鞋跟高度"], ("5cm",))
+        self.assertEqual(report["attributes"]["吊牌价（元）"], ("899元",))
+
+    async def test_footwear_heel_uses_first_compatible_numeric_candidate(self):
+        listing = await self._listing('''<div class="useCategory-wrap"><div class="props-items">
+          <span><div class="el-form-item is-required" id="heel">
+            <label class="el-form-item__label">鞋跟高度</label>
+            <div class="el-form-item__content"><input value="原值"></div>
+          </div></span>
+        </div></div>''')
+        listing._category_text = AsyncMock(return_value="流行男鞋 > 靴子 > 时装靴")
+
+        report = await listing.fill_attributes({"鞋跟高度": "中跟（3cm-5cm）/5.25厘米/6"})
+        self.assertEqual(report["attributes"]["鞋跟高度"], ("5.25cm",))
+        self.assertEqual(await self.page.locator("#heel input").input_value(), "5.25cm")
+        with self.assertRaisesRegex(TmallFormListingError, "鞋跟高度.*单个厘米数值"):
+            await listing.fill_attributes({"鞋跟高度": "中跟（3cm-5cm）/5.123"})
+        self.assertEqual(await self.page.locator("#heel input").input_value(), "5.25cm")
+
+    async def test_non_footwear_heel_input_is_not_given_cm(self):
+        listing = await self._listing('''<div class="useCategory-wrap"><div class="props-items">
+          <span><div class="el-form-item is-required" id="heel">
+            <label class="el-form-item__label">鞋跟高度</label>
+            <div class="el-form-item__content"><input></div>
+          </div></span>
+        </div></div>''')
+        listing._category_text = AsyncMock(return_value="男装 > 休闲裤")
+
+        report = await listing.fill_attributes({"鞋跟高度": "5"})
+        self.assertEqual(report["attributes"]["鞋跟高度"], ("5",))
+        self.assertEqual(await self.page.locator("#heel input").input_value(), "5")
+
+    async def test_ambiguous_hang_price_controls_are_not_overwritten(self):
+        listing = await self._listing('''<div class="useCategory-wrap"><div class="props-items">
+          <span><div class="el-form-item"><label class="el-form-item__label">吊牌价</label>
+            <div class="el-form-item__content"><input value="原价1"></div></div></span>
+          <span><div class="el-form-item"><label class="el-form-item__label">吊牌价（元）</label>
+            <div class="el-form-item__content"><input value="原价2"></div></div></span>
+        </div></div>''')
+
+        with self.assertRaisesRegex(TmallFormListingError, "吊牌价字段不唯一"):
+            await listing.fill_attributes({"吊牌价": "899"})
+        self.assertEqual(await self.page.locator(".props-items input").evaluate_all(
+            "nodes => nodes.map(node => node.value)"), ["原价1", "原价2"])
 
     async def test_required_fabric_uses_material_name_from_percentage_value(self):
         listing = await self._listing(
@@ -1145,6 +1581,121 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
 
         await listing.require_full_form()
 
+    async def test_belt_full_form_accepts_platform_without_size_chart(self):
+        for category in (
+            "服饰配件/皮带/帽子/围巾 > 腰带/皮带/腰链",
+            "服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带",
+        ):
+            with self.subTest(category=category):
+                listing = await self._listing(f"""
+                    <div class="platform-category-input">{category}</div>
+                    <div class="wrap-item"><div class="wrap-item_label">商品明细</div>
+                      <div class="sku-batch-row"><input></div>
+                    </div>
+                    <form class="step3-form">
+                      <div class="title">物流信息</div><input>
+                      <div class="title">商品描述</div><input>
+                      <div class="title">售后及其他</div><input>
+                    </form>
+                """)
+
+                await listing.require_full_form()
+
+    async def test_size_chart_exception_preserves_other_full_form_checks(self):
+        belt = "服饰配件 > 腰带/皮带/腰链"
+        for category, sku, logistics, size_section, missing in (
+            ("男装 > 休闲裤", True, True, False, "尺码表"),
+            ("男鞋 > 皮鞋", True, True, False, "尺码表"),
+            ("", True, True, False, "尺码表"),
+            (belt, False, True, False, "SKU批量设置行"),
+            (belt, True, False, False, "物流信息"),
+            (belt, True, True, True, "尺码表"),
+        ):
+            with self.subTest(category=category, missing=missing):
+                listing = await self._listing(f"""
+                    <div class="platform-category-input">{category}</div>
+                    <div class="wrap-item"><div class="wrap-item_label">商品明细</div>
+                      {'<div class="sku-batch-row"><input></div>' if sku else ''}
+                    </div>
+                    {'<div class="wrap-item"><div class="wrap-item_label">尺码表</div></div>' if size_section else ''}
+                    <form class="step3-form">
+                      {'<div class="title">物流信息</div><input>' if logistics else ''}
+                      <div class="title">商品描述</div><input>
+                      <div class="title">售后及其他</div><input>
+                    </form>
+                """)
+
+                with self.assertRaisesRegex(TmallFormListingError, missing):
+                    await listing.require_full_form()
+
+    async def test_belt_sku_length_fills_number_and_unit_without_review(self):
+        fixed = ("价格", "库存", "上市时间", "货号")
+        batch_fields = "".join(
+            f'<div class="sku-batch-item"><span class="sku-batch-item_label">{label}</span>'
+            f'<input class="el-input__inner" data-batch="{label}"></div>'
+            for label in fixed
+        )
+        headers = "".join(f"<th>{label}</th>" for label in fixed)
+        cells = "".join(f'<td><input data-value="{label}"></td>' for label in fixed)
+        runtime = SimpleNamespace(resolve=AsyncMock())
+        listing = await self._listing(f"""
+            <div class="wrap-item"><div class="wrap-item_label">商品明细</div>
+              <div class="sku-batch-row">{batch_fields}
+                <div class="sku-batch-item"><span class="sku-batch-item_label">总长度：</span>
+                  <div class="el-input el-input-digit"><input class="el-input__inner" id="length">
+                    <div class="suffix"><div class="el-select" id="unit">
+                      <input class="el-input__inner" readonly
+                        onclick="const menu=this.nextElementSibling; menu.style.display=menu.style.display==='none'?'block':'none'"
+                        onkeydown="if(event.key==='Escape') this.nextElementSibling.style.display='none'">
+                      <ul class="el-select-dropdown" style="display:none">
+                        <li class="el-select-dropdown__item" onclick="chooseUnit(this)">cm</li>
+                        <li class="el-select-dropdown__item" onclick="chooseUnit(this)">mm</li>
+                      </ul>
+                    </div></div>
+                  </div>
+                </div>
+                <button onclick="applyBatch()">批量设置</button>
+              </div>
+              <div class="el-table__main-wrapper">
+                <div class="el-table__header-wrapper"><table><thead><tr>
+                  {headers}<th>平台规格编码</th><th>总长度</th>
+                </tr></thead></table></div>
+                <div class="el-table__body-wrapper"><table><tbody><tr>
+                  {cells}<td>PLATFORM-BELT</td><td><input id="row-length"><input id="row-unit"></td>
+                </tr></tbody></table></div>
+              </div>
+            </div>
+            <script>
+              window.batchClicks = 0;
+              function chooseUnit(option) {{
+                option.closest('.el-select').querySelector('input').value = option.textContent;
+                option.parentElement.style.display = 'none';
+              }}
+              function applyBatch() {{
+                window.batchClicks++;
+                for (const input of document.querySelectorAll('[data-value]')) {{
+                  input.value = document.querySelector(`[data-batch="${{input.dataset.value}}"]`).value;
+                }}
+                document.querySelector('#row-length').value = document.querySelector('#length').value;
+                document.querySelector('#row-unit').value = document.querySelector('#unit input').value;
+              }}
+            </script>
+        """, attribute_runtime=runtime)
+        fields = {"价格": "298", "数量": "100", "货号": "ZH0222皮带",
+                  "长度/总长度": "100CM（含）-110CM（不含）/110cm"}
+
+        report = await listing.fill_sku_batch(fields)
+
+        self.assertTrue(report["batch_clicked"])
+        self.assertEqual(report["values"]["总长度"], "110|cm")
+        self.assertEqual(report["rows"][0]["总长度"], "110|cm")
+        self.assertEqual(report["platform_codes"], ("PLATFORM-BELT",))
+        runtime.resolve.assert_not_awaited()
+        fields["长度/总长度"] = "100CM（含）-110CM（不含）"
+        with self.assertRaisesRegex(TmallFormListingError, "明确的单个数值和页面单位"):
+            await listing.fill_sku_batch(fields)
+        self.assertEqual(await self.page.evaluate("window.batchClicks"), 1)
+
     async def test_sku_batch_uses_today_and_preserves_platform_codes(self):
         listing = await self._listing(
             """
@@ -1219,7 +1770,7 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
           document.querySelector('#batch-code').parentElement.remove();
           document.querySelectorAll('tr').forEach(row => row.children[4].remove());
           document.querySelector('.sku-batch-row').insertAdjacentHTML('beforeend',
-            '<div class="sku-batch-item"><span class="sku-batch-item_label">鞋跟高度（cm）</span><input class="el-input__inner" id="heel"></div>');
+            '<div class="sku-batch-item"><span class="sku-batch-item_label">鞋跟高度</span><input type="number" class="el-input__inner" id="heel"></div>');
           document.querySelector('thead tr').insertAdjacentHTML('beforeend', '<th>鞋跟高度（cm）</th>');
           document.querySelectorAll('tbody tr').forEach(row => row.insertAdjacentHTML('beforeend','<td><input data-field="heel"></td>'));
           const previous = window.applyBatch;
@@ -1229,12 +1780,43 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
           };
         }''')
         shoe_report = await listing.fill_sku_batch(
-            {"价格": "980", "数量": "100", "货号": "MY018-11", "鞋跟高度（cm）": "5cm/中跟（3.1-5.5cm）"})
+            {"价格": "980", "数量": "100", "货号": "MY018-11", "鞋跟高度/鞋跟高": "平跟/平跟（小于等于1cm）/3cm"})
         self.assertTrue(shoe_report['batch_clicked'])
         self.assertNotIn('上市时间', shoe_report['values'])
         self.assertNotIn('货号', shoe_report['values'])
-        self.assertEqual(shoe_report['values']['鞋跟高度（cm）'], '5')
+        self.assertEqual(shoe_report['values']['鞋跟高度'], '3')
         self.assertEqual(shoe_report['platform_codes'], ('PLATFORM-S', 'PLATFORM-M'))
+        await self.page.evaluate('''() => {
+          document.querySelector('.sku-batch-row').insertAdjacentHTML('beforeend', `
+            <div class="sku-batch-item"><span class="sku-batch-item_label">鞋面材质</span>
+              <div class="el-select" id="batch-material">
+                <div class="el-select__tags"><input class="el-select__input" onclick="this.closest('.el-select').querySelector('ul').style.display='block'"></div>
+                <input class="el-input__inner" readonly>
+                <ul class="el-select-dropdown" style="display:none">${['布','皮'].map(value =>
+                  `<li class="el-select-dropdown__item" onclick="pickMaterial(this)">${value}</li>`).join('')}</ul>
+              </div></div>`);
+          document.querySelector('#batch-material').__vue__ = {multiple: true};
+          window.pickMaterial = option => {
+            option.closest('.el-select').querySelector('.el-select__tags').insertAdjacentHTML(
+              'afterbegin', `<span class="el-tag">${option.textContent}</span>`);
+            option.parentElement.style.display='none';
+          };
+          document.querySelector('thead tr').insertAdjacentHTML('beforeend', '<th>鞋面材质</th>');
+          document.querySelectorAll('tbody tr').forEach(row => row.insertAdjacentHTML('beforeend','<td data-material></td>'));
+          const previous = window.applyBatch;
+          window.applyBatch = () => {
+            previous();
+            document.querySelectorAll('[data-material]').forEach(cell => {
+              cell.innerHTML='<div class="el-select"><div class="el-select__tags">'
+                + document.querySelector('#batch-material .el-select__tags').innerHTML + '</div><input></div>';
+            });
+          };
+        }''')
+        multi_report = await listing.fill_sku_batch({
+            '价格': '980', '数量': '100', '货号': 'MY018-11', '鞋面材质': '布，皮',
+        })
+        self.assertEqual(set(multi_report['values']['鞋面材质'].split('|')), {'布', '皮'})
+        self.assertTrue(all(row['鞋面材质'] == '皮|布' for row in multi_report['rows']))
 
     async def test_shoe_size_cleanup_only_changes_numeric_size_dimension(self):
         listing = await self._listing(
@@ -2070,7 +2652,7 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
               function clearMaterialError() {
                 const item = document.querySelector('#real-material-dom');
                 item.classList.remove('is-error');
-                item.querySelector('.el-form-item__error').remove();
+                item.querySelector('.el-form-item__error')?.remove();
               }
             </script>
             """
@@ -2084,6 +2666,59 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
                 "nodes => nodes.map(node => node.value)"
             ),
             ["棉", "100"],
+        )
+
+        report = await listing.fill_after_sales({"材质成分/材质": "棉95.4%，亚麻4.6%"})
+        self.assertEqual(report["materials"], (("棉", 95.4), ("亚麻", 4.6)))
+        self.assertEqual(await self.page.locator('#real-material-dom .percentage').evaluate_all(
+            'inputs => inputs.map(input => input.value)'), ['95.40', '4.60'])
+        repeated = await listing.fill_after_sales({"材质成分/材质": "棉95.4%，亚麻4.6%"})
+        self.assertEqual(repeated["materials"], report["materials"])
+
+    async def test_material_composition_validates_against_selected_platform_labels(self):
+        listing = await self._listing(
+            """
+            <div class="el-form-item" id="mapped-material">
+              <div class="multi-complex-items">
+                <button type="button" onclick="addMappedMaterial()">添加</button>
+              </div>
+            </div>
+            <script>
+              function addMappedMaterial() {
+                const root = document.querySelector('#mapped-material .multi-complex-items');
+                const row = document.createElement('div');
+                row.innerHTML = '<div class="el-select"><input class="el-input__inner" readonly></div>' +
+                  '<input class="percentage">';
+                root.appendChild(row);
+              }
+            </script>
+            """
+        )
+        selected_labels = iter(("棉", "聚酯纤维"))
+
+        async def select_platform_label(select, *_args, **_kwargs):
+            label = next(selected_labels)
+            await select.locator("input.el-input__inner").evaluate(
+                "(input, value) => { input.value = value; }", label
+            )
+            return (label,)
+
+        listing._select_values = AsyncMock(side_effect=select_platform_label)
+        listing._revalidate_material_field = AsyncMock()
+        materials = parse_taobao_materials({
+            "材质成分/材质": "棉（95.4%），聚脂钎维（4.6%）"
+        })
+
+        actual = await listing.fill_materials(
+            materials, item=self.page.locator("#mapped-material")
+        )
+
+        self.assertEqual(actual, (("棉", 95.4), ("聚酯纤维", 4.6)))
+        self.assertEqual(
+            await self.page.locator("#mapped-material .percentage").evaluate_all(
+                "inputs => inputs.map(input => input.value)"
+            ),
+            ["95.4", "4.6"],
         )
 
     async def test_material_percentage_waits_for_row_rerender_after_name_choice(self):
@@ -2259,6 +2894,65 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         repeated = await listing.fill_after_sales({"材质成分/材质": "羊皮"})
         self.assertEqual(repeated["materials"], (("羊皮", None),))
         self.assertEqual(await self.page.evaluate('window.materialAdds'), 1)
+
+    async def test_name_only_material_alternatives_follow_excel_order(self):
+        listing = await self._conditional_material_listing()
+        report = await listing.fill_after_sales({"材质成分/材质": "羊皮/皮革"})
+        self.assertEqual(report["materials"], (("羊皮", None),))
+        self.assertEqual(await self.page.locator('#conditional-material input').input_value(), "羊皮")
+        repeated = await listing.fill_after_sales({"材质成分/材质": "羊皮/皮革"})
+        self.assertEqual(repeated["materials"], (("羊皮", None),))
+        self.assertEqual(await self.page.evaluate('window.materialAdds'), 1)
+
+    async def test_material_revalidates_stale_required_message_after_selection(self):
+        listing = await self._conditional_material_listing()
+        await self.page.evaluate('''() => {
+          const item = document.querySelector('#conditional-material');
+          const error = document.createElement('div');
+          error.className = 'el-form-item__error'; error.textContent = '必填';
+          item.appendChild(error);
+          item.__vue__ = {
+            $options: {name: 'ElFormItem'},
+            validate: (_trigger, callback) => { error.remove(); callback(''); },
+            $nextTick: callback => callback(),
+          };
+        }''')
+        report = await listing.fill_after_sales({"材质成分/材质": "羊皮/皮革"})
+        self.assertEqual(report["materials"], (("羊皮", None),))
+        self.assertEqual(await self.page.locator('#conditional-material .el-form-item__error:visible').count(), 0)
+
+    async def test_name_only_material_tries_next_available_alternative(self):
+        listing = await self._conditional_material_listing()
+        await self.page.evaluate('''() => {
+          const add = window.addConditionalMaterial;
+          window.addConditionalMaterial = () => {
+            add();
+            const options = document.querySelector('#conditional-material ul');
+            options.querySelector('li').remove();
+            const option = document.createElement('li');
+            option.className = 'el-select-dropdown__item';
+            option.textContent = '皮革';
+            option.onclick = function() {
+              chooseConditionalMaterial(this);
+              this.closest('.multi-complex-items_item').querySelector('.percentage-field').remove();
+            };
+            options.appendChild(option);
+          };
+        }''')
+        report = await listing.fill_after_sales({"材质成分/材质": "羊皮/皮革"})
+        self.assertEqual(report["materials"], (("皮革", None),))
+
+    async def test_material_alternatives_do_not_invent_required_percentage(self):
+        listing = await self._conditional_material_listing()
+        with self.assertRaisesRegex(TmallFormListingError, "需要填写具体含量.*未提供明确百分比"):
+            await listing.fill_after_sales({"材质成分/材质": "棉/亚麻"})
+        self.assertEqual(await self.page.locator('[name="material_prop_content"]').input_value(), "")
+
+    async def test_slash_material_alternatives_do_not_mask_mixed_invalid_composition(self):
+        listing = await self._conditional_material_listing()
+        with self.assertRaisesRegex(TmallFormListingError, "面料材质格式不正确"):
+            await listing.fill_after_sales({"材质成分/材质": "羊皮/皮革，棉"})
+        self.assertEqual(await self.page.evaluate('window.materialAdds'), 0)
 
     async def test_name_only_material_cannot_discard_mixed_composition_percentages(self):
         listing = await self._conditional_material_listing()
@@ -2720,6 +3414,26 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
             ("S 身高（cm）", "M 身高（cm）"),
         )
 
+    async def test_size_chart_range_without_page_range_control_uses_lower_bound(self):
+        listing = await self._listing(
+            """
+            <div class="wrap-item"><div class="wrap-item_label">尺码表</div>
+              <table class="tmall-size-table">
+                <thead><tr><th>尺码</th><th>*身高（cm）</th></tr></thead>
+                <tbody><tr><td>S</td><td><input></td></tr></tbody>
+              </table>
+            </div>
+            """
+        )
+        report = await listing.fill_size_chart(
+            ({"尺码": "S", "身高(cm)": (155, 160)},)
+        )
+        self.assertEqual(
+            await self.page.locator(".tmall-size-table tbody input").first.input_value(),
+            "155",
+        )
+        self.assertEqual(report["rows"]["S"]["身高（cm）"], "155")
+
     async def test_size_chart_reuses_operator_custom_value_on_rerun(self):
         class Runtime:
             async def resolve(self, request):
@@ -2924,6 +3638,9 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("裤长（cm）", report["rows"]["M"])
 
     async def test_required_images_are_mapped_by_label_not_dom_order(self):
+        import cv2
+        import numpy as np
+
         listing = await self._listing(
             """
             <div class="el-form-item" id="parameter"><label class="el-form-item__label">产品参数图片</label></div>
@@ -2933,25 +3650,40 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         )
         calls = []
 
-        async def uploader(_page, item, paths, label, _timeout):
+        async def uploader(_page, item, paths, label, _timeout, **kwargs):
             calls.append((await item.get_attribute("id"), tuple(paths), label))
+            if label == "透明素材图":
+                self.assertTrue(kwargs["force_replace"])
+                actual = cv2.imread(str(paths[0]), cv2.IMREAD_UNCHANGED)
+                self.assertEqual(actual.shape, (800, 800, 4))
+                src = "data:image/png;base64," + base64.b64encode(paths[0].read_bytes()).decode()
+                await item.evaluate("""(item, src) => {
+                  item.querySelector('.sc-upload')?.remove();
+                  const group = document.createElement('div');
+                  group.className = 'sc-upload';
+                  group.innerHTML = '<div class="file-img"><img class="originImg"></div>';
+                  group.querySelector('img').src = src;
+                  item.append(group);
+                }""", src)
             return "uploaded"
 
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            vertical = root / "vertical.png"
-            transparent = root / "transparent.png"
-            parameter = root / "parameter.png"
-            for image in (vertical, transparent, parameter):
-                image.write_bytes(b"image")
-            assets = SimpleNamespace(
-                vertical_image=vertical,
-                transparent_image=transparent,
-                parameter_image=parameter,
-            )
-            report = await listing.sync_required_images(
-                assets, timeout_seconds=2, uploader=uploader
-            )
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        vertical = root / "vertical.png"
+        transparent = root / "transparent.png"
+        parameter = root / "parameter.png"
+        for image in (vertical, parameter):
+            image.write_bytes(b"image")
+        cv2.imwrite(str(transparent), np.full((1200, 1200, 4), 128, dtype=np.uint8))
+        assets = SimpleNamespace(
+            vertical_image=vertical,
+            transparent_image=transparent,
+            parameter_image=parameter,
+        )
+        report = await listing.sync_required_images(
+            assets, timeout_seconds=2, uploader=uploader
+        )
 
         self.assertEqual(
             [call[0] for call in calls], ["vertical", "transparent", "parameter"]
@@ -2975,6 +3707,15 @@ class TmallFormListingTests(unittest.IsolatedAsyncioTestCase):
         report = await listing.sync_required_images(assets, timeout_seconds=2, uploader=uploader)
         self.assertEqual([call[0] for call in calls], ["transparent"])
         self.assertEqual(set(report), {"透明素材图"})
+
+        await self.page.locator('#transparent').evaluate("""item => {
+          const error = document.createElement('div');
+          error.className = 'el-form-item__error';
+          error.textContent = '宽度不能大于800';
+          item.append(error);
+        }""")
+        with self.assertRaisesRegex(TmallFormListingError, "宽度不能大于800"):
+            await listing._require_transparent_image_size(self.page.locator('#transparent'), 0)
 
     async def test_inherited_main_images_swap_first_and_third_for_both_tmall_rows(self):
         listing = await self._listing(

@@ -19,6 +19,7 @@ class ReviewRecoveryTests(unittest.IsolatedAsyncioTestCase):
         listing._captured_api_field = AsyncMock(return_value=(SimpleNamespace(source_id="details"), "jacket"))
         listing._select_values = AsyncMock(return_value=("明线",))
         item = MagicMock()
+        item.locator.return_value.first.evaluate = AsyncMock(return_value=False)
         item.locator.return_value.first.locator.return_value.count = AsyncMock(return_value=0)
         return listing, item
 
@@ -29,6 +30,9 @@ class ReviewRecoveryTests(unittest.IsolatedAsyncioTestCase):
         request = listing.attribute_runtime.resolve.call_args.args[0]
         self.assertTrue(request.evidence["selection_only"])
         self.assertTrue(request.evidence["force_review"])
+        self.assertEqual(request.excel_value, "做旧")
+        self.assertEqual(request.evidence["validation_error"], "回读不一致")
+        self.assertEqual(request.control_type, "select")
         listing._select_values.assert_not_awaited()
 
     async def test_approved_value_not_excel_is_written_and_verified(self):

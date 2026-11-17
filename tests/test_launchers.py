@@ -9,6 +9,28 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class LauncherArgumentTests(unittest.TestCase):
+    def test_bilibili_menu_modes_and_explicit_publish(self):
+        for selection, flag in [('1', '--no-save'), ('2', '--save-only'), ('3\nPUBLISH', '--bilibili-publish')]:
+            arguments, _ = self._run_launcher(input_text='13\n' + selection + '\n')
+            self.assertEqual(arguments, ('kuaimai_erp.py', '--platform', 'bilibili', flag))
+
+    def test_bilibili_menu_uses_own_products_and_ignores_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            product = root / 'bili' / '寒战' / '产品信息.xlsx'
+            product.parent.mkdir(parents=True)
+            product.touch()
+            (root / 'bili' / '毛衣模板.xlsx').touch()
+            normal = root / 'normal' / '其他商品' / '产品信息.xlsx'
+            normal.parent.mkdir(parents=True)
+            normal.touch()
+            arguments, output = self._run_launcher(input_text='13\n1\n2\n', extra_env={
+                'KUAIMAI_SKIP_PRODUCT_SELECTION': '0', 'BILIBILI_PRODUCTS_ROOT': str(root / 'bili'),
+                'BILIBILI_LAST_PRODUCT_FILE': str(root / 'last-bili'), 'KUAIMAI_PRODUCTS_ROOT': str(root / 'normal')})
+            self.assertEqual(arguments, ('kuaimai_erp.py', '--excel-url', str(product), '--platform', 'bilibili', '--save-only'))
+            self.assertNotIn('毛衣模板', output)
+            self.assertNotIn('其他商品', output)
+
     def test_all_except_youzan_menu_is_preserved(self):
         arguments, _ = self._run_launcher(input_text="11\n2\n")
         self.assertEqual(arguments, (
@@ -22,7 +44,7 @@ class LauncherArgumentTests(unittest.TestCase):
             "kuaimai_erp.py", "--platform", "douyin,jd,xhs", "--save-only",
         ))
         self.assertIn("平台编号可多选", output)
-        self.assertNotIn("12)", output)
+        self.assertIn("12) 得物", output)
         self.assertNotIn("自定义多平台", output)
         self.assertIn("抖音 → 京东 → 小红书", output)
 
@@ -33,7 +55,7 @@ class LauncherArgumentTests(unittest.TestCase):
         ))
 
     def test_platform_menu_retries_invalid_or_empty_selection(self):
-        arguments, output = self._run_launcher(input_text="12\n\n2,0\n2,1\n2,10\n2,11\n9,12\n2,xhs\n2,7\n1\n")
+        arguments, output = self._run_launcher(input_text="14\n\n2,0\n2,1\n2,10\n2,11\n9,12\n2,xhs\n2,7\n1\n")
         self.assertEqual(arguments, (
             "kuaimai_erp.py", "--platform", "douyin,xhs", "--no-save",
         ))
@@ -74,6 +96,56 @@ class LauncherArgumentTests(unittest.TestCase):
         arguments, output = self._run_launcher(input_text="10\n3\n1\n")
         self.assertIn("请选择 1 或 2", output)
         self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "base", "--create-product", "--no-save"))
+
+    def test_dewu_menu_defaults_to_draft_unless_review_is_confirmed(self):
+        arguments, output = self._run_launcher(input_text="12\n3\nno\n")
+        self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "dewu", "--save-only"))
+        self.assertIn("未确认提交审核", output)
+        self.assertIn("完整填写并保存草稿（不提交审核）", output)
+        self.assertNotIn("确认请输入大写 PUBLISH", output)
+        arguments, _ = self._run_launcher(input_text="12\n1\n")
+        self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "dewu", "--no-save"))
+        arguments, _ = self._run_launcher(input_text="12\n3\nREVIEW\n")
+        self.assertEqual(arguments, ("kuaimai_erp.py", "--platform", "dewu", "--dewu-submit-review"))
+
+    def test_dewu_cli_arguments_are_forwarded_without_erp_defaults(self):
+        user_args = ("--platform=dewu", "--dewu-product", "双头鹰", "--save-only")
+        arguments, output = self._run_launcher(user_args)
+        self.assertEqual(arguments, ("kuaimai_erp.py", *user_args))
+        self.assertNotIn("请选择需要运行的平台", output)
+
+    def test_dewu_product_menu_uses_its_own_root_and_remembered_product(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            erp_excel = root / "erp" / "其他平台商品" / "产品信息.xlsx"
+            dewu_excel = root / "dewu" / "双头鹰" / "产品信息.xlsx"
+            erp_excel.parent.mkdir(parents=True)
+            dewu_excel.parent.mkdir(parents=True)
+            erp_excel.touch()
+            dewu_excel.touch()
+            (root / "dewu" / "休闲裤模板.xlsx").touch()
+            erp_last = root / "erp-last"
+            erp_last.write_text(str(erp_excel) + "\n", encoding="utf-8")
+            dewu_last = root / "dewu-last"
+            env = {
+                "KUAIMAI_SKIP_PRODUCT_SELECTION": "0",
+                "KUAIMAI_PRODUCTS_ROOT": str(root / "erp"),
+                "KUAIMAI_LAST_PRODUCT_FILE": str(erp_last),
+                "DEWU_PRODUCTS_ROOT": str(root / "dewu"),
+                "DEWU_LAST_PRODUCT_FILE": str(dewu_last),
+            }
+            arguments, output = self._run_launcher(input_text="12\n1\n2\n", extra_env=env)
+            self.assertEqual(arguments, (
+                "kuaimai_erp.py", "--excel-url", str(dewu_excel),
+                "--platform", "dewu", "--save-only",
+            ))
+            self.assertNotIn("其他平台商品", output)
+            self.assertNotIn("休闲裤模板", output)
+            self.assertEqual(erp_last.read_text(encoding="utf-8").strip(), str(erp_excel))
+            self.assertEqual(dewu_last.read_text(encoding="utf-8").strip(), str(dewu_excel))
+            repeated, output = self._run_launcher(input_text="12\n\n1\n", extra_env=env)
+            self.assertIn("[上次选择]", output)
+            self.assertEqual(repeated[-3:], ("--platform", "dewu", "--no-save"))
 
     def test_double_click_menu_allows_jd_no_save_preview(self):
         arguments, output = self._run_launcher(input_text="9\n1\n")
@@ -321,11 +393,11 @@ class LauncherArgumentTests(unittest.TestCase):
             env = {"KUAIMAI_SKIP_PRODUCT_SELECTION": "0",
                    "KUAIMAI_PRODUCTS_ROOT": str(products),
                    "KUAIMAI_LAST_PRODUCT_FILE": str(last_file)}
-            arguments, output = self._run_launcher(input_text="2\n9\n1\n", extra_env=env)
+            arguments, output = self._run_launcher(input_text="9\n2\n1\n", extra_env=env)
             self.assertIn("B 款", output)
             self.assertEqual(arguments,
                 ("kuaimai_erp.py", "--excel-url", str(second), "--platform", "jd", "--no-save"))
-            arguments, output = self._run_launcher(input_text="\n9\n1\n", extra_env=env)
+            arguments, output = self._run_launcher(input_text="9\n\n1\n", extra_env=env)
             self.assertIn("[上次选择]", output)
             self.assertEqual(arguments,
                 ("kuaimai_erp.py", "--excel-url", str(second), "--platform", "jd", "--no-save"))

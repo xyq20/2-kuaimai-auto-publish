@@ -12,6 +12,7 @@ from douyin_data import (
     field_lookup,
     key_aliases,
     normalize_key,
+    normalize_material_percentage,
     parse_douyin_fields,
     parse_materials,
     read_douyin_assets,
@@ -111,6 +112,35 @@ class DouyinFieldParsingTests(unittest.TestCase):
             (MaterialComponent("棉", 100),),
         )
 
+    def test_decimal_material_percentages_preserve_values_and_source_names(self):
+        expected = (MaterialComponent("棉", 95.4), MaterialComponent("聚脂钎维", 4.6))
+        for source in (
+            "棉（95.4%），聚脂钎维（4.6%）",
+            "棉95.4%，聚脂钎维4.6%",
+            "棉/95.4%，聚脂钎维/4.6%",
+            "棉(95.40％)；聚脂钎维(4.60％)",
+            "棉95.4%/棉布，聚脂钎维4.6%/涤纶",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(parse_materials(source), expected)
+        self.assertEqual(json.loads(json.dumps(expected[0].__dict__))["percentage"], 95.4)
+
+    def test_decimal_material_total_uses_exact_decimal_arithmetic(self):
+        result = parse_materials("棉16.7%，涤纶16.7%，氨纶66.6%")
+        self.assertEqual(tuple(x.percentage for x in result), (16.7, 16.7, 66.6))
+        for value in ("棉95.4%，涤纶4.5%", "棉95.4%，涤纶4.7%"):
+            with self.subTest(value=value), self.assertRaisesRegex(DouyinDataError, "合计必须为 100"):
+                parse_materials(value)
+
+    def test_decimal_materials_reject_invalid_numbers_and_ranges(self):
+        for value in ("NaN", "Infinity", "-0.1", "100.1", "", "abc"):
+            with self.subTest(value=value), self.assertRaises(DouyinDataError):
+                normalize_material_percentage(value)
+        for value in ("棉（95..4%），涤纶（4.6%）", "棉95..4%", "棉95..4％"):
+            with self.subTest(value=value), self.assertRaisesRegex(DouyinDataError, "格式不正确"):
+                parse_materials(value)
+        self.assertEqual(parse_materials("棉100.0%"), (MaterialComponent("棉", 100),))
+
     def test_rejects_incomplete_or_malformed_material_percentages(self):
         for value in ("棉（80%）", "棉（70%）/聚酯纤维（20%）", "棉（70%）/聚酯纤维（30%）x"):
             with self.subTest(value=value):
@@ -169,6 +199,20 @@ class DouyinFieldParsingTests(unittest.TestCase):
                 fields[key] = "  "
                 with self.assertRaisesRegex(DouyinDataError, label):
                     parse_douyin_fields(fields)
+
+    def test_accessory_can_omit_size_without_weakening_default_validation(self):
+        fields = dict(CURRENT_PRODUCT_FIELDS)
+        del fields["尺码"]
+
+        result = parse_douyin_fields(fields, require_size=False)
+
+        self.assertEqual(result.sizes, ())
+        with self.assertRaisesRegex(DouyinDataError, "尺码"):
+            parse_douyin_fields(fields)
+
+    def test_price_skips_unit_only_alias_row(self):
+        fields = {"吊牌价/价格/基本售价/商品价格": "元", **CURRENT_PRODUCT_FIELDS}
+        self.assertEqual(parse_douyin_fields(fields).price, "586")
 
     def test_rejects_negative_and_fractional_stocks(self):
         for key, label in (("现货库存", "现货库存"), ("预售库存", "预售库存")):
@@ -283,6 +327,15 @@ class DouyinAssetDiscoveryTests(unittest.TestCase):
 
             self.assertIsNone(result.size_chart_image)
             self.assertIsNone(result.height_weight_image)
+
+    def test_accessory_does_not_require_size_or_recommendation_images(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = read_douyin_assets(
+                Path(temporary_directory), garment_kind="accessory"
+            )
+
+        self.assertIsNone(result.size_chart_image)
+        self.assertIsNone(result.height_weight_image)
 
     def test_requires_exactly_one_size_and_recommendation_image(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

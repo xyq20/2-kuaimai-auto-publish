@@ -16,6 +16,45 @@ from local_review.service import analyze_product
 
 
 class LocalReviewApiTests(unittest.TestCase):
+    def test_all_platforms_distinguish_custom_input_from_restricted_candidates(self):
+        self.product_and_snapshot()
+        self.login()
+        headers = {'Origin': 'http://testserver'}
+        for platform in ('douyin', 'tb', 'tm', 'pdd', 'wxsph', 'xhs', 'yz', 'jd'):
+            for selection_only in (True, False):
+                with self.subTest(platform=platform, selection_only=selection_only):
+                    key = f'{platform}-custom-{selection_only}'
+                    self.event(key + '-snapshot', 'snapshot.created', {
+                        'snapshot_version': key, 'platform_id': platform,
+                        'category_leaf_id': 'category', 'field_id': key,
+                        'field_label': '测试属性', 'canonical_field': None,
+                        'schema_version': key, 'control_type': 'select',
+                        'custom_allowed': True,
+                        'options': [{'value_id': '101', 'label': '现有候选', 'position': 0}],
+                    })
+                    self.event(key, 'review.created', {
+                        'id': key, 'run_id': 'run', 'device_id': 'mac',
+                        'product_version': 'pv-1', 'platform_id': platform,
+                        'category_leaf_id': 'category', 'field_id': key,
+                        'field_label': '测试属性', 'canonical_field': None,
+                        'snapshot_version': key, 'reason_code': 'field_mapping_required',
+                        'evidence_json': {'selection_only': selection_only},
+                    })
+                    task = next(t for t in self.client.get('/api/reviews').json()['tasks']
+                                if t['id'] == key)
+                    self.assertEqual(task['custom_allowed'], not selection_only)
+                    claim = self.client.post(f'/api/reviews/{key}/claim', headers=headers,
+                                             json={'version': task['version']}).json()
+                    custom = self.client.post(f'/api/reviews/{key}/confirm', headers=headers,
+                                              json={'version': claim['version'],
+                                                    'final_value_id': '可保存的新值'})
+                    self.assertEqual(custom.status_code, 422 if selection_only else 200, custom.text)
+                    if selection_only:
+                        candidate = self.client.post(f'/api/reviews/{key}/confirm', headers=headers,
+                                                     json={'version': claim['version'],
+                                                           'final_value_id': '101'})
+                        self.assertEqual(candidate.status_code, 200, candidate.text)
+
     def test_device_can_supersede_only_its_unclaimed_review_without_human_learning(self):
         self.product_and_snapshot()
         self.event('obsolete', 'review.created', {
@@ -665,6 +704,24 @@ class LocalReviewApiTests(unittest.TestCase):
             row = connection.execute("SELECT status,version FROM run_checkpoints WHERE run_id='run-stale'").fetchone()
             self.assertEqual((row["status"], row["version"]), ("failed", 6))
         self.event("stale-final", "checkpoint.updated", {**checkpoint, "status": "failed", "version": 7})
+
+    def test_failed_checkpoint_can_complete_after_successful_resume(self):
+        self.event("resumed-product", "product.upsert", {
+            "product_version": "pv-resumed", "style_code": "RS", "title": "resumed", "category_json": {}})
+        checkpoint = {"run_id": "run-resumed", "product_version": "pv-resumed",
+                      "device_id": "mac", "execution_mode": "save_only",
+                      "platform_order": ["douyin"], "current_index": 0,
+                      "status": "running", "pending_review_id": None,
+                      "version": 1, "image_version": "images"}
+        self.event("resumed-start", "checkpoint.updated", checkpoint)
+        self.event("resumed-stop", "checkpoint.updated", {**checkpoint, "status": "failed", "version": 6})
+        completed = {**checkpoint, "current_index": 1, "status": "completed", "version": 7}
+        response = self.client.post("/api/device/events", headers=self.device_headers,
+            json={"idempotency_key": "resumed-complete", "event_type": "checkpoint.updated", "payload": completed})
+        self.assertEqual(response.status_code, 201, response.text)
+        with connect(self.settings) as connection:
+            row = connection.execute("SELECT status,version,current_index FROM run_checkpoints WHERE run_id='run-resumed'").fetchone()
+            self.assertEqual((row["status"], row["version"], row["current_index"]), ("completed", 7, 1))
 
     def test_legacy_checkpoint_id_is_normalized_before_idempotency_check(self):
         self.event(

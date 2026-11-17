@@ -11,18 +11,22 @@ from field_policies import listing_date_text_value, positional_listing_date_valu
 
 import asyncio
 import re
+import tempfile
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from attribute_runtime import AttributeRequest
-from category_profile import choose_category_candidate, is_leather_shoe_category, is_footwear_category
+from douyin_data import DouyinDataError, MaterialPercentage, normalize_material_percentage
+from category_profile import category_profile, choose_category_candidate, is_leather_shoe_category, is_footwear_category, preferred_category_hints
 from canonical_fields import is_learning_managed_field
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from platform_schema import FieldOption
 from platform_candidate_source import (
     select_supports_multiple,
+    select_supports_custom_value,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -42,6 +46,7 @@ from taobao_listing import (
     selection_value_groups_for_control,
 )
 from tmall_api_index import TmallApiJsonIndex
+from tmall_data import TmallDataError, prepare_tmall_transparent_image
 from tmall_rules import (
     TmallRuleError,
     new_product_declaration_value,
@@ -52,6 +57,10 @@ from tmall_rules import (
 
 class TmallFormListingError(RuntimeError):
     """可直接向用户展示的天猫资料填写异常。"""
+
+
+class TmallProductIdentityNotReady(TmallFormListingError):
+    """首批产品字段全部未挂载；尚未填写，可受限重载编辑器。"""
 
 
 class TmallProductWriteRequired(TmallFormListingError):
@@ -126,10 +135,18 @@ def _numeric_text_equal(actual: str, expected: str) -> bool:
         return False
 
 
+def _tmall_attribute_key(label: object) -> str:
+    """天猫不同类目的吊牌价标签可能带括号内的货币单位。"""
+    normalized = normalize_label(label)
+    if normalized == normalize_label("吊牌价（元）"):
+        return normalize_label("吊牌价")
+    return normalized
+
+
 def _tmall_values_equal(page_label: str, actual: str, expected: str) -> bool:
     if actual == expected:
         return True
-    if normalize_label(page_label) not in {
+    if _tmall_attribute_key(page_label) not in {
         normalize_label("商品价格"),
         normalize_label("吊牌价"),
         normalize_label("价格"),
@@ -145,18 +162,19 @@ def _field_source(
     page_label: str,
     aliases: Sequence[str] = (),
 ) -> Optional[Tuple[str, str]]:
-    wanted = {normalize_label(page_label)}
-    wanted.update(normalize_label(value) for value in aliases)
+    wanted = {_tmall_attribute_key(page_label)}
+    wanted.update(_tmall_attribute_key(value) for value in aliases)
     wanted.update(
-        normalize_label(value)
-        for value in TMALL_FIELD_ALIASES.get(normalize_label(page_label), ())
+        _tmall_attribute_key(value)
+        for value in TMALL_FIELD_ALIASES.get(_tmall_attribute_key(page_label), ())
     )
     matches = [
         (str(key), str(value).strip())
         for key, value in fields.items()
-        if wanted.intersection(excel_aliases(key)) and str(value).strip()
+        if wanted.intersection(_tmall_attribute_key(alias) for alias in excel_aliases(key))
+        and str(value).strip()
     ]
-    is_money = normalize_label(page_label) in {
+    is_money = _tmall_attribute_key(page_label) in {
         normalize_label("商品价格"),
         normalize_label("吊牌价"),
         normalize_label("价格"),
@@ -164,6 +182,9 @@ def _field_source(
         normalize_label("售价"),
     }
     if is_money:
+        # Excel 空金额模板会只留下单位“元”。它不提供金额，也不能
+        # 与另一个价格字段冲突；必填字段仍由 _required_source/属性校验拦截。
+        matches = [(key, value) for key, value in matches if value != "元"]
         try:
             matches = [
                 (key, normalize_money_value(value)) for key, value in matches
@@ -197,6 +218,24 @@ def _required_source(
     return source[1]
 
 
+def _tmall_material_source(fields: Mapping[str, str]) -> Tuple[Tuple[MaterialComponent, ...], Tuple[str, ...]]:
+    """保留纯材质名的斜杠候选；其含量由现场控件决定是否可省略。"""
+    try:
+        return parse_taobao_materials(fields), ()
+    except TaobaoListingError as original:
+        source = _field_source(fields, "材质成分", ("材质",))
+        text = source[1] if source is not None else ""
+        alternatives = tuple(part.strip() for part in re.split(r"[/／]", text))
+        if (
+            len(alternatives) < 2
+            or any(not part or re.search(r"[\d%％()（）,，、;；]", part) for part in alternatives)
+        ):
+            raise TmallFormListingError(str(original).replace("淘宝", "天猫")) from original
+        # 100 是现有内部结构要求的占位；仅在页面明确没有含量字段时
+        # 可使用该分支，绝不会将此数值写入含量输入框。
+        return (MaterialComponent(alternatives[0], 100),), alternatives
+
+
 class TmallFormListing(TaobaoListing):
     """填写天猫编辑器资料，不点击底部保存或保存并铺货。"""
 
@@ -211,6 +250,7 @@ class TmallFormListing(TaobaoListing):
         *,
         attribute_runtime: Optional[Any] = None,
         category_hints: Sequence[str] = (),
+        category_shop_name: str = "",
     ) -> None:
         super().__init__(
             page,
@@ -220,6 +260,7 @@ class TmallFormListing(TaobaoListing):
             category_hints=category_hints,
         )
         self.api_index = api_index
+        self.category_shop_name = category_shop_name.strip()
 
     async def _api_resolved_groups(
         self,
@@ -531,6 +572,7 @@ class TmallFormListing(TaobaoListing):
     async def apply_recommended_category(self) -> str:
         if self.panel is None:
             raise TmallFormListingError("请先调用 open() 打开天猫资料")
+        preferred_hints = preferred_category_hints(self.category_hints)
         current = ""
         candidates: List[Tuple[Any, str]] = []
         # ERP 常在保存基础资料后的约 30 秒才重新挂载类目配置与产品字段；
@@ -570,9 +612,9 @@ class TmallFormListing(TaobaoListing):
                     if not self.category_hints:
                         return current
                     chosen, _strategy = choose_category_candidate(
-                        (current,), self.category_hints
+                        (current,), preferred_hints
                     )
-                    if chosen:
+                    if chosen and choose_category_candidate((current,), self.category_hints)[0]:
                         return current
                 if len(visible_expand) > 1:
                     raise TmallFormListingError(
@@ -584,9 +626,9 @@ class TmallFormListing(TaobaoListing):
                     if not self.category_hints:
                         return current
                     chosen, _strategy = choose_category_candidate(
-                        (current,), self.category_hints
+                        (current,), preferred_hints
                     )
-                    if chosen:
+                    if chosen and choose_category_candidate((current,), self.category_hints)[0]:
                         return current
                 except TmallFormListingError as exc:
                     if not str(exc).endswith("：0"):
@@ -615,8 +657,10 @@ class TmallFormListing(TaobaoListing):
         if self.category_hints:
             chosen, strategy = choose_category_candidate(
                 tuple(expected for _button, expected in candidates),
-                self.category_hints,
+                preferred_hints,
             )
+            if chosen and not choose_category_candidate((chosen,), self.category_hints)[0]:
+                chosen = ""
             matches = [
                 item for item in candidates
                 if self._normalize_category_path(item[1])
@@ -866,22 +910,46 @@ class TmallFormListing(TaobaoListing):
         return result
 
     async def _fill_exact_form_item(
-        self, page_label: str, item: Any, expected: object
-    ) -> str:
+        self, page_label: str, item: Any, expected: object, *,
+        allow_review_skip: bool = False,
+    ) -> Optional[str]:
         expected_text = str(expected).strip()
         if not expected_text:
             raise TmallFormListingError(f"天猫字段“{page_label}”期望值为空")
 
-        choice_groups = await self._api_resolved_groups(
-            page_label,
-            selection_value_groups_for_control(page_label, expected_text, multi=False),
-        )
+        if normalize_label(page_label) == normalize_label("宽度"):
+            unit_selects = item.locator(".el-select")
+            inputs = item.locator(
+                'input:not([type="radio"]):not([type="checkbox"]):not([disabled]), textarea:not([disabled])'
+            )
+            visible_inputs = []
+            for index in range(await inputs.count()):
+                control = inputs.nth(index)
+                if await control.is_visible() and not await control.evaluate(
+                    "element => Boolean(element.closest('.el-select'))"
+                ):
+                    visible_inputs.append(control)
+            if await unit_selects.count() == 1 and len(visible_inputs) == 1:
+                try:
+                    numeric, unit = await super()._fill_numeric_unit_attribute(
+                        page_label, expected_text, visible_inputs[0], unit_selects.first
+                    )
+                except TaobaoListingError as exc:
+                    raise TmallFormListingError(str(exc).replace("淘宝", "天猫")) from exc
+                if unit.casefold() != "cm":
+                    raise TmallFormListingError(
+                        f"天猫字段“{page_label}”必须选择小写 cm 单位，页面回读为 {unit!r}"
+                    )
+                return numeric + unit
+
+        choice_groups = selection_value_groups_for_control(page_label, expected_text, multi=False)
         radio_controls = item.locator('input[type="radio"]')
         visible_radio_count = 0
         for index in range(await radio_controls.count()):
             if await radio_controls.nth(index).is_visible():
                 visible_radio_count += 1
         if visible_radio_count:
+            choice_groups = await self._api_resolved_groups(page_label, choice_groups)
             if len(choice_groups) != 1:
                 rendered = "，".join("/".join(group) for group in choice_groups)
                 raise TmallFormListingError(
@@ -939,6 +1007,13 @@ class TmallFormListing(TaobaoListing):
             choice_groups = await self._excel_groups_for_select(
                 select, page_label, expected_text, multi=multi
             )
+            runtime = self.attribute_runtime
+            review_skip = getattr(runtime, "review_pending_or_omitted", None)
+            if allow_review_skip and callable(review_skip) and review_skip(
+                self.attribute_platform_id, page_label
+            ):
+                return None
+            choice_groups = await self._api_resolved_groups(page_label, choice_groups)
             try:
                 actual = await self._select_values(
                     select,
@@ -950,11 +1025,15 @@ class TmallFormListing(TaobaoListing):
                 raise TmallFormListingError(
                     str(exc).replace("淘宝", "天猫")
                 ) from exc
-            if actual is None or len(actual) != 1:
+            if not actual and allow_review_skip and callable(review_skip) and review_skip(
+                self.attribute_platform_id, page_label
+            ):
+                return None
+            if not actual or (not multi and len(actual) != 1):
                 raise TmallFormListingError(
                     f"天猫字段“{page_label}”没有唯一精确候选“{expected_text}”"
                 )
-            return actual[0]
+            return "，".join(actual) if multi else actual[0]
 
         inputs = item.locator(
             'input:not([type="radio"]):not([type="checkbox"]):not([disabled]), textarea:not([disabled])'
@@ -1036,8 +1115,10 @@ class TmallFormListing(TaobaoListing):
         return actual
 
     async def fill_initial_footwear_attributes(self, fields: Any) -> Mapping[str, str]:
-        """靴类的首次产品表单也有属性，须在生成下方表单前填写。"""
-        if not is_footwear_category(await self._category_text()):
+        """鞋靴及皮带首次产品表单的属性须在生成下方表单前填写。"""
+        category = await self._category_text()
+        if not (is_footwear_category(category)
+                or category_profile((category,)).garment_kind == "accessory"):
             return {}
         source_fields = _fields_mapping(fields)
         # 靴类附加属性位于货号/品牌 product-form 之外的独立表单。
@@ -1048,7 +1129,7 @@ class TmallFormListing(TaobaoListing):
                     ("货号", "品牌", "上市时间", "上市年份季节")}
         for label, item, required in await self._visible_form_items(scope):
             # Product schema and sale attributes can coexist with identical labels.
-            if await item.evaluate("element => Boolean(element.closest('.useCategory-wrap, .sku-batch-item, .el-table, .others-items'))"):
+            if await item.evaluate("element => Boolean(element.closest('.step3-form, .useCategory-wrap, .block-specification, .sku-batch-item, .el-table, .others-items'))"):
                 continue
             key = normalize_label(label)
             if key in excluded or not await item.locator(
@@ -1063,9 +1144,62 @@ class TmallFormListing(TaobaoListing):
                 if required and not await self._item_has_value(item):
                     raise TmallFormListingError(f"天猫首次产品必填属性缺少 Excel 值：{label}")
                 continue
-            applied[label] = await self._fill_exact_form_item(label, item, source[1])
+            source_value = source[1]
+            if (category_profile((category,)).garment_kind == "accessory"
+                    and key == normalize_label("宽度")
+                    and await item.locator(".el-select").count() == 0):
+                source_value = re.split(r"[/／]", source_value, maxsplit=1)[0].strip()
+                width = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(cm|厘米)?", source_value, re.I)
+                if width is None:
+                    raise TmallFormListingError(
+                        f"天猫皮带宽度不是有效的单个厘米数值：{source_value!r}"
+                    )
+                source_value = width.group(1) + "cm"
+            value = await self._fill_exact_form_item(
+                label, item, source_value, allow_review_skip=True
+            )
+            if value is None:
+                if required and not await self._item_has_value(item):
+                    runtime = self.attribute_runtime
+                    if getattr(runtime, "has_deferred_reviews", False):
+                        runtime.raise_deferred_reviews()
+                    raise TmallFormListingError(
+                        f"天猫首次产品字段“{label}”为必填，审核选择不填写，"
+                        "页面无法留空；请核实平台要求"
+                    )
+                if self.logger is not None:
+                    self.logger.info("天猫首次产品属性“%s”按审核结果跳过", label)
+                continue
+            applied[label] = value
+            if key == normalize_label("材质工艺"):
+                await self._wait_for_loading_masks()
+                await asyncio.sleep(0.25)
+                refreshed_item = await self._tmall_form_item(label, scope=scope)
+                applied[label] = await self._fill_exact_form_item(
+                    label, refreshed_item, source_value, allow_review_skip=True
+                )
+                if applied[label] is None:
+                    applied.pop(label)
+                    if required and not await self._item_has_value(refreshed_item):
+                        runtime = self.attribute_runtime
+                        if getattr(runtime, "has_deferred_reviews", False):
+                            runtime.raise_deferred_reviews()
+                        raise TmallFormListingError(
+                            f"天猫首次产品字段“{label}”为必填，审核选择不填写，"
+                            "页面无法留空；请核实平台要求"
+                        )
+                    continue
+                if self.logger is not None:
+                    self.logger.info(
+                        "天猫首次产品属性稳定回读：%s=%s", label, applied[label]
+                    )
             if self.logger is not None:
                 self.logger.info("天猫首次产品属性填写并回读：%s=%s", label, applied[label])
+        runtime = self.attribute_runtime
+        if getattr(runtime, "has_deferred_reviews", False):
+            # 首次产品区的“发布”会生成后续表单；仍有待审核字段时，
+            # 先暂停等待审核，不能把尚未确认当成“不填写”。
+            runtime.raise_deferred_reviews()
         return applied
 
     async def fill_product_identity(self, fields: Any) -> Mapping[str, Any]:
@@ -1074,8 +1208,10 @@ class TmallFormListing(TaobaoListing):
             ("货号", ("商家外部编码", "款式编码")),
             ("品牌", ()),
         )
-        footwear = is_footwear_category(await self._category_text())
-        if not footwear:
+        category = await self._category_text()
+        footwear = is_footwear_category(category)
+        accessory = category_profile((category,)).garment_kind == "accessory"
+        if not footwear and not accessory:
             specifications += (("上市年份季节", ("上市季节",)),)
         expected = {
             label: _required_source(source_fields, label, aliases)
@@ -1096,6 +1232,16 @@ class TmallFormListing(TaobaoListing):
         await self._wait_for_loading_masks()
         if footwear:
             return {"values": actual}
+        if accessory:
+            records = await self._visible_form_items(self.panel)
+            if not any(normalize_label(label) == normalize_label("上市年份季节")
+                       for label, _item, _required in records):
+                if self.logger is not None:
+                    self.logger.info("天猫皮带产品表单无上市年份季节字段，按当前类目跳过")
+                return {"values": actual}
+            expected["上市年份季节"] = _required_source(
+                source_fields, "上市年份季节", ("上市季节",)
+            )
         deadline = asyncio.get_running_loop().time() + 30
         season_item = None
         last_error: Optional[Exception] = None
@@ -1123,7 +1269,9 @@ class TmallFormListing(TaobaoListing):
 
     async def restore_product_season(self, fields: Any, *, confirmed: Optional[str] = None) -> Optional[str]:
         """图片更新会重建产品模型，恢复已确认的季节并等待回读稳定。"""
-        if is_footwear_category(await self._category_text()):
+        category = await self._category_text()
+        if (is_footwear_category(category)
+                or category_profile((category,)).garment_kind == "accessory"):
             records = await self._visible_form_items(self.panel)
             if not any(normalize_label(label) == normalize_label("上市年份季节")
                        for label, _item, _required in records):
@@ -1160,26 +1308,71 @@ class TmallFormListing(TaobaoListing):
             expected = actual
         raise TmallFormListingError("天猫图片更新后上市年份季节反复被清空或改写，禁止继续保存")
 
+    async def _confirm_category_shop_dialog(self) -> bool:
+        """Complete the shop choice used to load this shop's category schema."""
+        dialogs = self.page.get_by_role("dialog", name="选择店铺", exact=True)
+        visible_dialogs = [
+            dialogs.nth(index) for index in range(await dialogs.count())
+            if await dialogs.nth(index).is_visible()
+        ]
+        if not visible_dialogs:
+            return False
+        if len(visible_dialogs) != 1:
+            raise TmallFormListingError("天猫同步类目的“选择店铺”弹窗不唯一")
+        dialog = visible_dialogs[0]
+        controls = dialog.locator(".el-radio")
+        choices = []
+        for index in range(await controls.count()):
+            control = controls.nth(index)
+            radio = control.locator('input[type="radio"]')
+            if await control.is_visible() and await radio.count() == 1 and await radio.is_enabled():
+                choices.append(((await control.inner_text()).strip(), control, radio))
+        if self.category_shop_name:
+            choices = [choice for choice in choices if choice[0] == self.category_shop_name]
+        if len(choices) != 1:
+            raise TmallFormListingError(
+                f"天猫同步类目无法唯一确定店铺：目标={self.category_shop_name or '唯一可用店铺'}，匹配数={len(choices)}"
+            )
+        name, control, radio = choices[0]
+        if not await radio.is_checked():
+            await control.click()
+        if not await radio.is_checked():
+            raise TmallFormListingError(f"天猫同步类目店铺选择后回读失败：{name}")
+        confirm = dialog.get_by_role("button", name=re.compile(r"^\s*确\s*定\s*$"))
+        if await confirm.count() != 1:
+            raise TmallFormListingError("天猫同步类目店铺弹窗找不到唯一确定按钮")
+        await confirm.click()
+        await dialog.wait_for(state="hidden", timeout=10_000)
+        if self.logger is not None:
+            self.logger.info("天猫同步类目已确认店铺：%s；继续等待产品信息字段", name)
+        return True
+
     async def _wait_for_product_identity_items(
         self,
         labels: Sequence[str] = ("货号", "品牌"),
+        *,
+        timeout_seconds: float = 60,
     ) -> Mapping[str, Any]:
         """等待类目激活后异步渲染的首批产品信息字段。"""
-        deadline = asyncio.get_running_loop().time() + 60
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
         sync_deadline = asyncio.get_running_loop().time() + 2
         sync_attempted = False
         last_error: Optional[Exception] = None
+        items: Dict[str, Any] = {}
         while asyncio.get_running_loop().time() < deadline:
+            if sync_attempted:
+                await self._confirm_category_shop_dialog()
             scope = await self._product_identity_scope()
-            try:
-                return {
-                    label: await self._tmall_form_item(label, scope=scope)
-                    for label in labels
-                }
-            except TmallFormListingError as exc:
-                last_error = exc
-                if not str(exc).endswith("：0"):
-                    raise
+            items = {}
+            for label in labels:
+                try:
+                    items[label] = await self._tmall_form_item(label, scope=scope)
+                except TmallFormListingError as exc:
+                    last_error = exc
+                    if not str(exc).endswith("：0"):
+                        raise
+            if len(items) == len(labels):
+                return items
             if not sync_attempted and asyncio.get_running_loop().time() >= sync_deadline:
                 sync_buttons = self.panel.get_by_role(
                     "button", name="同步平台类目", exact=True
@@ -1202,16 +1395,20 @@ class TmallFormListing(TaobaoListing):
                         # 字段本身仍由下面的轮询确认；同步按钮的加载遮罩
                         # 不应覆盖真实字段渲染结果。
                         pass
+                    # 同步类目会重新渲染天猫产品信息区，部分页面会顺带收起
+                    # 该区块。重新展开后继续等 schema，避免把折叠误判为空表单。
+                    await self._expand_product_identity_section()
                 elif len(visible_sync) > 1:
                     raise TmallFormListingError(
                         f"天猫“同步平台类目”入口不唯一：{len(visible_sync)}"
                     )
             await asyncio.sleep(0.1)
-        rendered = "、".join(labels)
-        raise TmallFormListingError(
-            "天猫类目激活后，产品信息字段在 60 秒内未显示：{0}".format(
-                rendered
-            )
+        rendered = "、".join(label for label in labels if label not in items)
+        # 只有全部首批字段都未挂载才允许外层重新初始化；部分字段缺失、
+        # 字段重复、Excel 来源错误及填写后的校验错误仍按真实异常停止。
+        error_type = TmallProductIdentityNotReady if not items else TmallFormListingError
+        raise error_type(
+            f"天猫类目激活后，产品信息字段在 {timeout_seconds:g} 秒内未显示：{rendered}"
         ) from last_error
 
     async def _expand_product_identity_if_needed(self) -> None:
@@ -1226,6 +1423,12 @@ class TmallFormListing(TaobaoListing):
             if not str(exc).endswith("：0"):
                 raise
 
+        await self._expand_product_identity_section()
+
+    async def _expand_product_identity_section(self) -> bool:
+        """展开天猫产品信息区并确认折叠按钮已消失，不等待 schema 加载。"""
+        if self.panel is None:
+            raise TmallFormListingError("请先调用 open() 打开天猫资料")
         candidates = self.panel.get_by_text("展开", exact=True)
         visible = []
         for index in range(await candidates.count()):
@@ -1233,7 +1436,7 @@ class TmallFormListing(TaobaoListing):
             if await candidate.is_visible():
                 visible.append(candidate)
         if not visible:
-            return
+            return False
         if len(visible) != 1:
             raise TmallFormListingError(
                 f"天猫产品信息“展开”入口不唯一：{len(visible)}"
@@ -1244,16 +1447,16 @@ class TmallFormListing(TaobaoListing):
 
         deadline = asyncio.get_running_loop().time() + 10
         while asyncio.get_running_loop().time() < deadline:
-            await self._wait_for_loading_masks(timeout_seconds=10)
-            scope = await self._product_identity_scope()
-            try:
-                await self._tmall_form_item("货号", scope=scope)
-                return
-            except TmallFormListingError as exc:
-                if not str(exc).endswith("：0"):
-                    raise
+            candidates = self.panel.get_by_text("展开", exact=True)
+            still_expanded = False
+            for index in range(await candidates.count()):
+                if await candidates.nth(index).is_visible():
+                    still_expanded = True
+                    break
+            if not still_expanded:
+                return True
             await asyncio.sleep(0.1)
-        raise TmallFormListingError("展开天猫产品信息后，货号字段在 10 秒内未显示")
+        raise TmallFormListingError("点击展开后，天猫产品信息区域仍处于折叠状态")
 
     async def _product_identity_scope(self) -> Any:
         if self.panel is None:
@@ -1517,6 +1720,43 @@ class TmallFormListing(TaobaoListing):
                 result.append(row)
         return result
 
+    async def _revalidate_material_field(self, item: Any) -> None:
+        """已回读材质后，重新校验可能保留旧“必填”提示的天猫外层字段。"""
+        if not await item.locator('.el-form-item__error:visible').count():
+            return
+        result = await item.evaluate('''async element => {
+          const formItem = element.matches('.el-form-item') ? element
+            : element.querySelector(':scope > .el-form-item');
+          const component = formItem && formItem.__vue__;
+          if (!component || !component.$options || component.$options.name !== 'ElFormItem'
+              || typeof component.validate !== 'function') return {supported: false};
+          return await new Promise(resolve => {
+            let done = false;
+            const timer = setTimeout(() => {
+              if (!done) { done = true; resolve({supported: true, timeout: true}); }
+            }, 2000);
+            component.validate('', message => {
+              if (done) return;
+              done = true; clearTimeout(timer);
+              const finish = () => resolve({supported: true, message: message || ''});
+              if (typeof component.$nextTick === 'function') component.$nextTick(finish);
+              else finish();
+            });
+          });
+        }''')
+        if result.get('timeout'):
+            raise TmallFormListingError('天猫材质成分重新校验超时')
+        if result.get('message'):
+            raise TmallFormListingError('天猫材质成分页面校验失败：' + str(result['message']))
+        if result.get('supported'):
+            errors = item.locator('.el-form-item__error:visible')
+            try:
+                await errors.first.wait_for(state='hidden', timeout=2000)
+            except Exception as exc:
+                raise TmallFormListingError(
+                    '天猫材质成分校验后错误提示仍未消失，请检查页面状态'
+                ) from exc
+
     @staticmethod
     async def _material_percentage_is_omitted(row: Any) -> bool:
         """仅接收平台明确渲染的名称单字段结构，含量控件损坏仍报错。"""
@@ -1533,8 +1773,8 @@ class TmallFormListing(TaobaoListing):
 
     @staticmethod
     def _material_rows_match(
-        actual: Sequence[Tuple[str, Optional[int]]],
-        expected: Sequence[Tuple[str, int]],
+        actual: Sequence[Tuple[str, Optional[MaterialPercentage]]],
+        expected: Sequence[Tuple[str, MaterialPercentage]],
     ) -> bool:
         if any(percentage is None for _name, percentage in actual):
             # 名称单字段无法表达混合比例，只能对应唯一的完整材质。
@@ -1547,7 +1787,9 @@ class TmallFormListing(TaobaoListing):
         self,
         materials: Sequence[MaterialComponent],
         item: Optional[Any] = None,
-    ) -> Tuple[Tuple[str, Optional[int]], ...]:
+        *,
+        name_alternatives: Sequence[str] = (),
+    ) -> Tuple[Tuple[str, Optional[MaterialPercentage]], ...]:
         """通过天猫页面的普通 DOM 事件填写材质成分并回读。
 
         天猫新版材质组件不再暴露淘宝旧页使用的 ``__vue__`` 内部对象，
@@ -1573,7 +1815,15 @@ class TmallFormListing(TaobaoListing):
 
         try:
             existing = await self._read_materials(item)
-            if self._material_rows_match(existing, expected):
+            existing_matches = self._material_rows_match(existing, expected)
+            if name_alternatives:
+                existing_matches = (
+                    len(existing) == 1 and existing[0][1] is None
+                    and normalize_option(existing[0][0])
+                    == normalize_option(name_alternatives[0])
+                )
+            if existing_matches:
+                await self._revalidate_material_field(item)
                 self.material_validation = {
                     "source": "tmall_dom_events",
                     "confirmed": True,
@@ -1607,6 +1857,7 @@ class TmallFormListing(TaobaoListing):
                     "天猫材质成分找不到唯一“添加”按钮"
                 )
 
+            effective_expected = []
             for index, (name, percentage) in enumerate(expected):
                 before = len(await self._material_rows(item))
                 await add_button.click()
@@ -1631,7 +1882,7 @@ class TmallFormListing(TaobaoListing):
                     )
                 actual_name = await self._select_values(
                     selects.first,
-                    ((name,) + TAOBAO_MATERIAL_OPTION_ALIASES.get(
+                    (tuple(name_alternatives) if name_alternatives else (name,) + TAOBAO_MATERIAL_OPTION_ALIASES.get(
                         normalize_option(name), ()
                     ),),
                     label=f"材质成分第 {index + 1} 行材质",
@@ -1641,6 +1892,16 @@ class TmallFormListing(TaobaoListing):
                     raise TmallFormListingError(
                         f"天猫材质成分第 {index + 1} 行没有 Excel 材质“{name}”"
                         "的精确候选"
+                    )
+                if name_alternatives:
+                    expected = ((actual_name[0], 100),)
+                effective_expected.append((actual_name[0], percentage))
+                if actual_name[0] != name and self.logger is not None:
+                    self.logger.info(
+                        "天猫材质成分第 %s 行：Excel 材质“%s”映射为平台选项“%s”",
+                        index + 1,
+                        name,
+                        actual_name[0],
                     )
 
                 percentage_input = await self._material_percentage_input(
@@ -1665,6 +1926,11 @@ class TmallFormListing(TaobaoListing):
                             index + 1, actual_name[0],
                         )
                 else:
+                    if name_alternatives:
+                        raise TmallFormListingError(
+                            "天猫材质成分需要填写具体含量，但 Excel 仅提供材质名称备选，"
+                            "未提供明确百分比；请核实材质含量"
+                        )
                     await percentage_input.fill(str(percentage))
                     await percentage_input.press("Tab")
 
@@ -1699,11 +1965,13 @@ class TmallFormListing(TaobaoListing):
                             current.split(".", 1)[0],
                         )
 
+            expected = tuple(effective_expected)
             deadline = asyncio.get_running_loop().time() + 5
-            actual: Tuple[Tuple[str, Optional[int]], ...] = ()
+            actual: Tuple[Tuple[str, Optional[MaterialPercentage]], ...] = ()
             while asyncio.get_running_loop().time() < deadline:
                 actual = await self._read_materials(item)
                 if self._material_rows_match(actual, expected):
+                    await self._revalidate_material_field(item)
                     self.material_validation = {
                         "source": "tmall_dom_events",
                         "confirmed": True,
@@ -1728,15 +1996,6 @@ class TmallFormListing(TaobaoListing):
         首次页必须先填写，否则页面会拦截发布而停留在产品信息页。
         """
         source_fields = _fields_mapping(fields)
-        try:
-            materials = parse_taobao_materials(source_fields)
-        except TaobaoListingError as exc:
-            raise TmallFormListingError(
-                str(exc).replace("淘宝", "天猫")
-            ) from exc
-        if not materials:
-            return {"filled": False, "materials": ()}
-
         await self._wait_for_loading_masks()
         scope = await self._product_identity_scope()
         labels = scope.locator(".el-form-item > .el-form-item__label")
@@ -1752,6 +2011,9 @@ class TmallFormListing(TaobaoListing):
             if self.logger is not None:
                 self.logger.info("天猫首次产品信息未展示材质成分；继续生成完整表单，后续按实际字段填写")
             return {"filled": False, "materials": (), "reason": "not_present_in_product_information"}
+        materials, name_alternatives = _tmall_material_source(source_fields)
+        if not materials:
+            return {"filled": False, "materials": ()}
         compatible = []
         for page_label, item in records:
             components = item.locator(".multi-complex-items")
@@ -1764,7 +2026,9 @@ class TmallFormListing(TaobaoListing):
                 f"匹配 {len(compatible)} 个"
             )
         page_label, item = compatible[0]
-        actual = await self.fill_materials(materials, item=item)
+        actual = await self.fill_materials(
+            materials, item=item, name_alternatives=name_alternatives
+        ) if name_alternatives else await self.fill_materials(materials, item=item)
         if self.logger is not None:
             self.logger.info(
                 "天猫首次产品信息“%s”已填写并回读材质成分：%s",
@@ -1773,7 +2037,7 @@ class TmallFormListing(TaobaoListing):
             )
         return {"filled": True, "label": page_label, "materials": actual}
 
-    async def _read_materials(self, item: Any) -> Tuple[Tuple[str, Optional[int]], ...]:
+    async def _read_materials(self, item: Any) -> Tuple[Tuple[str, Optional[MaterialPercentage]], ...]:
         actual = []
         for index, row in enumerate(await self._material_rows(item)):
             select_input = row.locator(
@@ -1795,21 +2059,13 @@ class TmallFormListing(TaobaoListing):
             if not name and not percentage_text:
                 continue
             try:
-                percentage_number = Decimal(percentage_text)
-            except InvalidOperation as exc:
+                percentage_number = normalize_material_percentage(percentage_text)
+            except DouyinDataError as exc:
                 raise TmallFormListingError(
-                    f"天猫材质成分第 {index + 1} 行含量不是整数："
+                    f"天猫材质成分第 {index + 1} 行含量无效："
                     f"{percentage_text!r}"
                 ) from exc
-            if (
-                not percentage_number.is_finite()
-                or percentage_number != percentage_number.to_integral_value()
-            ):
-                raise TmallFormListingError(
-                    f"天猫材质成分第 {index + 1} 行含量不是整数："
-                    f"{percentage_text!r}"
-                )
-            actual.append((name, int(percentage_number)))
+            actual.append((name, percentage_number))
         return tuple(actual)
 
     async def fill_after_sales(self, fields: Any) -> Mapping[str, Any]:
@@ -1858,15 +2114,11 @@ class TmallFormListing(TaobaoListing):
                 targets.append((page_label, item, source[1]))
 
         materials = ()
+        name_alternatives: Tuple[str, ...] = ()
         material_compatible = False
         if material_record is not None:
             page_label, material_item, required = material_record
-            try:
-                materials = parse_taobao_materials(source_fields)
-            except TaobaoListingError as exc:
-                raise TmallFormListingError(
-                    str(exc).replace("淘宝", "天猫")
-                ) from exc
+            materials, name_alternatives = _tmall_material_source(source_fields)
 
             if materials:
                 # 空材质组件也必须有行容器，且“添加”属于该容器；
@@ -1894,10 +2146,15 @@ class TmallFormListing(TaobaoListing):
                 "天猫售后必填字段缺少 Excel 值："
                 + "、".join(dict.fromkeys(missing))
             )
-        actual_materials: Tuple[Tuple[str, Optional[int]], ...] = ()
+        actual_materials: Tuple[Tuple[str, Optional[MaterialPercentage]], ...] = ()
         if materials and material_compatible:
             try:
-                actual_materials = await self.fill_materials(materials, item=material_item)
+                actual_materials = (
+                    await self.fill_materials(
+                        materials, item=material_item, name_alternatives=name_alternatives
+                    ) if name_alternatives else
+                    await self.fill_materials(materials, item=material_item)
+                )
             except TaobaoListingError as exc:
                 raise TmallFormListingError(
                     str(exc).replace("淘宝", "天猫")
@@ -1970,10 +2227,11 @@ class TmallFormListing(TaobaoListing):
 
             selects = item.locator(".el-select")
             if await selects.count() == 1:
-                control_type = "select"
                 select = selects.first
+                multi = await select_supports_multiple(select)
+                control_type = "multi_select" if multi else "select"
                 field_id = await self._dom_select_source_id(select)
-                await self._open_select(select, multi=False)
+                await self._open_select(select, multi=multi)
                 try:
                     _dropdown, dom_options = await self._visible_dom_options(
                         select, timeout_seconds=2
@@ -1998,10 +2256,7 @@ class TmallFormListing(TaobaoListing):
                     CandidateValue(value_id, label)
                     for value_id, label in unique_options.values()
                 )
-                custom_allowed = (
-                    (await select.get_attribute("caninputcustom") or "").casefold()
-                    == "true"
-                )
+                custom_allowed = await select_supports_custom_value(select)
             else:
                 radio_labels = item.locator(
                     "label.el-radio, label:has(input[type='radio'])"
@@ -2125,13 +2380,19 @@ class TmallFormListing(TaobaoListing):
         item: Optional[Any] = None,
     ) -> Optional[Tuple[str, ...]]:
         """用接口 JSON 选定精确候选，再由 DOM 完成点击和回读。"""
-        if normalize_label(label) == normalize_label("吊牌价"):
+        if normalize_label(label) == normalize_label("鞋底厚度"):
+            # cm 是范围控件的单位，不能当作类目属性候选送入模型判断。
+            try:
+                return await super().fill_attribute(label, expected, item=item)
+            except TaobaoListingError as exc:
+                raise TmallFormListingError(str(exc).replace("淘宝", "天猫")) from exc
+        if _tmall_attribute_key(label) == normalize_label("吊牌价"):
             if item is None:
                 items = await self._attribute_items()
                 records = [
                     record
-                    for key, record in items.items()
-                    if key.split("#", 1)[0] == normalize_label(label)
+                    for record in items.values()
+                    if _tmall_attribute_key(record[0]) == normalize_label("吊牌价")
                 ]
                 if len(records) != 1:
                     raise TmallFormListingError(
@@ -2170,7 +2431,79 @@ class TmallFormListing(TaobaoListing):
                     "天猫吊牌价填写后校验失败："
                     f"期望 {expected_with_unit!r}，页面为 {actual!r}"
                 )
+            if self.logger is not None:
+                self.logger.info("天猫属性“%s”已填写并回读：%s", label, actual)
             return (actual,)
+
+        if normalize_label(label) in {
+            normalize_label("鞋跟高度"), normalize_label("鞋跟高")
+        } and is_footwear_category(await self._category_text()):
+            if item is None:
+                items = await self._attribute_items()
+                records = [
+                    record
+                    for key, record in items.items()
+                    if key.split("#", 1)[0] == normalize_label(label)
+                ]
+                if len(records) != 1:
+                    raise TmallFormListingError(
+                        f"当前天猫类目中属性“{label}”匹配数为 {len(records)}"
+                    )
+                _page_label, item = records[0]
+            selects = item.locator(
+                ":scope > .el-form-item > .el-form-item__content .el-select"
+            )
+            inputs = item.locator(
+                ":scope > .el-form-item > .el-form-item__content "
+                "input:not([readonly]):not([disabled])"
+            )
+            visible_inputs = []
+            for index in range(await inputs.count()):
+                candidate = inputs.nth(index)
+                if await candidate.is_visible() and not await candidate.evaluate(
+                    "element => Boolean(element.closest('.el-select'))"
+                ):
+                    visible_inputs.append(candidate)
+            # 天猫鞋类的普通文本框要求“值cm”；下拉框和数值控件仍由
+            # 原处理逻辑负责，不把这个格式扩散到其他控件或平台。
+            if (
+                await selects.count() == 0
+                and len(visible_inputs) == 1
+                and (await visible_inputs[0].get_attribute("type") or "text").casefold() == "text"
+            ):
+                candidates = re.split(r"[/／]", str(expected))
+                numeric = next(
+                    (
+                        match.group(1)
+                        for candidate in candidates
+                        for match in [re.fullmatch(
+                            r"\s*(\d+(?:\.\d{1,2})?)\s*(?:cm|厘米)?\s*",
+                            candidate,
+                            re.IGNORECASE,
+                        )]
+                        if match is not None
+                    ),
+                    None,
+                )
+                if numeric is None:
+                    raise TmallFormListingError(
+                        "天猫鞋跟高度没有可填写的单个厘米数值，"
+                        "请在 Excel 中提供最多两位小数的数值"
+                    )
+                expected_with_unit = f"{numeric}cm"
+                input_box = visible_inputs[0]
+                if (await input_box.input_value()).strip() != expected_with_unit:
+                    await input_box.fill(expected_with_unit)
+                    await input_box.press("Tab")
+                actual = (await input_box.input_value()).strip()
+                if actual != expected_with_unit:
+                    raise TmallFormListingError(
+                        "天猫鞋跟高度填写后校验失败："
+                        f"期望 {expected_with_unit!r}，页面为 {actual!r}"
+                    )
+                if self.logger is not None:
+                    self.logger.info("天猫属性“%s”已填写并回读：%s", label, actual)
+                return (actual,)
 
         groups = (
             material_value_groups(label, exact_values)
@@ -2218,6 +2551,10 @@ class TmallFormListing(TaobaoListing):
                 if all(len(group) == 1 for group in resolved_groups)
                 else None
             )
+        if resolved_values is not None:
+            # Once the category/runtime has chosen an exact value, a failed
+            # click must not fall through to a later slash-separated option.
+            getattr(self, "_excel_select_plans", {}).pop(normalize_label(label), None)
         try:
             return await super().fill_attribute(
                 label,
@@ -2258,7 +2595,7 @@ class TmallFormListing(TaobaoListing):
                     deferred.append(page_label)
                 continue
             required = await self._item_is_required(item, page_label)
-            hang_price = normalize_label(page_label) == normalize_label("吊牌价")
+            hang_price = _tmall_attribute_key(page_label) == normalize_label("吊牌价")
             waist_shape = normalize_label(page_label) in {
                 normalize_label("腰型"),
                 normalize_label("腰形"),
@@ -2285,6 +2622,17 @@ class TmallFormListing(TaobaoListing):
                     )
             targets.append(
                 (key, page_label, item, source, required, exact_values)
+            )
+        price_targets = [
+            page_label
+            for _key, page_label, _item, source, _required, _exact in targets
+            if source is not None
+            and _tmall_attribute_key(page_label) == normalize_label("吊牌价")
+        ]
+        if len(price_targets) > 1:
+            raise TmallFormListingError(
+                "天猫吊牌价字段不唯一，无法确认应填写的控件："
+                + "、".join(price_targets)
             )
         if missing:
             raise TmallFormListingError(
@@ -2578,7 +2926,13 @@ class TmallFormListing(TaobaoListing):
                 timeout_seconds,
                 force_replace=True,
             )
-        return {"count": len(actions), "actions": actions}
+        ready = await self.wait_for_initial_product_images(
+            expected_count=len(original),
+            timeout_seconds=timeout_seconds,
+            initial_delay_seconds=0,
+            allow_existing_product_shortcut=False,
+        )
+        return {"count": len(actions), "actions": actions, "ready": ready}
 
     async def publish_product_information(
         self, *, timeout_seconds: float = 30, expected_image_count: int = 5
@@ -2689,29 +3043,44 @@ class TmallFormListing(TaobaoListing):
         has_sku_row = any(
             [await sku_rows.nth(index).is_visible() for index in range(await sku_rows.count())]
         )
+        # 皮带的完整商品表单可能不提供尺码表，不能把这类正常页面
+        # 当成仍在加载。若页面已展示尺码表标题，仍须等到表格生成。
+        has_size_section = bool(size_sections.intersection(visible_sections))
+        size_chart_optional = (
+            not has_size_section
+            and category_profile((await self._category_text(),)).garment_kind
+            == "accessory"
+        )
         has_size_table = False
-        try:
-            size_container = await self._size_chart_container()
-            size_table = await self._size_chart_table(size_container)
-            has_size_table = await size_table.is_visible()
-        except TmallFormListingError:
-            pass
-        if not has_size_table:
-            legacy_size_tables = self.panel.locator(".tmall-size-table")
-            has_size_table = any(
-                [
-                    await legacy_size_tables.nth(index).is_visible()
-                    for index in range(await legacy_size_tables.count())
-                ]
-            )
+        if not size_chart_optional:
+            try:
+                size_container = await self._size_chart_container()
+                size_table = await self._size_chart_table(size_container)
+                has_size_table = await size_table.is_visible()
+            except TmallFormListingError:
+                pass
+            if not has_size_table:
+                legacy_size_tables = self.panel.locator(".tmall-size-table")
+                has_size_table = any(
+                    [
+                        await legacy_size_tables.nth(index).is_visible()
+                        for index in range(await legacy_size_tables.count())
+                    ]
+                )
         if (
             required_sections.issubset(visible_sections)
-            and bool(size_sections.intersection(visible_sections))
             and has_sku_row
-            and has_size_table
+            and (size_chart_optional or (has_size_section and has_size_table))
         ):
             return
-        raise TmallFormListingError("天猫类目已选择，但后续完整表单尚未渲染")
+        missing = sorted(required_sections - visible_sections)
+        if not has_sku_row:
+            missing.append("SKU批量设置行")
+        if not size_chart_optional and not (has_size_section and has_size_table):
+            missing.append("尺码表")
+        raise TmallFormListingError(
+            "天猫类目已选择，但后续完整表单尚未渲染：缺少" + "、".join(missing)
+        )
 
     async def normalize_synced_specifications(
         self, category_path: str
@@ -2903,7 +3272,9 @@ class TmallFormListing(TaobaoListing):
                 elif label == "上市时间":
                     matches = re.sub(r"\D", "", actual) == re.sub(r"\D", "", wanted)
                 else:
-                    matches = normalize_option(actual) == normalize_option(wanted)
+                    matches = self._sku_option_values_equal(
+                        actual, wanted, multi=indices[label] in snapshot.get("multi_columns", ())
+                    )
                 if not matches:
                     errors.append(f"第{row_number}行{label}={actual!r}")
             rows.append(values)
@@ -2991,13 +3362,23 @@ class TmallFormListing(TaobaoListing):
             if source is None:
                 continue
             if await item.locator(".el-select").count() == 1:
-                groups = selection_value_groups_for_control(label, source[1], multi=False)
-                if len(groups) != 1:
-                    raise TmallFormListingError(
-                        f"天猫 SKU 字段“{label}”是单选，但 Excel 不是单值"
-                    )
                 try:
-                    resolved = await self._fill_batch_select(row, label, groups[0])
+                    numeric_inputs = item.locator(
+                        ".el-input-digit > input.el-input__inner:not([readonly]):not([disabled])"
+                    )
+                    if await numeric_inputs.count() == 1:
+                        # 总长度等字段由数值框和单位下拉组成。单位候选
+                        # 不能用于匹配整个长度值，复用数值/单位填写及回读。
+                        measurement = await self._fill_numeric_unit_attribute(
+                            label, source[1], numeric_inputs.first,
+                            item.locator(".el-select").first,
+                        )
+                        resolved = "|".join(measurement)
+                    else:
+                        # 共享填写器按当前类目的现场控件解析逗号多选和斜杠备用。
+                        resolved = await self._fill_batch_select(
+                            row, label, excel_aliases(source[1]), excel_value=source[1]
+                        )
                 except TaobaoListingError as exc:
                     raise TmallFormListingError(
                         str(exc).replace("淘宝", "天猫")
@@ -3010,7 +3391,9 @@ class TmallFormListing(TaobaoListing):
                     dynamic[label] = resolved
             else:
                 text_value = source[1]
-                if footwear and normalize_label(label) == normalize_label("鞋跟高度（cm）"):
+                if footwear and normalize_label(label) in {
+                    normalize_label("鞋跟高度"), normalize_label("鞋跟高度（cm）")
+                }:
                     groups = selection_value_groups(label, text_value)
                     numbers = [
                         match.group(1)
@@ -3613,7 +3996,30 @@ class TmallFormListing(TaobaoListing):
                     if self.logger is not None:
                         self.logger.info("天猫鞋类脚长仅支持单值，按确认规则取尺码图区间最小值")
                     continue
+                # 部分服装/马甲类目把身高、体重渲染成单值输入，页面没有
+                # 区间开关，但 Excel/推荐表仍提供的是区间。沿用鞋类单值
+                # 兼容策略取区间下限，保证页面能落地且不把无候选的输入框
+                # 错误送进人工审核。
+                if (not visible_switches and normalized_header in {
+                    normalize_label("身高（cm）"), normalize_label("体重（kg）")
+                }):
+                    for key, parts in tuple(parsed_sources.items()):
+                        if key[1] == normalized_header and len(parts) == 2:
+                            minimum = min(Decimal(parts[0]), Decimal(parts[1]))
+                            parsed_sources[key] = (format(minimum.normalize(), "f"),)
+                    if self.logger is not None:
+                        self.logger.info(
+                            "天猫尺码表%s仅支持单值，按区间下限填写",
+                            header_label,
+                        )
+                    continue
                 if len(visible_switches) != 1:
+                    if expected_count == 2:
+                        raise TmallFormListingError(
+                            f"天猫尺码参数“{header_label}”来源为区间值，"
+                            "但页面没有唯一可用的“区间”控件，无法填写；"
+                            "请检查天猫类目尺码表是否支持区间模式"
+                        )
                     if self.attribute_runtime is not None:
                         if normalized_header in required_keys:
                             unresolved_cells.update(
@@ -3651,6 +4057,14 @@ class TmallFormListing(TaobaoListing):
                 )
                 current_count = await first_inputs.count()
             if current_count != expected_count:
+                # 同上：区间来源与页面输入框数量不一致是页面结构问题，
+                # 不是属性候选歧义，不应创建人工审核任务。
+                if expected_count == 2:
+                    raise TmallFormListingError(
+                        f"天猫尺码参数“{header_label}”来源为区间值，"
+                        f"但页面只有 {current_count} 个输入框，无法填写；"
+                        "请检查天猫类目尺码表是否支持区间模式"
+                    )
                 if self.attribute_runtime is not None:
                     if normalized_header in required_keys:
                         unresolved_cells.update(
@@ -4016,14 +4430,52 @@ class TmallFormListing(TaobaoListing):
                         and is_footwear_category(await self._category_text())):
                     continue
                 raise TmallFormListingError(str(exc).replace("淘宝", "天猫")) from exc
-            actions[label] = await uploader(
-                self.page,
-                item,
-                (path,),
-                label,
-                timeout_seconds,
-            )
+            if label == "透明素材图":
+                with tempfile.TemporaryDirectory(prefix="tmall-transparent-") as directory:
+                    try:
+                        prepared = await asyncio.to_thread(
+                            prepare_tmall_transparent_image, Path(path),
+                            Path(directory) / "transparent-800x800.png",
+                        )
+                    except TmallDataError as exc:
+                        raise TmallFormListingError(str(exc)) from exc
+                    if self.logger is not None:
+                        self.logger.info("天猫透明素材图已生成 800×800 上传副本，保留原文件与透明通道")
+                    actions[label] = await uploader(
+                        self.page, item, (prepared,), label, timeout_seconds,
+                        force_replace=True,
+                    )
+                    await self._require_transparent_image_size(item, timeout_seconds)
+            else:
+                actions[label] = await uploader(
+                    self.page, item, (path,), label, timeout_seconds,
+                )
         return actions
+
+    async def _require_transparent_image_size(self, item: Any, timeout_seconds: float) -> None:
+        deadline = asyncio.get_running_loop().time() + min(5.0, timeout_seconds)
+        state: Mapping[str, Any] = {}
+        while True:
+            state = await item.evaluate("""element => {
+              const visible = node => Boolean(node.getClientRects().length);
+              return {
+                images: [...element.querySelectorAll('.sc-upload .file-img img.originImg')]
+                  .filter(visible).map(image => ({loaded: image.complete,
+                    width: image.naturalWidth, height: image.naturalHeight})),
+                errors: [...element.querySelectorAll('.el-form-item__error')]
+                  .filter(visible).map(node => node.innerText.trim()).filter(Boolean)
+              };
+            }""")
+            images = state.get("images", ())
+            if (len(images) == 1 and images[0].get("loaded")
+                    and images[0].get("width") == 800 and images[0].get("height") == 800
+                    and not state.get("errors")):
+                if self.logger is not None:
+                    self.logger.info("天猫透明素材图页面回读通过：800×800，无尺寸校验错误")
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TmallFormListingError(f"天猫透明素材图上传后尺寸校验未通过：{state}")
+            await asyncio.sleep(0.1)
 
     async def sync_attribute_images(
         self,
@@ -4151,5 +4603,6 @@ class TmallFormListing(TaobaoListing):
 __all__ = [
     "TmallFormListing",
     "TmallFormListingError",
+    "TmallProductIdentityNotReady",
     "TmallProductWriteRequired",
 ]

@@ -325,7 +325,10 @@ CHECKPOINT_TRANSITIONS = {
     "running": {"running", "waiting_review", "failed", "completed", "cancelled"},
     "waiting_review": {"waiting_review", "resume_pending", "failed", "cancelled"},
     "resume_pending": {"resume_pending", "running", "failed", "cancelled"},
-    "failed": {"failed", "running", "waiting_review", "cancelled"},
+    # A stopped executor marks its last checkpoint failed. If its safe resume
+    # later finishes the remaining platform, accept the monotonic terminal
+    # update so the local service can reconcile the completed run.
+    "failed": {"failed", "running", "waiting_review", "completed", "cancelled"},
     "completed": {"completed"},
     "cancelled": {"cancelled"},
 }

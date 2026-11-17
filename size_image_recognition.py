@@ -93,7 +93,8 @@ class ClothingSkuRecommendation:
     length: Number
     chest: Number
     shoulder: Number
-    sleeve: Number
+    sleeve: Optional[Number]
+    hem: Optional[Number] = None
 
 
 @dataclass(frozen=True)
@@ -481,6 +482,12 @@ _CLOTHING_MEASUREMENT_ALIASES = {
     # Vision OCR occasionally reads 袖 as 神 in this bilingual row.
     "sleeve": ("袖长", "神长", "SLEEVELENGTH", "SLEEVE"),
 }
+_VEST_MEASUREMENT_ALIASES = {
+    "length": _CLOTHING_MEASUREMENT_ALIASES["length"],
+    "chest": _CLOTHING_MEASUREMENT_ALIASES["chest"],
+    "shoulder": _CLOTHING_MEASUREMENT_ALIASES["shoulder"],
+    "hem": ("下摆", "HEM", "BOTTOM", "HEMLINE"),
+}
 _CLOTHING_EXTRA_ROW_ALIASES = {
     "cuff": ("袖口", "CUFF"),
 }
@@ -490,6 +497,7 @@ _CLOTHING_MEASUREMENT_NAMES = {
     "shoulder": "肩宽",
     "sleeve": "袖长",
 }
+_VEST_MEASUREMENT_NAMES = {**_CLOTHING_MEASUREMENT_NAMES, "hem": "下摆"}
 
 # 肩宽在部分平台的尺码表中不是必填项。缺少整行时使用稳定、可追溯的
 # 顺序值，避免各平台在自己的填表逻辑中重复处理并产生不一致。
@@ -498,6 +506,8 @@ _CLOTHING_REQUIRED_MEASUREMENTS = ("length", "chest", "sleeve")
 _TAOBAO_LENGTH_ALIASES = {
     "pants": ("裤长", "LENGTH", "PANTSLENGTH", "TROUSERLENGTH"),
     "clothing": ("衣长", "LENGTH", "GARMENTLENGTH", "BODYLENGTH", "BACKLENGTH"),
+    # 马甲沿用服装尺码表的衣长/字母尺码识别；“下摆”仅在完整测量表中单独处理。
+    "vest": ("衣长", "LENGTH", "GARMENTLENGTH", "BODYLENGTH", "BACKLENGTH"),
 }
 
 
@@ -879,16 +889,17 @@ def parse_clothing_measurement_table(
     expected_sizes: Sequence[str],
     *,
     source: str = "尺码信息表",
+    garment_kind: str = "clothing",
 ) -> Dict[str, Mapping[str, Number]]:
     """Parse the four measurements required by Douyin clothing size tables."""
     expected_map = _expected_size_map(expected_sizes, source)
 
     row_tokens: Dict[str, OCRToken] = {}
     all_row_tokens: Dict[str, OCRToken] = {}
-    row_aliases = {
-        **_CLOTHING_MEASUREMENT_ALIASES,
-        **_CLOTHING_EXTRA_ROW_ALIASES,
-    }
+    vest = garment_kind == "vest"
+    measurement_aliases = _VEST_MEASUREMENT_ALIASES if vest else _CLOTHING_MEASUREMENT_ALIASES
+    measurement_names = _VEST_MEASUREMENT_NAMES if vest else _CLOTHING_MEASUREMENT_NAMES
+    row_aliases = {**measurement_aliases, **({} if vest else _CLOTHING_EXTRA_ROW_ALIASES)}
     consumed_label_tokens = set()
     for index, token in enumerate(tokens):
         if index in consumed_label_tokens:
@@ -926,12 +937,12 @@ def parse_clothing_measurement_table(
                 f"{source}：{row_aliases[kind][0]}行标题重复"
             )
         all_row_tokens[kind] = token
-        if kind in _CLOTHING_MEASUREMENT_NAMES:
+        if kind in measurement_names:
             row_tokens[kind] = token
 
     missing_rows = [
-        _CLOTHING_MEASUREMENT_NAMES[kind]
-        for kind in _CLOTHING_REQUIRED_MEASUREMENTS
+        measurement_names[kind]
+        for kind in (("length", "chest", "shoulder", "hem") if vest else _CLOTHING_REQUIRED_MEASUREMENTS)
         if kind not in row_tokens
     ]
     if missing_rows:
@@ -971,7 +982,7 @@ def parse_clothing_measurement_table(
     )
 
     cells: Dict[Tuple[str, str], Number] = {}
-    for kind in _CLOTHING_MEASUREMENT_NAMES:
+    for kind in measurement_names:
         if kind not in row_bound_by_kind:
             continue
         top, bottom = row_bound_by_kind[kind]
@@ -982,7 +993,7 @@ def parse_clothing_measurement_table(
                 if left <= _center_x(token) < right
                 and top <= _center_y(token) < bottom
             ]
-            cell_name = f"{size} {_CLOTHING_MEASUREMENT_NAMES[kind]}"
+            cell_name = f"{size} {measurement_names[kind]}"
             if len(matches) != 1:
                 raise RecognitionError(
                     f"{source}：单元格 {cell_name}匹配数为 {len(matches)}"
@@ -1010,7 +1021,8 @@ def parse_clothing_measurement_table(
             "length": cells[(size, "length")],
             "chest": cells[(size, "chest")],
             "shoulder": shoulder_values[size],
-            "sleeve": cells[(size, "sleeve")],
+            "sleeve": (cells[(size, "sleeve")] if not vest else cells[(size, "hem")]),
+            **({"hem": cells[(size, "hem")]} if vest else {}),
         }
         for size in expected_map
     }
@@ -1402,6 +1414,7 @@ def recognize_clothing_recommendations(
     size_chart_path: Path,
     height_weight_path: Path,
     expected_sizes: Sequence[str],
+    garment_kind: str = "clothing",
 ) -> Tuple[ClothingSkuRecommendation, ...]:
     """Read the measurements shown by Douyin for an upper-body garment."""
     expected_map = _expected_size_map(expected_sizes, "Excel")
@@ -1409,8 +1422,8 @@ def recognize_clothing_recommendations(
     size_chart_path = Path(size_chart_path)
     height_weight_path = Path(height_weight_path)
     from ocr_semantics import parse_chart
-    measurements = parse_chart(size_chart_path, "clothing", lambda tokens:
-                               parse_clothing_measurement_table(tokens, expected, source=str(size_chart_path)))
+    measurements = parse_chart(size_chart_path, garment_kind, lambda tokens:
+                               parse_clothing_measurement_table(tokens, expected, source=str(size_chart_path), garment_kind=garment_kind))
     ranges = parse_height_weight_chart(
         height_weight_path,
         vision_ocr(height_weight_path),
@@ -1434,6 +1447,7 @@ def recognize_clothing_recommendations(
                 _positive_number(values["chest"], str(size_chart_path), size, "胸围"),
                 _positive_number(values["shoulder"], str(size_chart_path), size, "肩宽"),
                 _positive_number(values["sleeve"], str(size_chart_path), size, "袖长"),
+                values.get("hem"),
             )
         )
 

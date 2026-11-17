@@ -26,6 +26,30 @@ def select_markup(options, *, empty_message=False):
 
 
 class YouzanFormListingTests(unittest.IsolatedAsyncioTestCase):
+    def test_belt_price_skips_unit_template_without_changing_other_categories(self):
+        from youzan_form_listing import _required_excel_value, YouzanFormListingError
+        fields = {'商品分类': '服装 > 服装配饰 > 腰带/皮带/腰链',
+                  '吊牌价/价格/基本售价': '元', '售价/价格': '298'}
+        self.assertEqual(_required_excel_value(fields, ('价格', '售价'), '价格', money=True), '298')
+        with self.assertRaisesRegex(YouzanFormListingError, '不是有效金额'):
+            _required_excel_value(dict(fields, 商品分类='男装 > 休闲裤'), ('价格', '售价'), '价格', money=True)
+    async def test_existing_belt_category_is_retained_with_complete_excel_hints(self):
+        current = '服装鞋包 > 配饰 > 腰带/皮带/腰链'
+        await self.page.set_content(f'<section id="panel"><div class="platform-category-input"><span class="current">{current}</span></div></section>')
+        hints = ('服装 > 服装配饰 > 腰带/皮带/腰链',
+                 '服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带')
+        listing = YouzanFormListing(self.page, self.page.locator('body'), None, category_hints=hints)
+        listing.panel = self.page.locator('#panel')
+        report = await listing.apply_category(('服装', '服装配饰', '腰带/腰链/男士皮带'))
+        self.assertEqual(report['selected'], current)
+        self.assertEqual(report['source'], 'validated_current')
+        self.assertEqual(listing.category_hints, hints)
+
+    async def test_belt_uses_existing_accessories_freight_template(self):
+        listing = await self._listing()
+        report = await listing.fill_sales_and_logistics('belt')
+        self.assertEqual(report['freight_template'], 'T恤、裤子、饰品邮费模版')
+
     def test_category_hints_choose_first_authored_unique_outerwear_leaf(self):
         self.assertEqual(
             choose_youzan_category_text(

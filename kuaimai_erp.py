@@ -36,8 +36,16 @@ from urllib.parse import unquote, unquote_to_bytes, urljoin, urlsplit
 from zipfile import BadZipFile
 
 from category_profile import category_profile
-from product_materials import MaterialPathError, default_materials_root, resolve_product_materials
-from douyin_data import DouyinAssets, DouyinDataError, DouyinFields, field_lookup, parse_douyin_fields, read_douyin_assets
+from product_materials import MaterialPathError, resolve_product_materials
+from douyin_data import (
+    DouyinAssets,
+    DouyinDataError,
+    DouyinFields,
+    field_lookup,
+    key_aliases,
+    parse_douyin_fields,
+    read_douyin_assets,
+)
 from douyin_listing import DouyinListing, DouyinListingError
 from jd_data import JdFields, parse_jd_fields
 from jd_form_listing import JdFormListing, JdFormListingError
@@ -81,6 +89,7 @@ from tmall_data import TmallAssets, TmallDataError, TmallFields, parse_tmall_fie
 from tmall_form_listing import (
     TmallFormListing,
     TmallFormListingError,
+    TmallProductIdentityNotReady,
     TmallProductWriteRequired,
 )
 from tmall_api_index import TMALL_READ_ONLY_ENDPOINTS, TmallApiJsonIndex
@@ -99,11 +108,11 @@ from wxsph_form_listing import WxsphFormListing, WxsphFormListingError
 
 ERP_ENTRY_URL = "https://erp.superboss.cc/index.html#/index/"
 CENTER_URL = "https://scm.superboss.cc/supplier/prod/center"
-# 快麦现在会按账号/环境把登录页跳到 erp、erpa 或 viperp，
-# 商品中心则可能使用 scm、scma 或 vipscm。这些都属于同一套快麦会话，
+# 快麦现在会按账号/环境把登录页跳到 erp、erpa、erpb 或 viperp，
+# 商品中心则可能使用 scm、scma、scmb 或 vipscm。这些都属于同一套快麦会话，
 # 不应因域名切换而把已登录页面误判为仍在登录。
-ERP_HOSTS = {"erp.superboss.cc", "erpa.superboss.cc", "viperp.superboss.cc"}
-SCM_HOSTS = {"scm.superboss.cc", "scma.superboss.cc", "vipscm.superboss.cc"}
+ERP_HOSTS = {"erp.superboss.cc", "erpa.superboss.cc", "erpb.superboss.cc", "viperp.superboss.cc"}
+SCM_HOSTS = {"scm.superboss.cc", "scma.superboss.cc", "scmb.superboss.cc", "vipscm.superboss.cc"}
 ERP_LOGIN_KEYCHAIN_SERVICE = "kuaimai-erp-auto-login"
 ERP_LOGIN_KEYCHAIN_LABEL = "快麦 ERP 自动登录"
 ERP_LOGIN_CREDENTIAL_RETRY_SECONDS = 30.0
@@ -153,8 +162,8 @@ DEFAULT_AUTH_STATE = RUNTIME_ROOT / "output/kuaimai/auth-state.json"
 DEFAULT_DOUYIN_PUBLISH_SHOPS = (
     "钊叔 NEIGBORL 制",
     "啊亮穿搭",
-    "老朱和NEIGBORL",
-    "泰美了穿搭",
+    "明仔和NEIGBORL1",
+    "NEIGBORL钊叔店",
     "NEIGBORL钊哥小店",
     "小马客服",
 )
@@ -166,7 +175,7 @@ DEFAULT_WXSPH_PUBLISH_SHOPS = (
     "NEIGBORL钊叔制造局",
 )
 DEFAULT_XHS_PUBLISH_SHOPS = (
-    "钊叔的店",
+    "Z钊叔制的店",
     "钊叔制NEIGBORL的店",
     "NEIGBORL钊叔劳伦的店",
 )
@@ -191,8 +200,8 @@ KNOWN_DOUYIN_SHOPS = (
     "钊叔 NEIGBORL 制",
     "夏一制",
     "啊亮穿搭",
-    "老朱和NEIGBORL",
-    "泰美了穿搭",
+    "明仔和NEIGBORL1",
+    "NEIGBORL钊叔店",
     "杰叔抖店",
     "Li Napping",
     "NEIGBORL钊哥小店",
@@ -204,8 +213,8 @@ KNOWN_DOUYIN_SHOPS = (
 DOUYIN_FREIGHT_TEMPLATE_SHOPS = (
     "钊叔 NEIGBORL 制",
     "啊亮穿搭",
-    "泰美了穿搭",
-    "老朱和NEIGBORL",
+    "NEIGBORL钊叔店",
+    "明仔和NEIGBORL1",
     "NEIGBORL钊哥小店",
 )
 
@@ -540,7 +549,8 @@ def normalize_cell(value: Any) -> str:
 
 def parse_category_hints(value: Any) -> Tuple[str, ...]:
     # Category syntax is shared across every platform: ``>`` denotes a path
-    # level and ``/`` denotes an alternative at that level.  Keep the
+    # level and ``/`` usually denotes an alternative at that level. Known
+    # composite belt labels are preserved by category_profile. Keep the
     # expression intact here so downstream matchers can preserve that
     # distinction instead of receiving a fake ordered route.
     text = normalize_cell(value)
@@ -746,7 +756,25 @@ def read_product_data(
 
     title = normalize_cell(field_value("商品标题", "商品名称", "宝贝标题"))
     style_code = normalize_cell(field_value("货号", "商家外部编码", "款式编码"))
-    price_value = field_value("基本售价", "吊牌价", "商品价格", "价格")
+    price_aliases = {"基本售价", "吊牌价", "商品价格", "价格"}
+    price_candidates = [
+        value for key, value in fields.items()
+        if price_aliases.intersection(key_aliases(key))
+        and value is not None and normalize_cell(value)
+    ]
+    price_value = None
+    first_price_error: Optional[AutomationError] = None
+    for candidate in price_candidates:
+        try:
+            normalize_price(candidate)
+        except AutomationError as exc:
+            if first_price_error is None:
+                first_price_error = exc
+            continue
+        price_value = candidate
+        break
+    if price_value is None and first_price_error is not None:
+        raise first_price_error
 
     if not title:
         raise AutomationError("Excel 中找不到商品标题/商品名称/宝贝标题")
@@ -793,16 +821,18 @@ def read_product_data(
         fields["尺码"] = "/".join(derived_size_names)
     main_dir = find_image_dir(
         product_dir,
-        ("1：1主图", "1:1主图", "主图/1：1", "主图/1:1"),
+        ("1：1主图", "1:1主图", "主图/1：1", "主图/1:1", "1：1", "1:1"),
         "1:1 主图",
     )
     main_34_dir = find_image_dir(
         product_dir,
-        ("3：4主图", "3:4主图", "主图/3：4", "主图/3:4"),
+        ("3：4主图", "3:4主图", "主图/3：4", "主图/3:4", "3：4", "3:4"),
         "3:4 主图",
     )
     detail_dir = find_image_dir(
-        product_dir, ("详情页图/images", "详情页图", "商品详情图/images", "商品详情图"), "商品详情图"
+        product_dir,
+        ("详情页图/images", "详情页图", "商品详情图/images", "商品详情图", "详情页/images", "详情页"),
+        "商品详情图",
     )
     sku_dir = find_image_dir(product_dir, ("SKU图", "sku图", "Sku图"), "SKU 图")
     has_douyin_signals = field_lookup(fields, "导购短标题") is not None or any(
@@ -831,7 +861,10 @@ def read_product_data(
         detail_images=list_images(detail_dir, "商品详情图"),
         sku_images=list_images(sku_dir, "SKU 图"),
         douyin_fields=(
-            parse_douyin_fields(fields)
+            parse_douyin_fields(
+                fields,
+                require_size=profile.garment_kind != "accessory",
+            )
             if include_douyin and has_douyin_signals
             else None
         ),
@@ -953,13 +986,16 @@ def recognize_product_recommendations(
             product.douyin_assets.height_weight_image,
             product.douyin_fields.sizes,
         )
-    elif product.garment_kind == "clothing":
+    elif product.garment_kind in {"clothing", "vest"}:
         assert product.douyin_assets.size_chart_image is not None
         assert product.douyin_assets.height_weight_image is not None
-        recommendations = recognize_clothing_recommendations(
+        args = (
             product.douyin_assets.size_chart_image,
             product.douyin_assets.height_weight_image,
             product.douyin_fields.sizes,
+        )
+        recommendations = recognize_clothing_recommendations(
+            *args, **({"garment_kind": product.garment_kind} if product.garment_kind == "vest" else {})
         )
     else:
         (artifact_dir / "ocr-result.json").write_text(
@@ -1036,6 +1072,12 @@ def tmall_preview_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
     if report.get("reason_code"):
         summary["reason_code"] = str(report["reason_code"])
     summary["form_mode"] = str(report.get("form_mode") or "unknown")
+    recovery = child_mapping("product_identity_recovery")
+    if recovery:
+        summary["product_identity_recovery"] = {
+            "attempts": int(recovery.get("attempts") or 0),
+            "status": str(recovery.get("status") or "unknown"),
+        }
     for report_key in (
         "initial_product_images_ready",
         "existing_product_images_before",
@@ -1174,8 +1216,8 @@ def resolve_taobao_category_mode(product: ProductData, category_mode: str) -> st
 def taobao_garment_kind(product: ProductData, category_mode: str) -> str:
     if category_mode == "casual-pants":
         return "pants"
-    if product.garment_kind in {"pants", "clothing", "footwear"}:
-        return product.garment_kind
+    if product.garment_kind in {"pants", "clothing", "vest", "footwear"}:
+        return "clothing" if product.garment_kind == "vest" else product.garment_kind
     raise AutomationError(
         "当前品类无法确定淘宝尺码表是衣长还是裤长，请进入运营审核"
     )
@@ -1189,6 +1231,8 @@ def recognize_taobao_size_lengths(
     if product.taobao_fields is None:
         raise AutomationError("淘宝尺码识别缺少 Excel 字段")
     size_source = field_lookup(dict(product.taobao_fields.fields), "尺码")
+    if size_source is None and product.garment_kind == "accessory":
+        return "", ()
     if size_source is None:
         raise AutomationError("Excel 中缺少淘宝尺码字段")
     sizes = tuple(
@@ -2808,7 +2852,7 @@ async def sync_image_group(
                 label,
                 converted_jfif,
             )
-        async def trigger_upload() -> None:
+        async def trigger_upload_once() -> None:
             await item.scroll_into_view_if_needed()
             # Deleting the last image can recreate the upload component.
             await item.evaluate("e => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
@@ -2818,12 +2862,12 @@ async def sync_image_group(
             # 只有控件本身仍有文件时才清空，再写入新文件。
             try:
                 current_count = await current_input.evaluate(
-                    "input => input.files ? input.files.length : 0"
+                    "input => input.files ? input.files.length : 0", timeout=1_000
                 )
             except Exception:
                 current_count = 0
             if current_count:
-                await current_input.set_input_files([])
+                await current_input.set_input_files([], timeout=5_000)
             file_values = [str(path) for path in upload_paths]
             # 快麦当前上传组件的“本地上传”按钮会在点击时注册页面侧
             # change/upload 处理器。直接给隐藏 input 设置文件虽然能回读
@@ -2856,9 +2900,9 @@ async def sync_image_group(
             if await upload_button.count():
                 try:
                     async with page.expect_file_chooser(timeout=5000) as chooser_info:
-                        await upload_button.click()
+                        await upload_button.click(timeout=5_000)
                     chooser = await chooser_info.value
-                    await chooser.set_files(file_values)
+                    await chooser.set_files(file_values, timeout=15_000)
                     used_file_chooser = True
                     logging.getLogger("kuaimai_erp").info(
                         "%s：已通过“本地上传”按钮触发文件选择器",
@@ -2871,10 +2915,16 @@ async def sync_image_group(
                         exc,
                     )
             if not used_file_chooser:
-                await current_input.set_input_files(file_values)
+                current_input = item.locator('input[type="file"]').first
+                if not await current_input.count():
+                    raise AutomationError(f"{label}上传控件已被页面异步回填替换")
+                await current_input.set_input_files(file_values, timeout=15_000)
             try:
+                # 单图组件在上传成功后会移除 input，回读不能再等待它重现。
+                if not await current_input.count():
+                    return
                 file_count = await current_input.evaluate(
-                    "input => input.files ? input.files.length : 0"
+                    "input => input.files ? input.files.length : 0", timeout=1_000
                 )
                 logging.getLogger("kuaimai_erp").info(
                     "%s：已将 %s 个本地文件写入页面上传控件",
@@ -2887,6 +2937,22 @@ async def sync_image_group(
                     label,
                     exc,
                 )
+
+        async def trigger_upload() -> None:
+            for attempt in range(2):
+                try:
+                    await trigger_upload_once()
+                    return
+                except Exception:
+                    # 天猫匹配既有产品的回调可能在删除旧图后再次回填图片，
+                    # 单图位因此移除上传 input。仅对明确要求覆盖的图位重试；
+                    # 数量相等的普通同步仍保留原来的跳过规则。
+                    if not force_replace or attempt or not await images.count():
+                        raise
+                    logging.getLogger("kuaimai_erp").info(
+                        "%s：检测到异步回填旧图，重新清空图位后上传", label
+                    )
+                    await delete_uploaded_images(item, page)
 
         upload_events = []
 
@@ -2926,7 +2992,9 @@ async def sync_image_group(
     return "replaced"
 
 
-async def base_specification_value_group(drawer: Any, spec_name: str) -> Any:
+async def base_specification_value_group(
+    drawer: Any, spec_name: str, *, required: bool = True
+) -> Any:
     """Locate one base-data specification value group by its exact spec name."""
     result = await drawer.evaluate(
         """
@@ -2963,6 +3031,8 @@ async def base_specification_value_group(drawer: Any, spec_name: str) -> Any:
         spec_name,
     )
     match_count = int(result.get("matchCount", 0))
+    if match_count == 0 and not required:
+        return None
     if match_count != 1:
         raise AutomationError(
             f"基础资料规格名“{spec_name}”无法唯一定位：匹配到 {match_count} 组"
@@ -2977,6 +3047,19 @@ async def read_base_specification_values(
     spec_name: str,
 ) -> Tuple[str, ...]:
     group = await base_specification_value_group(drawer, spec_name)
+    values = await group.locator(
+        ".specification-value-flex_input input:not([type=checkbox])"
+    ).evaluate_all("inputs => inputs.map(input => input.value.trim())")
+    return tuple(str(value).strip() for value in values)
+
+
+async def read_optional_base_specification_values(
+    drawer: Any, spec_name: str
+) -> Tuple[str, ...]:
+    """Read a specification that may not exist for accessory categories."""
+    group = await base_specification_value_group(drawer, spec_name, required=False)
+    if group is None:
+        return ()
     values = await group.locator(
         ".specification-value-flex_input input:not([type=checkbox])"
     ).evaluate_all("inputs => inputs.map(input => input.value.trim())")
@@ -3312,13 +3395,15 @@ async def replace_sku_images(
     return uploaded_count
 
 
-async def read_base_sku_color_code_rows(drawer: Any) -> List[Dict[str, str]]:
+async def read_base_sku_color_code_rows(
+    drawer: Any, *, require_size: bool = True
+) -> List[Dict[str, str]]:
     block = await first_visible(drawer.locator(".block-specification-list"))
     if block is None:
         raise AutomationError("基础资料没有可见的 SKU 规格明细，无法校验商品编码")
     result = await block.evaluate(
         """
-        root => {
+        (root, requireSize) => {
           const visible = node => node.getClientRects().length > 0
             && getComputedStyle(node).visibility !== 'hidden';
           for (const table of root.querySelectorAll('.el-table')) {
@@ -3338,7 +3423,7 @@ async def read_base_sku_color_code_rows(drawer: Any) -> List[Dict[str, str]]:
               column(['尺码', '尺码大小']),
               column(['商品编码', '基础资料商家编码']),
             ];
-            if (indexes.some(index => index < 0)) continue;
+            if (indexes[0] < 0 || indexes[2] < 0 || (requireSize && indexes[1] < 0)) continue;
             const rows = [...body.querySelectorAll('tbody > tr')].filter(visible).map(row => {
               const cells = [...row.querySelectorAll(':scope > td')];
               return indexes.map(index => {
@@ -3351,7 +3436,8 @@ async def read_base_sku_color_code_rows(drawer: Any) -> List[Dict[str, str]]:
           }
           return {found: false, rows: []};
         }
-        """
+        """,
+        require_size,
     )
     if not result.get("found") or not result.get("rows"):
         raise AutomationError("基础资料找不到颜色、尺码、商品编码三列及 SKU 行")
@@ -4826,11 +4912,14 @@ async def run_browser_automation(
             taobao_category_mode,
             artifact_dir,
         )
-        logger.info(
-            "淘宝尺码信息表识别完成：%s | %s",
-            {"pants": "裤长", "clothing": "衣长", "footwear": "脚长"}[taobao_garment_kind_value],
-            " / ".join(item.size for item in taobao_size_lengths),
-        )
+        if taobao_size_lengths:
+            logger.info(
+                "淘宝尺码信息表识别完成：%s | %s",
+                {"pants": "裤长", "clothing": "衣长", "footwear": "脚长"}[taobao_garment_kind_value],
+                " / ".join(item.size for item in taobao_size_lengths),
+            )
+        else:
+            logger.info("淘宝尺码表按皮带无尺码字段跳过")
 
     async with playwright_for_browser_run(async_playwright, shared_session) as playwright:
         reuse_editor = bool(shared_session and shared_session.get("drawer") is not None)
@@ -5084,7 +5173,11 @@ async def run_browser_automation(
             base_save_result = None
             if requires_base_save_before_platform(args.platform):
                 original_colors = await read_base_specification_values(drawer, "颜色")
-                original_sizes = await read_base_specification_values(drawer, "尺码")
+                original_sizes = (
+                    await read_optional_base_specification_values(drawer, "尺码")
+                    if product.garment_kind == "accessory"
+                    else await read_base_specification_values(drawer, "尺码")
+                )
                 size_report = (
                     validate_base_size_spec_values(
                         original_sizes, product.derived_size_names
@@ -5161,7 +5254,9 @@ async def run_browser_automation(
                 price_input = await set_base_price(drawer, product.base_price)
                 logger.info("已将基本售价批量设置为 %s", product.base_price)
 
-                sku_color_rows = await read_base_sku_color_code_rows(drawer)
+                sku_color_rows = await read_base_sku_color_code_rows(
+                    drawer, require_size=product.garment_kind != "accessory"
+                )
                 known_colors = original_colors
                 checked_skus = validate_base_sku_color_codes(
                     sku_color_rows, product.style_code, known_colors
@@ -5170,7 +5265,12 @@ async def run_browser_automation(
                 if await read_base_specification_values(drawer, "颜色") != original_colors:
                     raise AutomationError("基础资料颜色规格在填写过程中发生变化，未保存")
                 expected_sizes = original_sizes
-                if await read_base_specification_values(drawer, "尺码") != expected_sizes:
+                current_sizes = (
+                    await read_optional_base_specification_values(drawer, "尺码")
+                    if product.garment_kind == "accessory"
+                    else await read_base_specification_values(drawer, "尺码")
+                )
+                if current_sizes != expected_sizes:
                     raise AutomationError("基础资料尺码规格与预期不一致，未保存")
 
                 # 保存前做一次关键值复核。
@@ -5220,11 +5320,17 @@ async def run_browser_automation(
                         json.dumps(base_save_result, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
-                persisted_sku_rows = await read_base_sku_color_code_rows(drawer)
+                persisted_sku_rows = await read_base_sku_color_code_rows(
+                    drawer, require_size=product.garment_kind != "accessory"
+                )
                 validate_base_sku_color_codes(
                     persisted_sku_rows, product.style_code, known_colors
                 )
-                persisted_sizes = await read_base_specification_values(drawer, "尺码")
+                persisted_sizes = (
+                    await read_optional_base_specification_values(drawer, "尺码")
+                    if product.garment_kind == "accessory"
+                    else await read_base_specification_values(drawer, "尺码")
+                )
                 if persisted_sizes != expected_sizes:
                     raise AutomationError(
                         "基础资料保存后尺码规格回读不一致："
@@ -5346,9 +5452,13 @@ async def run_browser_automation(
                 await taobao.open()
                 if args.taobao_test_scope == "category-size":
                     category = await taobao.apply_category(taobao_category_mode)
-                    size_chart = await taobao.fill_size_chart_lengths(
-                        taobao_size_lengths,
-                        garment_kind=taobao_garment_kind_value,
+                    size_chart = (
+                        await taobao.fill_size_chart_lengths(
+                            taobao_size_lengths,
+                            garment_kind=taobao_garment_kind_value,
+                        )
+                        if taobao_size_lengths
+                        else {"status": "not_applicable", "reason": "category_has_no_size_field"}
                     )
                     taobao_report = {
                         "category": category,
@@ -5611,6 +5721,7 @@ async def run_browser_automation(
                     drawer,
                     logger,
                     attribute_runtime=attribute_runtime,
+                    category_hints=product.category_hints,
                 )
                 await jd.open()
                 try:
@@ -5649,18 +5760,69 @@ async def run_browser_automation(
                     api_index=tmall_api_index,
                     attribute_runtime=attribute_runtime,
                     category_hints=product.category_hints,
+                    category_shop_name=DEFAULT_TMALL_PUBLISH_SHOPS[0],
                 )
                 tmall_report: Dict[str, Any] = {
                     "status": "in_progress",
                 }
                 tmall_stage = "open"
                 try:
-                    await tmall.open()
-                    tmall_stage = "category"
-                    category = await tmall.apply_recommended_category()
-                    tmall_report["category"] = category
-                    tmall_stage = "product_identity"
-                    identity = await tmall.fill_product_identity(product.tmall_fields)
+                    for identity_attempt in range(2):
+                        tmall_stage = "open"
+                        await tmall.open()
+                        tmall_stage = "category"
+                        category = await tmall.apply_recommended_category()
+                        tmall_report["category"] = category
+                        tmall_stage = "product_identity"
+                        try:
+                            identity = await tmall.fill_product_identity(product.tmall_fields)
+                        except TmallProductIdentityNotReady:
+                            # 此异常只会在任何产品字段写入之前出现。多平台
+                            # 未保存预览不能刷新，以免丢失前面平台的页面修改。
+                            if identity_attempt:
+                                logger.error("天猫重载一次后货号、品牌表单仍未加载，停止当前平台")
+                                raise
+                            if shared_session is not None and not args.save:
+                                logger.warning("多平台预览存在未保存资料，保留当前页面，不自动重载天猫")
+                                raise
+                            before_retry = dict(tmall_report)
+                            before_retry["status"] = "retrying_product_identity"
+                            before_retry["api_json_validation"] = await tmall_api_index.safe_summary(
+                                getattr(tmall, "panel", None)
+                            )
+                            (artifact_dir / "tmall-product-identity-retry.json").write_text(
+                                json.dumps(tmall_preview_summary(before_retry), ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                            await safe_screenshot(page, artifact_dir / "tmall-product-identity-retry.png")
+                            logger.warning(
+                                "天猫货号、品牌表单均未加载，类目激活等待超时；"
+                                "接口字段=%s。重新加载商品编辑页重试一次，已完成平台不重跑",
+                                before_retry["api_json_validation"].get("api_field_count", 0),
+                            )
+                            tmall_report["product_identity_recovery"] = {"attempts": 1, "status": "retrying"}
+                            tmall_api_index.uninstall()
+                            # 新索引在刷新前安装，避免沿用旧编辑器的字段和候选。
+                            tmall_api_index = TmallApiJsonIndex(page, logger)
+                            tmall_api_index.install()
+                            tmall_stage = "product_identity_reload"
+                            await page.reload(wait_until="domcontentloaded", timeout=args.timeout * 1000)
+                            drawer = await open_product_editor(
+                                page, product.style_code, logger, timeout_seconds=args.timeout,
+                            )
+                            if shared_session is not None:
+                                shared_session["drawer"] = drawer
+                            tmall = TmallFormListing(
+                                page, drawer, logger, api_index=tmall_api_index,
+                                attribute_runtime=attribute_runtime,
+                                category_hints=product.category_hints,
+                                category_shop_name=DEFAULT_TMALL_PUBLISH_SHOPS[0],
+                            )
+                        else:
+                            if identity_attempt:
+                                tmall_report["product_identity_recovery"]["status"] = "recovered"
+                                logger.info("天猫商品编辑页重载后产品信息表单已恢复，继续当前平台")
+                            break
                     tmall_report["product_identity"] = identity
                     tmall_stage = "full_form"
                     try:
@@ -5871,6 +6033,9 @@ async def run_browser_automation(
                         ),
                     )
                 except TmallFormListingError:
+                    recovery = tmall_report.get("product_identity_recovery")
+                    if recovery and recovery["status"] == "retrying":
+                        recovery["status"] = "failed"
                     tmall_report["api_json_validation"] = (
                         await tmall_api_index.safe_summary(
                             getattr(tmall, "panel", None)
@@ -5882,6 +6047,7 @@ async def run_browser_automation(
                         tmall_report,
                         reason_code=f"tmall_{tmall_stage}_review_required",
                     )
+                    tmall_api_index.uninstall()
                     raise
                 try:
                     tmall_stage = "size_source"
@@ -5911,7 +6077,11 @@ async def run_browser_automation(
                     tmall_stage = "size_chart"
                     tmall_stage_started = time.monotonic()
                     logger.info("天猫下方表单：开始处理尺码表")
-                    size_chart = await tmall.fill_size_chart(size_sources.rows)
+                    size_chart = (
+                        await tmall.fill_size_chart(size_sources.rows)
+                        if size_sources.rows
+                        else {"status": "not_applicable", "reason": "category_has_no_size_field"}
+                    )
                     logger.info(
                         "天猫下方表单：尺码表已完成，耗时 %.1f 秒",
                         time.monotonic() - tmall_stage_started,
@@ -5954,7 +6124,8 @@ async def run_browser_automation(
                     # 把纯展示格式清理放在全部写入操作之后，防止 155 再显示为
                     # 155.00。这里不改数据模型，也不触发保存。
                     tmall_stage = "size_display_cleanup"
-                    await tmall.clean_size_chart_integer_displays()
+                    if size_sources.rows:
+                        await tmall.clean_size_chart_integer_displays()
                     tmall_stage = "remaining_required"
                     tmall_report["leather_shoe_listing_date"] = (
                         await tmall.fill_leather_shoe_listing_date(category)
@@ -6347,9 +6518,10 @@ async def run_browser_automation(
                     encoding="utf-8",
                 )
                 logger.info(
-                    "保存后%s复核通过：小红书标题、货号、类目属性、%s 行 SKU 价格库存和全款预售 15 天均已持久化",
+                    "保存后%s复核通过：小红书标题、货号、类目属性、%s 行 SKU 价格库存和全款预售 %s 天均已持久化",
                     "重开" if persisted_reopened else "当前页",
                     persisted_report["row_count"],
+                    str(persisted_report["presale"]["付款后"]).removesuffix("天"),
                 )
 
             if youzan_requested:
@@ -6402,7 +6574,7 @@ async def run_browser_automation(
                         force_reload=True,
                     )
                 )
-                persisted_jd = JdFormListing(page, persisted_drawer, logger)
+                persisted_jd = JdFormListing(page, persisted_drawer, logger, category_hints=product.category_hints)
                 await persisted_jd.open()
                 persisted_report = await persisted_jd.verify_persisted_values(
                     product.jd_fields,
@@ -6469,13 +6641,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--excel-url", default=DEFAULT_EXCEL_URL, help="产品信息.xlsx 的 smb:// 或本地路径")
+    parser.add_argument("--dewu-root", type=Path, default=Path(os.environ.get("DEWU_PRODUCTS_ROOT", "/Volumes/美工文件/得物上款")), help="得物专用商品根目录")
+    parser.add_argument("--dewu-product", default="", help="得物商品目录名称（精确匹配）")
+    parser.add_argument("--dewu-resume-url", default="", help="继续已创建的得物草稿；避免重复创建")
+    parser.add_argument("--dewu-submit-review", action="store_true", help="得物填写校验后提交审核；默认仅保存草稿")
+    parser.add_argument("--bilibili-resume-url", default="", help="继续已有 B 站草稿编辑地址，避免重复创建")
+    parser.add_argument("--bilibili-publish", action="store_true", help="B 站校验通过后发布商品；默认仅保存草稿")
+    parser.add_argument("--bilibili-root", type=Path, default=Path(os.environ.get('BILIBILI_PRODUCTS_ROOT', '/Volumes/美工文件/B站上款')), help="B 站专用商品根目录")
+    parser.add_argument("--bilibili-product", default="", help="B 站商品目录名称（精确匹配）")
     parser.add_argument(
         "--replace-base-detail-images", action="store_true",
         help="素材更新后强制替换基础资料详情图，即使图片数量未变",
     )
     parser.add_argument(
-        "--materials-root", type=Path, default=default_materials_root(),
-        help="图片素材根目录；按北京时间选择当月文件夹，再按商品简称/货号及颜色匹配",
+        "--materials-root", type=Path, default=None,
+        help="手动指定另一图片素材根目录；默认使用 Excel 所在商品目录的图片",
     )
     parser.add_argument("--create-product", action="store_true", help="手工新增商品链接；与 --platform base 搭配，仅创建快麦商品，不铺货")
     parser.add_argument(
@@ -6486,7 +6666,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "运行范围：all=全部已实现平台，base=仅基础资料，"
             "douyin=抖音，taobao=淘宝，tmall=天猫，"
-            "pdd=拼多多，wxsph=微信小店，xhs=小红书，youzan=有赞，jd=京东；"
+            "pdd=拼多多，wxsph=微信小店，xhs=小红书，youzan=有赞，jd=京东，dewu=得物独立上款，bilibili=B站独立上款；"
             "可用逗号指定多个平台，按输入顺序执行，例如 douyin,jd,xhs"
         ),
     )
@@ -6511,14 +6691,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "最后保存；抖音、淘宝、天猫、拼多多、微信小店、小红书、有赞或京东会点击"
-            "“保存并铺货到平台”（默认）"
+            "“保存并铺货到平台”（默认）；得物默认保存草稿，提交审核须加 --dewu-submit-review"
         ),
     )
     parser.add_argument(
         "--no-save",
         dest="save",
         action="store_false",
-        help="只填写并校验所选平台资料，不保存平台资料、不铺货，也不改动基础资料",
+        help="只填写并校验所选平台资料，不保存平台资料、不铺货，也不改动基础资料；得物会先创建初始草稿，填写后不再次保存",
     )
     parser.add_argument(
         "--save-only",
@@ -6699,6 +6879,21 @@ def validate_execution_mode(args: argparse.Namespace) -> Tuple[PlatformSpec, ...
         if args.platform != "base" or args.inspect_only:
             raise SystemExit("--create-product 只允许 --platform base，不能与字段发现或平台铺货组合")
     selected = expand_platform_selection(args.platform)
+    if any(spec.cli_name == "bilibili" for spec in selected) and len(selected) != 1:
+        raise SystemExit("B 站使用独立商家后台，请单独选择 --platform bilibili")
+    if args.platform != "bilibili" and (getattr(args, "bilibili_resume_url", "") or getattr(args, "bilibili_publish", False) or getattr(args, 'bilibili_product', '')):
+        raise SystemExit("--bilibili-product、--bilibili-resume-url 和 --bilibili-publish 仅用于 --platform bilibili")
+    if getattr(args, "bilibili_publish", False) and (args.save_only or not args.save):
+        raise SystemExit("--bilibili-publish 不能与 --save-only 或 --no-save 同时使用")
+    if any(spec.cli_name == "dewu" for spec in selected) and len(selected) != 1:
+        raise SystemExit("得物使用独立网页和素材目录，请单独选择 --platform dewu")
+    if args.platform != "dewu" and (
+        getattr(args, "dewu_product", "") or getattr(args, "dewu_resume_url", "")
+        or getattr(args, "dewu_submit_review", False)
+    ):
+        raise SystemExit("--dewu-product、--dewu-resume-url 和 --dewu-submit-review 仅用于 --platform dewu")
+    if getattr(args, "dewu_submit_review", False) and (args.save_only or not args.save):
+        raise SystemExit("--dewu-submit-review 不能与 --save-only 或 --no-save 同时使用")
     if len(selected) > 1 and not args.save and any(spec.cli_name == "base" for spec in selected):
         raise SystemExit("多平台仅填写模式不能包含基础资料；请只选择所需平台，或使用 --save-only")
     scaffold = tuple(spec for spec in selected if spec.lifecycle == "scaffold")
@@ -6847,7 +7042,11 @@ def learning_execution_mode(args: argparse.Namespace) -> str:
         return "inspect_only"
     if not args.save:
         return "preview"
-    if getattr(args, "save_only", False) or args.platform == "base":
+    if args.platform == "dewu" and getattr(args, "dewu_submit_review", False):
+        return "submit_review"
+    if args.platform == "bilibili":
+        return "publish" if getattr(args, "bilibili_publish", False) else "save_only"
+    if getattr(args, "save_only", False) or args.platform in {"base", "dewu"}:
         return "save_only"
     return "save_and_publish"
 
@@ -7293,6 +7492,16 @@ async def run_all_implemented_platforms(
             raise AutomationError("审核检查点的平台位置无效")
     logger.info("本次平台执行顺序：%s", " → ".join(stages))
     stage_results: List[Dict[str, Any]] = []
+    if resume_checkpoint is not None:
+        try:
+            previous_results = json.loads((artifact_dir / "all-platform-result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous_results = []
+        if isinstance(previous_results, list):
+            stage_results = [row for row in previous_results if isinstance(row, dict)
+                             and row.get("platform") in stages[:resume_index]
+                             and row.get("status") in {"success", "skipped"}]
+    skipped_platforms = set(getattr(args, "all_platform_skip", ()) or ())
     shared_session: Dict[str, Any] = {}
 
     if learning_context is not None:
@@ -7317,6 +7526,20 @@ async def run_all_implemented_platforms(
         stage_index = resume_index
         while stage_index < len(stages):
             platform_name = stages[stage_index]
+            if platform_name in skipped_platforms:
+                stage_results.append({"platform": platform_name, "status": "skipped", "reason": "用户指定跳过"})
+                (artifact_dir / "all-platform-result.json").write_text(
+                    json.dumps(stage_results, ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+                if learning_context is not None:
+                    save_learning_checkpoint(
+                        learning_context, args, stages, stage_index + 1,
+                        "completed" if stage_index + 1 == len(stages) else "running",
+                    )
+                    await drain_learning_events(learning_context)
+                logger.info("按用户要求跳过平台：%s；未执行、未保存", platform_name)
+                stage_index += 1
+                continue
             stage_dir = artifact_dir / platform_name
             stage_dir.mkdir(parents=True, exist_ok=True)
             stage_args = argparse.Namespace(**vars(args))
@@ -7462,6 +7685,12 @@ from failure_diagnosis import diagnose_failure
 def main() -> int:
     args = build_parser().parse_args()
     selected_platforms = validate_execution_mode(args)
+    if args.platform == "dewu":
+        from dewu_listing import run_dewu_command
+        return run_dewu_command(args)
+    if args.platform == "bilibili":
+        from bilibili_listing import run_bilibili_command
+        return run_bilibili_command(args)
     if args.publish_shop is None:
         args.publish_shop = list(DEFAULT_DOUYIN_PUBLISH_SHOPS)
     if args.all_platform_one_shop_test:

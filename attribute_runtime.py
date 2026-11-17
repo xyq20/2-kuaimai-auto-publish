@@ -23,7 +23,6 @@ from learning_models import CandidateSnapshot, CandidateValue, canonical_sha256
 from learning_store import LearningStore
 from platform_registry import canonical_platform_name
 from platform_candidate_source import first_per_label
-from semantic_policy import is_style_judgment_field
 
 
 UNSUPPORTED_CONTROL_TYPES = frozenset({"shop", "logistics", "freight"})
@@ -312,7 +311,7 @@ class AttributeRuntime:
         force_review: bool = False,
         fallback_request: Optional[AttributeRequest] = None,
     ) -> Optional[ResolvedAttribute]:
-        """Judge a failed attribute write once, then defer a failed retry.
+        """Judge failed writes with the original intent before retry or review.
 
         Keep the original Excel intent and validated dictionary. A previously
         approved label is failure evidence, not a replacement Excel value.
@@ -333,6 +332,7 @@ class AttributeRuntime:
         if request is None:
             full_excel = original.evidence.get("full_excel_value")
             request = replace(original,
+                custom_allowed=False,
                 excel_value=full_excel if original.control_type in MULTI_SELECT_CONTROL_TYPES and isinstance(full_excel, str) and full_excel.strip() else original.excel_value,
                 evidence={
                 **dict(original.evidence), 'selection_only': True, 'bounded_write_retry': True,
@@ -351,51 +351,26 @@ class AttributeRuntime:
         except FieldMappingError:
             canonical_field = None
         self._queue_candidate_snapshot(snapshot, canonical_field, request.control_type)
-        if not force_review:
-            approved = self.confirmed_choice(request)
-            if approved is not None:
-                return self._remember_resolved(request, approved)
-            if previous.source in {'human_override', 'cross_product_human', 'review_learning'} and previous.value_id and all(
-                    ident in {c.value_id for c in request.candidates} for ident in split_multi_choice(previous.value_id)):
-                return self._remember_resolved(request, previous)
-            variants = _matched_excel_variants(request.excel_value, request.candidates,
-                control_type=request.control_type, field_label=request.field_label)
-            if variants and previous.source not in {'human_override', 'cross_product_human', 'review_learning'}:
-                chosen = variants[0]
-                logging.getLogger('kuaimai_erp').info(
-                    '属性“%s”候选已确定，重试页面写入：%s', field_label,
-                    ','.join(value.label for value in chosen))
-                return self._remember_resolved(request, ResolvedAttribute(
-                    ','.join(value.value_id for value in chosen),
-                    ','.join(value.label for value in chosen), 'explicit_text', snapshot.snapshot_version))
+        for trace in self.model_decisions:
+            if (canonical_platform_name(trace['platform_id']) == key[0]
+                    and trace['field_id'] == request.field_id
+                    and set(trace['selected_value_ids']) == set(split_multi_choice(previous.value_id))):
+                trace.update(readback_status='write_failed', write_error=str(error))
+        if self.model_decision_sink is not None:
+            self.model_decision_sink()
         logging.getLogger('kuaimai_erp').warning(
-            '属性“%s”填写失败：%s；%s', field_label, error,
-            '页面重试仍失败，转人工处理写入异常' if force_review else '进入大模型判断流程')
-        resolved = (previous if previous.value_id else None) if force_review else await self._semantic_choice(request, snapshot, allow_auto=True)
-        if resolved is not None and not force_review:
-            return resolved
-        traces = [row for row in self.model_decisions
-                  if canonical_platform_name(row['platform_id']) == key[0]
-                  and row['field_id'] == request.field_id
-                  and row['snapshot_version'] == snapshot.snapshot_version
-                  and row.get('input_evidence') == dict(request.evidence)]
-        trace = traces[-1] if traces else None
-        suggested = resolved.value_id if resolved is not None else (
-            ','.join(trace['selected_value_ids'])
-            if trace and trace['status'] != 'rejected' else None)
-        if force_review and trace is not None:
-            trace.update(status='review_required', readback_status='write_failed',
-                         write_error=str(error), treatment_reason='已确定候选，页面重试仍未写入，需要处理写入异常')
-            if self.model_decision_sink is not None:
-                self.model_decision_sink()
+            '属性“%s”填写失败：%s；请求大模型结合原始资料、学习库和报错兜底', field_label, error)
         review_request = replace(request, evidence={
-            **dict(request.evidence), 'force_review': True,
+            **dict(request.evidence), 'force_review': force_review,
+            'write_retry_exhausted': force_review,
             'first_validation_error': request.evidence['validation_error'],
             'validation_error': str(error),
+            'failed_selection': previous.label,
+            'failed_selection_value_ids': list(split_multi_choice(previous.value_id)),
+            'failed_selection_source': request.evidence['failed_selection_source'],
         })
-        await self._raise_review(review_request, snapshot, canonical_field,
-                                 'platform_write_failed', suggested, model_checked=True)
-        return None
+        return await self._raise_review(review_request, snapshot, canonical_field,
+                                        'platform_write_failed')
 
     async def resolve_unmatched_page_options(
         self,
@@ -450,7 +425,10 @@ class AttributeRuntime:
             field_label=field_label,
             candidates=tuple(candidates),
             excel_value=excel_value,
-            evidence={"excel": True, "live_dom": True, **({"force_review": True, "selection_only": True} if force_review else {})},
+            evidence={"excel": True, "live_dom": True, **({
+                "force_review": True, "selection_only": True,
+                "write_retry_exhausted": True,
+            } if force_review else {})},
             custom_allowed=False,
             schema_version=schema_version,
             control_type="multi_select" if multi else "select",
@@ -513,14 +491,37 @@ class AttributeRuntime:
         suggested_value_id: Optional[str] = None,
         *,
         model_checked: bool = False,
-    ) -> None:
+    ) -> Optional[ResolvedAttribute]:
         existing = self._deferred_reviews.get(snapshot.snapshot_version)
         if existing is not None:
             return
-        if suggested_value_id is None and not model_checked and request.control_type != "ocr_semantic":
-            suggestion = await self._semantic_choice(request, snapshot, allow_auto=False)
-            if suggestion is not None:
-                suggested_value_id = suggestion.value_id
+        # Every review path shares this gate, including conflicts, rejected
+        # rule decisions and exhausted page retries. A suggested ID is not a
+        # substitute for a model judgment. OCR has its own validated model call.
+        if request.control_type != "ocr_semantic":
+            request = replace(request, evidence={
+                **dict(request.evidence), 'pre_review_fallback': True,
+                'review_reason_code': reason_code,
+                'prior_suggested_value_id': suggested_value_id,
+            })
+            resolved = await self._semantic_choice(request, snapshot)
+            if resolved is not None:
+                return resolved
+            judgment_key = canonical_sha256(self._semantic_payload(request, snapshot))
+            traces = [row for row in self.model_decisions
+                      if row['key'] == judgment_key]
+            if traces and traces[-1]['status'] != 'rejected':
+                suggested_value_id = ','.join(traces[-1]['selected_value_ids'])
+            events = [row for row in self.model_events
+                      if row['key'] == judgment_key]
+            request = replace(request, evidence={**dict(request.evidence),
+                'model_fallback': {k: events[-1].get(k) for k in (
+                    'status', 'api_called', 'reason_code', 'reason', 'history_summary')}
+                if events else {'status': 'unavailable', 'api_called': False,
+                                'reason_code': 'judgment_service_unavailable'},
+            })
+        elif not model_checked:
+            raise ValueError('OCR review requires its OCR model fallback first')
         review_id = uuid.uuid4().hex
         evidence = {
             **dict(request.evidence),
@@ -569,30 +570,46 @@ class AttributeRuntime:
         await self._flush()
         raise review
 
+    def _semantic_payload(self, request: AttributeRequest, snapshot: CandidateSnapshot) -> dict:
+        evidence = dict(request.evidence)
+        candidates = request.candidates
+        if len(candidates) > 1000:
+            candidates = candidates[:1000]
+            evidence['candidate_dictionary_truncated'] = len(request.candidates)
+        return {
+            "product_version": self.product_version,
+            "platform_id": request.platform_id,
+            "category_leaf_id": request.category_leaf_id, "field_id": request.field_id,
+            "field_label": request.field_label, "control_type": request.control_type,
+            "snapshot_version": snapshot.snapshot_version, "excel_value": request.excel_value,
+            "options": [{"value_id": c.value_id, "label": c.label} for c in candidates],
+            "evidence": evidence,
+        }
+
     async def _semantic_choice(
         self, request: AttributeRequest, snapshot: CandidateSnapshot, *, allow_auto: bool = True,
     ) -> Optional[ResolvedAttribute]:
         """Interpret an unmatched intent; candidate membership is mandatory."""
         judge = getattr(self.client, "semantic_judge", None)
         from model_judgments import api_called, reason_text, record_event
+        pre_review = request.evidence.get('pre_review_fallback') is True
         skip_reason = (
             "judgment_service_unavailable" if not callable(judge) else
-            "no_candidates" if not request.candidates else
-            "too_many_candidates" if len(request.candidates) > 1000 else
-            "unsupported_control" if request.control_type not in {"select", "category", *MULTI_SELECT_CONTROL_TYPES} else
-            "operational_field" if re.search(r"价格|售价|库存|运费|物流|店铺", request.field_label) else ""
+            "no_candidates" if not request.candidates and not pre_review else
+            "too_many_candidates" if len(request.candidates) > 1000 and not pre_review else
+            "unsupported_control" if not pre_review and request.control_type not in {"select", "category", *MULTI_SELECT_CONTROL_TYPES} else
+            "operational_field" if not pre_review and re.search(r"价格|售价|库存|运费|物流|店铺", request.field_label) else ""
         )
         if skip_reason:
             self._record_model_skip(request, skip_reason)
             return None
-        payload = {
-            "product_version": self.product_version, "platform_id": request.platform_id,
-            "category_leaf_id": request.category_leaf_id, "field_id": request.field_id,
-            "field_label": request.field_label, "control_type": request.control_type,
-            "snapshot_version": snapshot.snapshot_version, "excel_value": request.excel_value,
-            "options": [{"value_id": c.value_id, "label": c.label} for c in request.candidates],
-            "evidence": dict(request.evidence),
-        }
+        # An incomplete dictionary is advisory only; keep endpoint size bounded.
+        if (len(request.candidates) > 1000
+                or request.evidence.get('write_retry_exhausted')
+                or request.control_type in UNSUPPORTED_CONTROL_TYPES
+                or re.search(r"价格|售价|库存|运费|物流|店铺", request.field_label)):
+            allow_auto = False
+        payload = self._semantic_payload(request, snapshot)
         key = canonical_sha256(payload)
         event = {"key": key, "platform_id": canonical_platform_name(request.platform_id),
                  "field_id": request.field_id, "field_label": request.field_label,
@@ -691,7 +708,7 @@ class AttributeRuntime:
         )
         if ready:
             return self._remember_resolved(request, result)
-        return result if not allow_auto else None
+        return None
 
     def confirmed_choice(self, request: AttributeRequest) -> Optional[ResolvedAttribute]:
         """Read a product/field/snapshot scoped approval without attempting a write."""
@@ -995,6 +1012,8 @@ class AttributeRuntime:
     async def resolve(
         self, request: AttributeRequest
     ) -> Optional[ResolvedAttribute]:
+        if request.evidence.get("selection_only") and request.custom_allowed:
+            request = replace(request, custom_allowed=False)
         request = replace(request, candidates=first_per_label(request.candidates))
         if request.control_type.casefold() in UNSUPPORTED_CONTROL_TYPES:
             raise ValueError("operational selector cannot use attribute learning")
@@ -1084,8 +1103,7 @@ class AttributeRuntime:
             except FieldMappingError:
                 canonical_field = None
             self._queue_candidate_snapshot(snapshot, canonical_field, request.control_type)
-            await self._raise_review(request, snapshot, canonical_field, "platform_write_failed")
-            return None
+            return await self._raise_review(request, snapshot, canonical_field, "platform_write_failed")
         confirmed_value = self.store.load_review_resolution(
             product_version=self.product_version,
             platform_id=canonical_platform_name(request.platform_id),
@@ -1165,9 +1183,8 @@ class AttributeRuntime:
             snapshot, canonical_field, request.control_type
         )
         if request.evidence.get("force_review"):
-            await self._raise_review(request, snapshot, canonical_field,
-                                     "platform_write_failed")
-            return None
+            return await self._raise_review(request, snapshot, canonical_field,
+                                            "platform_write_failed")
         if historical_candidate is not None or historical_group_valid:
             if historical_candidate is None:
                 # 多选字段的保存回读是一组值（如 适用季节=秋季,冬季）：
@@ -1333,17 +1350,10 @@ class AttributeRuntime:
                 learned.get("calibrated_acceptance_rate", 0),
             )
             if learning_reason in {"review_learning_conflict", "review_learning_invalid_response"}:
-                if learning_reason == 'review_learning_conflict' and is_style_judgment_field(request.field_label):
-                    semantic = await self._semantic_choice(request, snapshot)
-                    if semantic is not None:
-                        return semantic
-                await self._raise_review(request, snapshot, canonical_field, learning_reason)
-                return None
+                request = replace(request, evidence={**dict(request.evidence),
+                    'review_learning_result': dict(learned)})
+                return await self._raise_review(request, snapshot, canonical_field, learning_reason)
         if canonical_field is None:
-            if request.control_type != "ocr_semantic":
-                semantic = await self._semantic_choice(request, snapshot)
-                if semantic is not None:
-                    return semantic
             # A platform pass owns an ordered local outbox.  While collecting a
             # batch, enqueue every unmapped field first and drain once at the
             # platform boundary; otherwise a size table with many empty cells
@@ -1351,10 +1361,9 @@ class AttributeRuntime:
             # on to the remaining fields.
             if not self._collecting_platform_id:
                 await self._flush()
-            await self._raise_review(
+            return await self._raise_review(
                 request, snapshot, None, learning_reason or "field_mapping_required"
             )
-            return None
         await self._flush()
         response = await asyncio.to_thread(
             self.client.decide,
@@ -1368,12 +1377,8 @@ class AttributeRuntime:
             },
         )
         if response.get("status") != "auto_fill_ready":
-            if response.get("reason_code") not in {"evidence_conflict", "review_learning_conflict"}:
-                semantic = await self._semantic_choice(request, snapshot)
-                if semantic is not None:
-                    return semantic
-            await self._raise_review(
-                request,
+            return await self._raise_review(
+                replace(request, evidence={**dict(request.evidence), 'prior_decision': dict(response)}),
                 snapshot,
                 canonical_field,
                 str(response.get("reason_code") or "insufficient_evidence"),
@@ -1381,7 +1386,6 @@ class AttributeRuntime:
                 if isinstance(response.get("value_id"), str)
                 else None,
             )
-            return None
         proposed = response.get("value_id")
         decision = validate_decision(
             DecisionInput(
@@ -1403,14 +1407,13 @@ class AttributeRuntime:
             snapshot,
         )
         if decision.status is not DecisionStatus.AUTO_FILL_READY:
-            await self._raise_review(
-                request,
+            return await self._raise_review(
+                replace(request, evidence={**dict(request.evidence), 'prior_decision': dict(response)}),
                 snapshot,
                 canonical_field,
                 decision.reason_code,
                 str(proposed) if isinstance(proposed, str) else None,
             )
-            return None
         return self._remember_resolved(
             request,
             ResolvedAttribute(

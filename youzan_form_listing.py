@@ -23,12 +23,15 @@ from category_profile import (
     category_input_levels,
     category_path_levels,
     category_search_terms,
+    choose_category_candidate,
+    is_belt_category,
 )
 from category_search import CategorySearchCapture
 from learning_models import CandidateValue, canonical_sha256
 from money_values import MoneyValueError, normalize_money_value
 from platform_candidate_source import (
     select_supports_multiple,
+    select_supports_custom_value,
     CandidateSourceError,
     DomCandidate,
     reconcile_candidates,
@@ -96,6 +99,7 @@ YOUZAN_INHERITED_FIELDS = frozenset(
 )
 YOUZAN_BATCH_ORDER = ("价格", "库存", "重量(kg)")
 YOUZAN_FREIGHT_TEMPLATES = {
+    "belt": "T恤、裤子、饰品邮费模版",
     "pants": "T恤、裤子、饰品邮费模版",
     "coat": "鞋子、皮衣、外套邮费模版",
     "footwear": "鞋子、皮衣、外套邮费模版",
@@ -121,6 +125,11 @@ def _required_excel_value(
         for key, value in fields.items()
         if wanted.intersection(excel_aliases(key)) and str(value).strip()
     ]
+    if money and any(
+        "商品分类" in excel_aliases(key) and is_belt_category(value)
+        for key, value in fields.items()
+    ):
+        matches = [(key, value) for key, value in matches if value != "元"]
     if not matches:
         raise YouzanFormListingError(
             "Excel 中缺少有赞{0}字段（可识别：{1}）".format(
@@ -597,11 +606,24 @@ class YouzanFormListing(TaobaoListing):
 
     async def apply_category(self, category_path: Sequence[str]) -> Mapping[str, Any]:
         path = tuple(str(value).strip() for value in category_path if str(value).strip())
-        self.category_hints = (" > ".join(path),)
+        belt = is_belt_category(" > ".join(path))
+        if not belt or not self.category_hints:
+            self.category_hints = (" > ".join(path),)
         if not path:
             raise YouzanFormListingError("Excel 中缺少有赞商品分类")
         if self.panel is None:
             raise YouzanFormListingError("请先调用 open() 打开有赞资料")
+        if belt:
+            try:
+                current = await self._category_text()
+            except YouzanFormListingError:
+                current = ""
+            selected, strategy = choose_category_candidate((current,), self.category_hints)
+            if selected:
+                if self.logger is not None:
+                    self.logger.info("有赞皮带当前类目已匹配，保留：%s（%s）", current, strategy)
+                return {"path": path, "search_term": "", "selected": current,
+                        "api_candidate_count": 0, "api_urls": (), "source": "validated_current"}
         buttons = self.panel.get_by_role("button", name="修改类目", exact=True)
         if await buttons.count() != 1:
             raise YouzanFormListingError("有赞“修改类目”按钮不是唯一项：{0}".format(await buttons.count()))
@@ -610,7 +632,7 @@ class YouzanFormListing(TaobaoListing):
         levels = category_input_levels(" > ".join(path))
         # Parsed tuples contain path levels; only the final level is a
         # keyword target. Slash peers retain their authored order.
-        leaf_hints = levels[-1] if levels else path
+        leaf_hints = category_search_terms(self.category_hints) if belt else (levels[-1] if levels else path)
         search_terms = category_search_terms(leaf_hints)
         search = await self._category_search_input(dialog)
         api_urls: List[str] = []
@@ -913,8 +935,11 @@ class YouzanFormListing(TaobaoListing):
                     exc,
                 )
             return None
+        custom_allowed = await select_supports_custom_value(
+            select, schema_allowed=field.get("custom_allowed")
+        )
         api_options = tuple(field.get("options") or ())
-        if not api_options and field.get("custom_allowed") is True:
+        if not api_options and custom_allowed:
             # Youzan valueType=1 is an API-declared free-form selector.  It has
             # no constrained platform candidate set.  Do not wait for a DOM
             # option list that the platform has already told us is empty.
@@ -924,7 +949,7 @@ class YouzanFormListing(TaobaoListing):
             try:
                 _dropdown, dom_options = await self._visible_dom_options(select)
             except TaobaoListingError as exc:
-                if field.get("custom_allowed") is True and "未找到可见选项" in str(exc):
+                if custom_allowed and "未找到可见选项" in str(exc):
                     return tuple(group[0] for group in groups if group)
                 raise
         finally:
@@ -984,7 +1009,7 @@ class YouzanFormListing(TaobaoListing):
                     field_id=field_id, field_label=page_label,
                     candidates=tuple(CandidateValue(v.value_id, v.label) for v in candidates),
                     excel_value="/".join(group), evidence={},
-                    custom_allowed=bool(field.get("custom_allowed")), schema_version=schema_version,
+                    custom_allowed=custom_allowed, schema_version=schema_version,
                     control_type="multi_select" if multi else "select",
                 ),
             )
@@ -997,7 +1022,7 @@ class YouzanFormListing(TaobaoListing):
                     candidates=request_candidates,
                     excel_value=excel_value,
                     evidence={"excel": bool(excel_value.strip())},
-                    custom_allowed=bool(field.get("custom_allowed")),
+                    custom_allowed=custom_allowed,
                     schema_version=schema_version,
                     control_type="multi_select" if multi else "select",
                 )

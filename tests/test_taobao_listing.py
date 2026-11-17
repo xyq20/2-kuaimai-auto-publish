@@ -4,11 +4,11 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from attribute_runtime import AttributeRequest, AttributeRuntime, ResolvedAttribute
 from learning_store import LearningStore
-from kuaimai_erp import resolve_taobao_category_mode
+from kuaimai_erp import AutomationError, require_resolved_page_attributes, resolve_taobao_category_mode
 from learning_models import CandidateValue
 from taobao_data import parse_taobao_fields
 from taobao_listing import (
@@ -18,6 +18,7 @@ from taobao_listing import (
     normalize_label,
     parse_taobao_fabrics,
     parse_taobao_materials,
+    parse_sole_thickness,
     preferred_exact_candidate_label,
     selection_value_groups,
     selection_value_groups_for_control,
@@ -407,6 +408,16 @@ function openTaobao() {
 
 
 class TaobaoPureFunctionTests(unittest.TestCase):
+    def test_sole_thickness_range_uses_explicit_ordered_centimeter_values(self):
+        for raw in ("最小厚度：4cm-最大厚度：5cm", "4-5cm", "４．０～５．０厘米", "4至5cm/6-7cm"):
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_sole_thickness(raw), ("4", "5"))
+        self.assertEqual(parse_sole_thickness("5cm"), ("5",))
+        for raw in ("", "5-4cm", "4mm-5cm", "约4-5cm", "-4-5cm"):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(RuntimeError, "鞋底厚度"):
+                    parse_sole_thickness(raw)
+
     def test_other_variant_matches_only_complete_option(self):
         self.assertEqual(preferred_exact_candidate_label(('其它', '羊毛'), ('其他',)), '其它')
         self.assertIsNone(preferred_exact_candidate_label(('其它材质',), ('其他',)))
@@ -574,6 +585,21 @@ class TaobaoPureFunctionTests(unittest.TestCase):
         }
 
         self.assertTrue(TaobaoListing._material_validation_is_confirmed(valid))
+        decimal_rows = [
+            {"material_prop_name": "棉", "material_prop_content": "95.40"},
+            {"material_prop_name": "氨纶", "material_prop_content": "4.60"},
+        ]
+        decimal_validation = {
+            "component": {"found": True, "key": "p-material", "rows": decimal_rows},
+            "form": {"found": True, "message": "", "fields": [{
+                "prop": "p-material", "validateState": "", "validateMessage": "",
+                "fieldValue": decimal_rows,
+            }]},
+        }
+        self.assertTrue(TaobaoListing._material_validation_is_confirmed(decimal_validation))
+        self.assertFalse(TaobaoListing._material_rows_match(
+            (("棉", 95.4), ("氨纶", 4.6)), (("棉", 95.9), ("氨纶", 4.1)),
+        ))
         for stale_message in (
             "材质成分子项请勿留空",
             "材质成分必填一份数据",
@@ -616,6 +642,20 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             select, '适用场景', '日常，休闲/运动', multi=False), (('运动',),))
         self.assertEqual(await self.listing._excel_groups_for_select(
             select, '适用场景', '日常，休闲/不存在', multi=False), (('日常',),))
+
+    async def test_scalar_vue_value_overrides_decorative_empty_tags_for_single_select(self):
+        from platform_candidate_source import select_supports_multiple
+
+        await self.page.set_content('''<div id="field" class="el-select">
+          <div class="el-select__tags"></div><input class="el-input__inner" value="铆钉">
+        </div>''')
+        select = self.page.locator('#field')
+        await select.evaluate("element => { element.__vue__ = {value: '115776'}; }")
+
+        self.assertFalse(await select_supports_multiple(select))
+
+        await select.evaluate("element => { element.__vue__.value = ['115776']; }")
+        self.assertTrue(await select_supports_multiple(select))
 
     async def test_open_multiselect_keeps_existing_dropdown_open(self):
         await self.page.set_content("""<div class="el-select" id="audience">
@@ -681,20 +721,21 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertEqual(actual, ('直筒',))
             self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
-            self.assertEqual(len(calls), 0)
+            self.assertEqual(len(calls), 1)
             self.assertFalse(runtime.deferred_reviews)
-            self.assertFalse(runtime.model_decisions)
+            self.assertEqual(runtime.model_decisions[-1]['status'], 'adopted')
+            self.assertIn('validation_error', calls[0]['evidence'])
         finally:
             await runtime.drain()
 
-    async def test_exact_candidate_does_not_need_uncertain_model(self):
+    async def test_failed_exact_candidate_still_calls_model_and_verifies_excel(self):
         select, runtime, calls = await self._failed_write_fixture(confidence=.7)
         try:
             actual = await self.listing._select_values(
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertEqual(actual, ('直筒',))
             self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
-            self.assertEqual(len(calls), 0)
+            self.assertEqual(len(calls), 1)
             self.assertFalse(runtime.deferred_reviews)
         finally:
             await runtime.drain()
@@ -706,22 +747,23 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertIsNone(actual)
             self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
-            self.assertEqual(len(calls), 0)
+            self.assertEqual(len(calls), 2)
             self.assertEqual(len(runtime.deferred_reviews), 1)
-            self.assertFalse(runtime.model_decisions)
+            self.assertEqual(runtime.model_decisions[-1]['status'], 'review_required')
+            self.assertTrue(calls[-1]['evidence']['write_retry_exhausted'])
         finally:
             await runtime.drain()
 
     async def test_failed_write_without_api_snapshot_retries_exact_dom_candidate(self):
         select, runtime, calls = await self._failed_write_fixture(confidence=.7)
         # Some selectors have no API field entry; only live DOM candidates are
-        # available. The failure must still reach judgment and human review.
+        # available. The failure must still reach judgment before retrying.
         runtime._resolved_attributes.clear()
         try:
             actual = await self.listing._select_values(
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertEqual(actual, ('直筒',))
-            self.assertEqual(len(calls), 0)
+            self.assertEqual(len(calls), 1)
             self.assertFalse(runtime.deferred_reviews)
         finally:
             await runtime.drain()
@@ -733,7 +775,7 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             actual = await self.listing._select_values(
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertEqual(actual, ('直筒',))
-            self.assertEqual(len(calls), 0)
+            self.assertEqual(len(calls), 1)
             self.assertEqual(await self.page.evaluate('window.writeCount'), 2)
             self.assertFalse(runtime.deferred_reviews)
         finally:
@@ -754,7 +796,7 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             actual = await self.listing._select_values(
                 select, (('直筒',),), label='裤型', multi=False)
             self.assertEqual(actual, ('直筒',))
-            self.assertEqual(len(calls), 0)
+            self.assertEqual(len(calls), 1)
         finally:
             await runtime.drain()
 
@@ -1046,6 +1088,20 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             await self.listing._validate_category_leaf(dialog, '流行男鞋 > 靴子', timeout=.1)
         self.assertEqual(await self.page.evaluate('window.clicks'), 0)
 
+    async def test_selected_leaf_waits_for_delayed_menus_without_resetting_parent(self):
+        dialog = await self._leaf_guard_fixture(['时装靴'])
+        await self.page.evaluate('''() => {
+          document.querySelector('#selected').textContent='已选：流行男鞋 > 靴子 > 时装靴';
+          window.clicks=0;
+          document.querySelectorAll('.el-cascader-node').forEach(node=>node.onclick=()=>{
+            window.clicks++;document.querySelector('#selected').textContent='已选：流行男鞋 > 靴子';
+          });
+          document.querySelectorAll('.el-cascader-menu').forEach(menu=>menu.style.display='none');
+          setTimeout(()=>document.querySelectorAll('.el-cascader-menu').forEach(menu=>menu.style.display='block'), 500);
+        }''')
+        self.assertEqual(await self.listing._complete_category_leaf(dialog, '流行男鞋 > 靴子 > 时装靴'), '流行男鞋 > 靴子 > 时装靴')
+        self.assertEqual(await self.page.evaluate('window.clicks'), 0)
+
     async def test_category_leaf_guard_continues_exact_parent_on_shared_platforms(self):
         for platform in ('tb', 'tm', 'wxsph', 'jd', 'yz', 'xhs'):
             dialog = await self._leaf_guard_fixture(['时装靴', '工装靴'])
@@ -1099,6 +1155,192 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual, ('5',))
         self.assertEqual(await self.page.locator('#heel-number').input_value(), '5')
         self.listing._select_values.assert_awaited_once()
+
+    async def _sole_thickness_fixture(self):
+        await self.page.evaluate('''() => {
+          document.querySelector('#attributes').innerHTML = `
+            <div class="complex-item" id="sole-thickness"><div class="el-form-item is-required">
+              <label class="el-form-item__label">鞋底厚度</label>
+              <div class="el-form-item__content">
+                最小厚度<input id="sole-min"> - 最大厚度<input id="sole-max">
+                <div class="el-select"><input class="el-input__inner" readonly value="mm" onclick="openSelect(this)">
+                  <div class="el-select-dropdown" style="display:none"><ul>
+                    <li class="el-select-dropdown__item" onclick="choose(this)">mm</li>
+                    <li class="el-select-dropdown__item" onclick="choose(this)">cm</li>
+                  </ul></div>
+                </div>
+              </div>
+            </div></div>`;
+          attachSelectComponents(document.querySelector('#attributes'));
+        }''')
+        return self.page.locator('#sole-thickness')
+
+    async def _measurement_fixture(self, label='宽度'):
+        await self.page.evaluate('''label => {
+          document.querySelector('#attributes').innerHTML = `
+            <div class="complex-item" id="measurement"><div class="el-form-item">
+              <label class="el-form-item__label">${label}</label>
+              <div class="el-form-item__content"><div class="taoSirProperty-content">
+                <div class="el-input el-input-digit"><input id="measurement-number"></div>
+                <div class="el-select"><input class="el-input__inner" readonly placeholder="单位" value="cm" onclick="openSelect(this)">
+                  <div class="el-select-dropdown" style="display:none"><ul>
+                    <li class="el-select-dropdown__item" onclick="choose(this)">cm</li>
+                  </ul></div>
+                </div>
+              </div></div>
+            </div></div>`;
+          attachSelectComponents(document.querySelector('#attributes'));
+        }''', label)
+        return self.page.locator('#measurement')
+
+    async def test_width_number_and_unit_are_filled_without_product_option_review(self):
+        from tmall_form_listing import TmallFormListing
+        for listing in (self.listing, TmallFormListing(self.page, self.page.locator('#drawer'), LOGGER)):
+            with self.subTest(platform=type(listing).__name__):
+                item = await self._measurement_fixture()
+                listing._resolve_learning_select_groups = AsyncMock(side_effect=AssertionError('unit is not a width option'))
+                actual = await listing.fill_attribute('宽度', '3.8CM/3.8', item=item)
+                self.assertEqual(actual, ('3.8', 'cm'))
+                self.assertEqual(await self.page.locator('#measurement-number').input_value(), '3.8')
+                self.assertEqual(await item.locator('.el-select input').input_value(), 'cm')
+
+    async def test_measurement_uses_page_unit_for_bare_number_and_supports_other_labels(self):
+        item = await self._measurement_fixture('长度')
+        actual = await self.listing.fill_attribute('长度', '110', item=item)
+        self.assertEqual(actual, ('110', 'cm'))
+        self.assertEqual(await self.page.locator('#measurement-number').input_value(), '110')
+
+    async def test_measurement_rejects_range_for_scalar_and_detects_lost_number(self):
+        item = await self._measurement_fixture()
+        with self.assertRaisesRegex(RuntimeError, '宽度'):
+            await self.listing.fill_attribute('宽度', '3.8-4cm', item=item)
+        self.assertEqual(await self.page.locator('#measurement-number').input_value(), '')
+        await self.page.locator('#measurement-number').evaluate("element => element.onblur = () => element.value = ''")
+        with self.assertRaisesRegex(RuntimeError, '宽度.*回读失败'):
+            await self.listing.fill_attribute('宽度', '3.8CM/3.8', item=item)
+
+    async def test_width_dropdown_remains_an_option_control(self):
+        await self.page.evaluate('''() => {
+          document.querySelector('#attributes').innerHTML = singleSelect('宽度', ['3.8CM', '4CM']);
+          attachSelectComponents(document.querySelector('#attributes'));
+        }''')
+        self.assertEqual(await self.listing.fill_attribute('宽度', '3.8CM/3.8'), ('3.8CM',))
+
+    async def test_sole_thickness_writes_both_bounds_and_unit_without_model_lookup(self):
+        from tmall_form_listing import TmallFormListing
+        for listing in (self.listing, TmallFormListing(self.page, self.page.locator('#drawer'), LOGGER)):
+            with self.subTest(platform=type(listing).__name__):
+                item = await self._sole_thickness_fixture()
+                listing._resolve_learning_select_groups = AsyncMock(side_effect=AssertionError('unit is not a product option'))
+                actual = await listing.fill_attribute('鞋底厚度', '最小厚度：4cm-最大厚度：5cm', item=item)
+                self.assertEqual(actual, ('4', '5', 'cm'))
+                self.assertEqual(await self.page.locator('#sole-min').input_value(), '4')
+                self.assertEqual(await self.page.locator('#sole-max').input_value(), '5')
+                self.assertEqual(await item.locator('.el-select input').input_value(), 'cm')
+                listing._resolve_learning_select_groups.assert_not_awaited()
+
+    async def test_sole_thickness_rejects_lost_bound_on_readback(self):
+        item = await self._sole_thickness_fixture()
+        await self.page.locator('#sole-max').evaluate("element => element.onblur = () => element.value = ''")
+        with self.assertRaisesRegex(RuntimeError, '鞋底厚度.*回读失败'):
+            await self.listing.fill_attribute('鞋底厚度', '4-5cm', item=item)
+
+    async def test_sole_thickness_rejects_invalid_range_before_writing(self):
+        item = await self._sole_thickness_fixture()
+        with self.assertRaisesRegex(RuntimeError, '鞋底厚度'):
+            await self.listing.fill_attribute('鞋底厚度', '5-4cm', item=item)
+        self.assertEqual(await self.page.locator('#sole-min').input_value(), '')
+        self.assertEqual(await item.locator('.el-select input').input_value(), 'mm')
+
+    async def test_sole_thickness_scalar_does_not_guess_from_excel_range(self):
+        item = await self._sole_thickness_fixture()
+        await self.page.locator('#sole-max').evaluate('element => element.remove()')
+        with self.assertRaisesRegex(RuntimeError, '鞋底厚度页面需要单个厚度值'):
+            await self.listing.fill_attribute('鞋底厚度', '最小厚度：4cm-最大厚度：5cm', item=item)
+        self.assertEqual(await self.page.locator('#sole-min').input_value(), '')
+        actual = await self.listing.fill_attribute('鞋底厚度', '5cm', item=item)
+        self.assertEqual(actual, ('5', 'cm'))
+
+    async def test_sku_batch_material_reads_live_multiselect_tags(self):
+        await self.page.evaluate('''() => {
+          const holder=document.createElement('div'); holder.innerHTML=multiSelect('材质', ['布']);
+          const select=holder.querySelector('.el-select');
+          const row=document.createElement('div'); row.id='batch-material';
+          row.innerHTML='<div class="sku-batch-item"><div class="sku-batch-item_label">鞋面材质</div></div>';
+          row.firstElementChild.appendChild(select);
+          document.body.appendChild(row); attachSelectComponents(row);
+        }''')
+        row=self.page.locator('#batch-material')
+        self.assertEqual(await self.listing._fill_batch_select(row, '鞋面材质', ('帆布', '布')), '布')
+        self.assertEqual(await self.listing._read_select_values(row.locator('.el-select'), multi=True), ('布',))
+
+    async def test_sku_batch_uses_live_type_for_comma_and_slash_plans(self):
+        for multi, expected in ((True, '布|皮'), (False, '备用')):
+            with self.subTest(multi=multi):
+                await self.page.evaluate('''multi => {
+                  document.querySelector('#batch-material')?.remove();
+                  const holder=document.createElement('div');
+                  holder.innerHTML=(multi ? multiSelect : singleSelect)('材质', ['布', '皮', '备用']);
+                  const row=document.createElement('div'); row.id='batch-material';
+                  row.innerHTML='<div class="sku-batch-item"><div class="sku-batch-item_label">鞋面材质</div></div>';
+                  row.firstElementChild.appendChild(holder.querySelector('.el-select'));
+                  document.body.appendChild(row); attachSelectComponents(row);
+                }''', multi)
+                actual = await self.listing._fill_batch_select(
+                    self.page.locator('#batch-material'), '鞋面材质', ('布，皮', '备用'),
+                    excel_value='布，皮/备用',
+                )
+                self.assertEqual(actual, expected)
+
+    async def test_sku_review_carries_live_type_category_and_original_excel(self):
+        requests = []
+        self.listing.attribute_runtime = SimpleNamespace(resolve=AsyncMock(side_effect=lambda request: requests.append(request)))
+        self.listing.api_index = SimpleNamespace()
+        schemas = []
+        category_ids = []
+        for category, multi in (('流行男鞋 > 休闲鞋', True), ('流行男鞋 > 休闲鞋', False), ('流行男鞋 > 靴子', True)):
+            await self.page.evaluate('''multi => {
+              document.querySelector('#review-material')?.remove();
+              const holder=document.createElement('div'); holder.id='review-material';
+              holder.innerHTML=(multi ? multiSelect : singleSelect)('鞋面材质', ['布', '皮']);
+              document.body.appendChild(holder); attachSelectComponents(holder);
+            }''', multi)
+            self.listing._category_text = AsyncMock(return_value=category)
+            await self.listing._suspend_batch_select_for_review(
+                self.page.locator('#review-material .el-select'), '鞋面材质', ('布，皮', '备用'),
+                excel_value='布，皮/备用',
+            )
+            request = requests[-1]
+            self.assertEqual(request.control_type, 'multi_select' if multi else 'select')
+            self.assertEqual(request.excel_value, '布，皮/备用')
+            self.assertEqual(tuple(value.label for value in request.candidates), ('布', '皮'))
+            schemas.append(request.schema_version)
+            category_ids.append(request.category_leaf_id)
+        self.assertEqual(len(set(schemas)), 3)
+        self.assertEqual(category_ids[0], category_ids[1])
+        self.assertNotEqual(category_ids[0], category_ids[2])
+
+    async def test_sku_snapshot_reads_and_validates_all_multiselect_tags(self):
+        await self.page.set_content('''<div id="sku"><div class="el-table__header-wrapper"><table>
+          <thead><tr><th>价格</th><th>数量</th><th>鞋面材质</th><th>款式</th></tr></thead></table></div>
+          <div class="el-table__body-wrapper"><table><tbody><tr>
+          <td><input value="399"></td><td><input value="100"></td>
+          <td><div class="el-select"><div class="el-select__tags">
+            <span class="el-tag">皮</span><span class="el-tag">布</span><input></div><input></div></td>
+          <td><div class="el-select"><input value="高帮"></div></td>
+          </tr></tbody></table></div></div>''')
+        expected = {'价格': '399', '数量': '100', '鞋面材质': '布|皮', '款式': '高帮'}
+        snapshot = await self.listing._sku_table_snapshot(self.page.locator('#sku'))
+        self.assertEqual(snapshot['multi_columns'], [2])
+        self.assertEqual(snapshot['select_columns'], [2, 3])
+        self.assertEqual(snapshot['rows'][0][2:], ['皮|布', '高帮'])
+        self.listing._validate_sku_snapshot(snapshot, expected)
+        for selector in ('.el-tag:first-child', '.el-tag'):
+            await self.page.locator(selector).evaluate_all('tags => tags.forEach(tag => tag.remove())')
+            snapshot = await self.listing._sku_table_snapshot(self.page.locator('#sku'))
+            with self.assertRaisesRegex(RuntimeError, '鞋面材质'):
+                self.listing._validate_sku_snapshot(snapshot, expected)
+        self.assertEqual(snapshot['rows'][0][2], '')
 
     async def test_casual_pants_mode_searches_exact_flat_result(self):
         await self.page.set_content(
@@ -1199,6 +1441,88 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await listing.apply_excel_category(), "男装 > 男士休闲直筒裤")
         self.assertEqual(await self.page.evaluate('window.searches'), ['男士休闲直筒裤'])
 
+    async def test_fallback_prediction_and_current_category_do_not_skip_earlier_excel_choice(self):
+        listing = await self._excel_category_search_listing('卫衣/打底衫')
+        await self.page.evaluate('''() => {
+          const display = document.querySelector('.platform-category-input');
+          display.firstChild.nodeValue = '男装 > 打底衫 ';
+          display.insertAdjacentHTML('beforeend', '<div class="prediction-item"><span>推荐</span><span class="path">男装 > 打底衫</span><button onclick="window.wrongPrediction=true">点击使用</button></div>');
+        }''')
+        self.assertEqual(await listing.apply_excel_category(), '男装 > 卫衣')
+        self.assertEqual(await self.page.evaluate('window.searches'), ['卫衣'])
+        self.assertFalse(await self.page.evaluate('Boolean(window.wrongPrediction)'))
+
+    async def test_current_category_accepts_second_belt_taxonomy_without_search(self):
+        listing = await self._excel_category_search_listing('服装 > 服装配饰 > 腰带/皮带/腰链')
+        second = '服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带'
+        listing.category_hints = (*listing.category_hints, second)
+        await self.page.locator('.platform-category-input').evaluate(
+            '(element, text) => element.firstChild.nodeValue = text', second,
+        )
+        self.assertEqual(await listing.apply_excel_category(), second)
+        self.assertEqual(await self.page.evaluate('window.searches'), [])
+
+    async def test_category_search_does_not_accept_later_alternative_from_earlier_query(self):
+        listing = await self._excel_category_search_listing('卫衣/打底衫')
+        await self.page.evaluate('''() => {
+          window.showCategory = value => {
+            window.searches.push(value);
+            const row=document.createElement('li'); row.textContent='男装 > 打底衫';
+            row.onclick=()=>{window.chosen='打底衫';document.getElementById('chosen').textContent='已选：'+row.textContent;renderMenus(row.textContent);};
+            document.getElementById('results').replaceChildren(row);
+          };
+        }''')
+        with patch('taobao_listing.CATEGORY_SEARCH_SECONDS', 0.2):
+            self.assertEqual(await listing.apply_excel_category(), '男装 > 打底衫')
+        self.assertEqual(await self.page.evaluate('window.searches'), ['卫衣', '打底衫'])
+
+    async def test_composite_belt_category_skips_single_word_rows(self):
+        await self.page.set_content('''
+          <section id="panel"><div class="platform-category-input">女装 > 裙子
+            <button onclick="document.querySelector('[role=dialog]').style.display='block'">修改类目</button>
+          </div><div class="conf"><div class="complex-wrap"></div></div></section>
+          <div role="dialog" aria-label="修改类目" style="display:none">
+            <input placeholder="请输入类目关键词，支持模糊查询" oninput="showCategory(this.value)">
+            <div id="chosen">已选：</div><div id="menus"></div>
+            <button onclick="document.querySelector('.platform-category-input').firstChild.nodeValue=window.chosen;this.parentElement.style.display='none';document.querySelector('.complex-wrap').innerHTML='<div class=complex-item>属性</div>'">确定</button>
+          </div>
+          <div class="el-autocomplete-suggestion"><ul id="results"></ul></div>
+          <script>
+            window.searches=[];
+            function renderMenus(path) {
+              document.querySelector('#menus').innerHTML=path.split(' > ').map((name,i)=>
+                '<div class="el-cascader-menu"><div class="el-cascader-node" '+
+                (i<path.split(' > ').length-1?'aria-haspopup="true"':'')+'><span class="el-cascader-node__label">'+name+'</span></div></div>').join('');
+            }
+            function showCategory(value) {
+              window.searches.push(value);
+              const path = value === '腰带/腰链/男士皮带'
+                ? '服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带'
+                : '服装 > 服装配饰 > 腰带';
+              const row=document.createElement('li'); row.textContent=path;
+              row.onclick=()=>{window.chosen=path;document.querySelector('#chosen').textContent='已选：'+path;renderMenus(path);};
+              document.querySelector('#results').replaceChildren(row);
+            }
+          </script>
+        ''')
+        listing = TaobaoListing(
+            self.page, self.page.locator('#panel'), LOGGER,
+            category_hints=(
+                '服装 > 服装配饰 > 腰带/皮带/腰链',
+                '服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带',
+            ),
+        )
+        listing.panel = self.page.locator('#panel')
+        with patch('taobao_listing.CATEGORY_SEARCH_SECONDS', 0.2):
+            self.assertEqual(
+                await listing.apply_excel_category(),
+                '服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带',
+            )
+        self.assertEqual(
+            await self.page.evaluate('window.searches'),
+            ['腰带/皮带/腰链', '腰带/腰链/男士皮带'],
+        )
+
     async def test_category_review_restores_candidate_from_earlier_search(self):
         listing = await self._excel_category_search_listing("牛仔裤/男士直筒牛仔裤")
         await self.page.evaluate("""() => {
@@ -1226,6 +1550,37 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         rows = await self.listing._visible_category_result_nodes()
         self.assertEqual([name for name, _node in rows], [
             '男鞋 > 男式正装皮鞋', '流行男鞋 > 时尚单鞋 > 正装皮鞋'])
+
+    async def test_category_results_keep_full_rows_without_highlight_duplicates(self):
+        await self.page.set_content('''
+          <div class="el-autocomplete-suggestion"><ul>
+            <li><span>服饰配件/皮带/帽子/围巾 &gt; <span style="color:red">腰带/皮带/腰链</span></span></li>
+            <li><span>闲鱼优品 &gt; 服饰配件/皮带/帽子/围巾 &gt; <span style="color:red">腰带/皮带/腰链</span></span></li>
+            <li><span>牛仔裤</span></li>
+          </ul></div>
+        ''')
+        rows = await self.listing._visible_category_result_nodes()
+        self.assertEqual([name for name, _node in rows], [
+            '服饰配件/皮带/帽子/围巾 > 腰带/皮带/腰链',
+            '闲鱼优品 > 服饰配件/皮带/帽子/围巾 > 腰带/皮带/腰链',
+            '牛仔裤',
+        ])
+
+    async def test_category_results_exclude_search_status_and_disabled_paths(self):
+        await self.page.set_content('''
+          <div class="el-autocomplete-suggestion"><ul>
+            <li>暂无结果</li><li>加载中...</li><li>男装 &gt; 暂无数据</li>
+            <li aria-disabled="true"><span>男装 &gt; 西裤</span></li>
+            <li class="is-disabled">男装 &gt; 衬衫</li>
+            <li>男装 &gt; 牛仔裤</li>
+          </ul></div>
+        ''')
+        self.assertEqual([name for name, _ in await self.listing._visible_category_result_nodes()],
+                         ['男装 > 牛仔裤'])
+        self.listing.attribute_runtime = type('Runtime', (), {'resolve': AsyncMock()})()
+        self.assertEqual(await self.listing._resolve_category_review(
+            ('暂无结果', '男装 > 暂无数据'), source='test'), '')
+        self.listing.attribute_runtime.resolve.assert_not_called()
 
     async def test_pants_size_chart_fills_length_by_size(self):
         actual = await self.listing.fill_size_chart_lengths(
@@ -1456,6 +1811,7 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
                 "材质成分",
             ),
         )
+
         self.assertEqual(
             await self.page.locator(".material-row").count(),
             1,
@@ -1472,6 +1828,68 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             await self.page.evaluate("window.materialState"),
             [{"material_prop_name": "cotton-id", "material_prop_content": "100"}],
         )
+
+    async def test_invalid_optional_tag_price_is_skipped_without_stopping_form(self):
+        report = await self.listing.apply_excel_attributes(
+            parse_taobao_fields(
+                {
+                    "吊牌价/价格/基本售价/商品价格": "元",
+                    "材质成分/材质": "棉/100%",
+                }
+            )
+        )
+
+        self.assertEqual(report["skipped_values"]["吊牌价"], "元")
+        self.assertNotIn("吊牌价", report["attributes"])
+        self.assertEqual(
+            await self.page.locator(".price-input").input_value(), ""
+        )
+
+    async def test_optional_unit_only_tag_price_does_not_block_save(self):
+        await self.listing.apply_recommended_category()
+        await self.page.locator(".complex-item:has(.price-input) > .el-form-item").evaluate(
+            "element => element.classList.remove('is-required')"
+        )
+        report = await self.listing.apply_excel_attributes(parse_taobao_fields({
+            "吊牌价/价格/基本售价/商品价格": "元",
+            "材质成分/材质": "棉/100%",
+            "面料": "棉",
+        }))
+
+        require_resolved_page_attributes("taobao", report)
+        self.assertEqual(report["empty_template_values"], {"吊牌价": "元"})
+        self.assertEqual(await self.page.locator(".price-input").input_value(), "")
+
+    async def test_required_or_nonplaceholder_tag_price_still_blocks_save(self):
+        for required, value in ((True, "元"), (False, "待确认")):
+            with self.subTest(required=required, value=value):
+                await self.listing.apply_recommended_category()
+                if not required:
+                    await self.page.locator(".complex-item:has(.price-input) > .el-form-item").evaluate(
+                        "element => element.classList.remove('is-required')"
+                    )
+                report = await self.listing.apply_excel_attributes(parse_taobao_fields({
+                    "吊牌价/价格/基本售价/商品价格": value,
+                    "材质成分/材质": "棉/100%",
+                    "面料": "棉",
+                }))
+                with self.assertRaisesRegex(AutomationError, "吊牌价"):
+                    require_resolved_page_attributes("taobao", report)
+
+    async def test_decimal_materials_sync_and_read_back_without_integer_truncation(self):
+        await self.listing.apply_recommended_category()
+        materials = parse_taobao_materials({"材质成分": "棉95.4%，亚麻4.6%"})
+
+        actual = await self.listing.fill_materials(materials)
+
+        self.assertEqual(actual, (("棉", 95.4), ("亚麻", 4.6)))
+        expected_state = [
+            {"material_prop_name": "cotton-id", "material_prop_content": "95.4"},
+            {"material_prop_name": "linen-id", "material_prop_content": "4.6"},
+        ]
+        self.assertEqual(self.listing.material_validation["component"]["rows"], expected_state)
+        self.assertEqual(await self.page.evaluate("window.materialState"), expected_state)
+        self.assertEqual(await self.listing.fill_materials(materials), actual)
 
     async def test_material_sync_does_not_hang_when_vue_next_tick_stalls(self):
         await self.listing.apply_recommended_category()
@@ -1620,6 +2038,125 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             ],
             ("纯色",),
         )
+
+    async def test_multifabric_learning_preserves_exact_option_and_reuses_single_override(self):
+        from platform_schema import FieldOption
+        from taobao_api_index import TaobaoApiJsonIndex
+        from tmall_api_index import TmallApiField
+
+        await self.listing.apply_recommended_category()
+        select = self.page.locator(
+            ".complex-item:has(.el-form-item__label:text-is('面料')) .el-select"
+        )
+        await select.evaluate("""element => {
+          const option = document.createElement('li');
+          option.className = 'el-select-dropdown__item';
+          option.textContent = '聚酯纤维';
+          option.onclick = () => choose(option);
+          element.querySelector('.el-select-dropdown ul').appendChild(option);
+          window.fabricSelectionLog = [];
+          const originalChoose = window.choose;
+          window.choose = candidate => {
+            if (candidate.closest('.el-select') !== element) {
+              originalChoose(candidate);
+              return;
+            }
+            const value = candidate.textContent.trim();
+            window.fabricSelectionLog.push(value);
+            const tags = element.querySelector('.el-select__tags');
+            const existing = Array.from(tags.querySelectorAll('.el-tag')).find(tag =>
+              tag.childNodes[0]?.textContent.trim() === value);
+            if (existing) existing.remove();
+            else setSelectValue(element, value);
+          };
+        }""")
+
+        api_index = TaobaoApiJsonIndex(self.page)
+        api_index._active_category_id = "pants"
+        api_index._fields[("schema", "fabric")] = TmallApiField(
+            endpoint_path="/tb/getItemPublishSchemaPropV2",
+            source_id="fabric",
+            label="面料",
+            required=True,
+            options=("棉", "聚酯纤维"),
+            option_values=(
+                FieldOption("cotton", "棉", 0),
+                FieldOption("polyester", "聚酯纤维", 1),
+            ),
+            category_leaf_id="pants",
+        )
+
+        class Runtime:
+            def __init__(self):
+                self.requests = []
+
+            def reusable_choice(self, request):
+                if len(request.candidates) == 1:
+                    return None
+                return ResolvedAttribute(
+                    "polyester", "聚酯纤维", "human_override", "snapshot"
+                )
+
+            async def resolve(self, request):
+                self.requests.append(request)
+                if len(request.candidates) == 1:
+                    return ResolvedAttribute(
+                        "cotton", "棉", "explicit_text", "snapshot"
+                    )
+                return ResolvedAttribute(
+                    "polyester", "聚酯纤维", "human_override", "snapshot"
+                )
+
+        runtime = Runtime()
+        self.listing.api_index = api_index
+        self.listing.attribute_runtime = runtime
+        self.listing.attribute_platform_id = "tb"
+
+        actual = await self.listing.fill_attribute("面料", "棉，聚脂钎维")
+
+        self.assertEqual(actual, ("棉", "聚酯纤维"))
+        self.assertEqual(await select.locator(".el-tag").count(), 2)
+        self.assertEqual(
+            await self.page.evaluate("window.fabricSelectionLog"),
+            ["棉", "聚酯纤维"],
+        )
+        self.assertEqual(
+            [request.excel_value for request in runtime.requests],
+            ["棉", "聚脂钎维"],
+        )
+        self.assertEqual(
+            tuple(value.label for value in runtime.requests[0].candidates), ("棉",)
+        )
+        self.assertEqual(
+            tuple(value.label for value in runtime.requests[1].candidates),
+            ("棉", "聚酯纤维"),
+        )
+
+        single = await self.listing._resolve_learning_select_groups(
+            "面料", select, (("棉",),)
+        )
+        self.assertEqual(single, ("聚酯纤维",))
+        self.assertEqual(
+            [request.excel_value for request in runtime.requests],
+            ["棉", "聚脂钎维", "棉"],
+        )
+
+    async def test_multiselect_readback_uses_one_dom_snapshot(self):
+        class Tags:
+            async def evaluate_all(self, _script):
+                return ["棉", "聚酯纤维"]
+
+            async def count(self):
+                raise AssertionError("tag count can go stale during rerender")
+
+            def nth(self, _index):
+                raise AssertionError("individual tag reads can wait on a detached node")
+
+        select = SimpleNamespace(locator=lambda _selector: Tags())
+
+        actual = await self.listing._read_select_values(select, multi=True)
+
+        self.assertEqual(actual, ("棉", "聚酯纤维"))
 
     async def test_unmapped_excel_field_keeps_legacy_or_selection_with_learning_enabled(self):
         class Runtime:
@@ -1964,6 +2501,18 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
             all(row["SKU分类"] == "第一顺位" for row in actual["rows"])
         )
 
+    async def test_sku_selling_price_is_independent_of_tag_price_alias(self):
+        for tag_price in ('元', '398'):
+            with self.subTest(tag_price=tag_price):
+                await self.listing.apply_recommended_category()
+                actual = await self.listing.fill_sku_batch({
+                    '吊牌价/价格/基本售价/商品价格': tag_price,
+                    '价格/京东价/市场价/售卖价/售价': '298',
+                    '数量': '100', '是否加绒': '否', 'SKU分类': '单品', '适用体型': '直筒型',
+                })
+                self.assertEqual(actual['values']['价格'], '298')
+                self.assertTrue(all(row['价格'] == '298' for row in actual['rows']))
+
     async def test_sku_fleece_prefers_excel_no_when_page_uses_yes_no(self):
         await self.listing.apply_recommended_category()
         product_details = await self.listing._wrap_item("商品明细")
@@ -2040,6 +2589,109 @@ class TaobaoListingFixtureTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(rows[0]["裤型"], "直筒裤")
+
+    async def test_unprovided_sku_select_uses_control_type_with_duplicate_text_label(self):
+        await self.listing.apply_recommended_category()
+        await self.page.evaluate('''() => {
+          const batch=document.querySelector('#sku-batch');
+          batch.insertAdjacentHTML('beforeend', batchItem('颜色分类', simpleSelect(['黑色'])) +
+            batchItem('颜色分类', '<input class="el-input__inner">'));
+          const item=[...batch.children].find(i=>i.querySelector('.sku-batch-item_label')?.textContent.trim()==='颜色分类：');
+          item.querySelector('input').value='黑色';
+          attachSelectComponents(batch);
+        }''')
+        self.assertEqual(await self.listing._resolve_unprovided_batch_select(
+            self.page.locator('#sku-batch'), '颜色分类'), '黑色')
+
+    async def test_sku_color_category_uses_excel_color_and_preserves_duplicate_text(self):
+        await self.listing.apply_recommended_category()
+        await self.page.evaluate('''() => {
+          const batch=document.querySelector('#sku-batch');
+          batch.insertAdjacentHTML('beforeend', batchItem('颜色分类', simpleSelect(['黑色'])) +
+            batchItem('颜色分类', '<input class="el-input__inner" value="保持原备注">'));
+          document.querySelector('#sku-table thead tr').insertAdjacentHTML('beforeend','<th>颜色分类</th><th>颜色分类</th>');
+          document.querySelectorAll('#sku-table tbody tr').forEach(row=>row.insertAdjacentHTML('beforeend',
+            '<td><div class="el-select"><input class="sku-color" readonly></div></td><td>保持原备注</td>'));
+          const apply=window.applySkuBatch;
+          window.applySkuBatch=()=>{apply(); const item=[...batch.children].find(i=>i.querySelector('.sku-batch-item_label')?.textContent.trim()==='颜色分类：');
+            document.querySelectorAll('.sku-color').forEach(i=>i.value=item.querySelector('input').value);};
+          attachSelectComponents(batch);
+        }''')
+        actual = await self.listing.fill_sku_batch({'价格':'298','数量':'100','颜色':'黑色',
+            '是否加绒':'否','SKU分类':'单品','适用体型':'直筒型'})
+        self.assertEqual(actual['values']['颜色分类'], '黑色')
+        self.assertTrue(all(row['颜色分类']=='黑色' for row in actual['rows']))
+        self.assertEqual(await self.page.locator('input[value="保持原备注"]').input_value(), '保持原备注')
+
+    async def test_belt_removes_only_blank_total_length_and_size_values(self):
+        await self.page.evaluate('''() => {
+          const root=document.querySelector('.block-specification');
+          for (const name of ['总长度','尺码','是否加绒']) {
+            const group=document.createElement('div');
+            group.innerHTML=`<div class="title-bg"><input value="${name}"></div>
+              <div class="specification-value"><div class="specification-value-flex">
+                <div class="specification-value-flex_item">
+                  <div class="del-input-wrap"><div class="el-input specification-value-flex_input">
+                    <input class="el-input__inner" value="${name==='是否加绒'?'否':''}"></div>
+                  <div class="del-btn" onclick="this.closest('.specification-value-flex_item').remove()"><i class="el-icon-close"></i></div></div>
+                </div>
+                <div class="specification-value-flex_item"><button>添加规格值</button></div>
+              </div></div>`;
+            root.append(group);
+          }
+        }''')
+        self.listing.category_hints = ('服饰配件/皮带/帽子/围巾 > 腰带/皮带/腰链',)
+
+        actual = await self.listing.remove_empty_belt_specification_values()
+
+        self.assertEqual(actual, {'总长度': 1, '尺码': 1})
+        self.assertEqual(await self.page.locator(
+            '.block-specification .title-bg:has(input[value="总长度"])'
+            ' + .specification-value .del-input-wrap'
+        ).count(), 0)
+        self.assertEqual(await self.page.locator(
+            '.block-specification .title-bg:has(input[value="尺码"])'
+            ' + .specification-value .del-input-wrap'
+        ).count(), 0)
+        self.assertEqual(await self.page.locator(
+            '.block-specification .title-bg:has(input[value="是否加绒"])'
+            ' + .specification-value .del-input-wrap'
+        ).count(), 1)
+
+    async def test_belt_blank_spec_value_cleanup_is_scoped_to_belt_category(self):
+        await self.page.evaluate('''() => {
+          const root=document.querySelector('.block-specification');
+          const group=document.createElement('div');
+          group.innerHTML=`<div class="title-bg"><input value="尺码"></div>
+            <div class="specification-value"><div class="specification-value-flex">
+              <div class="specification-value-flex_item"><div class="del-input-wrap">
+                <input class="specification-value-flex_input" value="">
+                <div class="del-btn" onclick="this.closest('.specification-value-flex_item').remove()"><i class="el-icon-close"></i></div></div></div>
+              <div class="specification-value-flex_item"><button>添加规格值</button></div>
+            </div></div>`;
+          root.append(group);
+        }''')
+        self.listing.category_hints = ('男装 > 时尚工装裤',)
+
+        actual = await self.listing.remove_empty_belt_specification_values()
+
+        self.assertEqual(actual, {})
+        self.assertEqual(await self.page.locator(
+            '.block-specification .title-bg:has(input[value="尺码"])'
+            ' + .specification-value .del-input-wrap'
+        ).count(), 1)
+
+    async def test_sku_duplicate_color_readback_checks_select_instead_of_spec_or_text(self):
+        snapshot = {
+            'headers': ('颜色分类', '价格', '数量', '颜色分类', '颜色分类'),
+            'rows': (('黑色', '298', '100', '', ''),),
+            'select_columns': [3],
+        }
+        with self.assertRaisesRegex(RuntimeError, '颜色分类'):
+            self.listing._validate_sku_snapshot(snapshot, {'价格': '298', '数量': '100', '颜色分类': '黑色'})
+        snapshot['rows'] = (('黑色', '298', '100', '黑色', ''),)
+        self.assertEqual(self.listing._validate_sku_snapshot(
+            snapshot, {'价格': '298', '数量': '100', '颜色分类': '黑色'})[0]['颜色分类'], '黑色')
 
     async def test_sku_batch_collects_every_unprovided_live_select_before_review(self):
         class Runtime:

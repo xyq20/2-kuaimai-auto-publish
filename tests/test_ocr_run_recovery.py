@@ -76,6 +76,12 @@ class OCRRunRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     return reply.json()
                 def ocr_judge(self,payload):
                     return {'status':'review_required','reason_code':'deepseek_not_configured'}
+                def upload_asset(self,product_version,sha256,kind,content_type,body):
+                    reply=api.put('/api/device/assets/'+sha256,
+                        headers={**headers,'X-Product-Version':product_version,
+                                 'X-Asset-Kind':kind,'Content-Type':content_type},content=body)
+                    test.assertIn(reply.status_code,(200,201),reply.text)
+                    return reply.json()
                 def poll_resume(self,*args):
                     for task in api.get('/api/reviews').json()['tasks']:
                         claimed=api.post('/api/reviews/'+task['id']+'/claim',headers=origin,json={'version':task['version']}).json()
@@ -95,7 +101,11 @@ class OCRRunRecoveryTests(unittest.IsolatedAsyncioTestCase):
             args=SimpleNamespace(save=True,save_only=True,platform='all')
             checkpoint=store.save_checkpoint(RunCheckpoint('run','product','save_only',('base','xhs','tmall'),2,'running',None,1,'device','images'))
             cloud.post_event('checkpoint','checkpoint.updated',checkpoint_event_payload(checkpoint))
-            error=OCRJudgmentRequired(root/'size.jpg',unfamiliar_tokens(),'clothing',
+            import base64
+            chart = root/'size.png'
+            chart.write_bytes(base64.b64decode(
+                'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/Z5kAAAAASUVORK5CYII='))
+            error=OCRJudgmentRequired(chart,unfamiliar_tokens(),'clothing',
                                      lambda tokens: recognition.parse_size_names(tokens,'clothing'),'衣长未识别')
             session=OCRSemanticSession()
             await erp.recover_ocr_with_learning(context,args,session,error,logging.getLogger(__name__))

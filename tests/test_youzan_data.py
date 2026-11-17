@@ -4,6 +4,13 @@ from youzan_data import parse_youzan_fields
 
 
 class YouzanDataTests(unittest.TestCase):
+    def test_belt_has_its_own_kind_and_keeps_other_accessories_unknown(self):
+        self.assertEqual(parse_youzan_fields({
+            '商品分类': '服装 > 服装配饰 > 腰带/皮带/腰链/服饰内衣 > 服饰配件 > 腰带/腰链/男士皮带',
+        }).garment_kind, 'belt')
+        self.assertEqual(parse_youzan_fields({
+            '商品分类': '服饰配件/皮带/帽子/围巾 > 帽子',
+        }).garment_kind, 'unknown')
     def test_preserves_fields_and_same_level_category_alternatives(self):
         parsed = parse_youzan_fields(
             {
