@@ -6,10 +6,13 @@ import inspect
 
 from field_policies import (
     heel_height_option_matches,
+    is_material_field_label,
     listing_date_text_value,
     match_option_candidates,
     match_style_option_candidates,
+    material_name_groups,
     positional_listing_date_value,
+    primary_material_names,
     season_option_aliases,
     style_option_aliases,
     without_color_attributes,
@@ -265,16 +268,6 @@ TAOBAO_MATERIAL_OPTION_ALIASES: Mapping[str, Tuple[str, ...]] = {
 }
 
 
-def is_material_field_label(label: object) -> bool:
-    """Return whether the field is in the shared fabric/material scope."""
-    normalized = normalize_label(label)
-    return bool(
-        normalized
-        and "含量" not in normalized
-        and ("材质" in normalized or "面料" in normalized)
-    )
-
-
 def material_value_candidates(value: object) -> Tuple[str, ...]:
     """Expand one Excel material name into known platform spellings."""
     text = str(value).strip()
@@ -286,32 +279,6 @@ def material_value_candidates(value: object) -> Tuple[str, ...]:
             + TAOBAO_MATERIAL_OPTION_ALIASES.get(normalize_option(text), ())
         )
     )
-
-
-def material_name_groups(value: object) -> Tuple[Tuple[str, ...], ...]:
-    """Parse material names: commas mean multiple values, slashes mean OR."""
-    groups: List[Tuple[str, ...]] = []
-    for raw_group in re.split(r"[,，、;；]", str(value or "")):
-        names: List[str] = []
-        normalized_names = set()
-        for raw_candidate in re.split(r"[/／]", raw_group):
-            candidate = raw_candidate.strip()
-            if not candidate or re.fullmatch(
-                r"\d+(?:\.\d+)?\s*[%％]", candidate
-            ):
-                continue
-            name = re.sub(
-                r"\s*[（(]?\s*\d+(?:\.\d+)?\s*[%％]\s*[）)]?\s*$",
-                "",
-                candidate,
-            ).strip()
-            normalized = normalize_option(name)
-            if name and normalized not in normalized_names:
-                normalized_names.add(normalized)
-                names.append(name)
-        if names:
-            groups.append(tuple(names))
-    return tuple(groups)
 
 
 def material_value_groups(
@@ -331,6 +298,21 @@ def material_value_groups(
             if candidates:
                 groups.append(tuple(candidates))
     return tuple(groups)
+
+
+def single_select_material_groups(
+    label: object, expected: object, groups: Sequence[Tuple[str, ...]]
+) -> Tuple[Tuple[str, ...], ...]:
+    """单选面料只保留含量最高的成分组（同含量取第一个），找不到再转审核。"""
+    groups = tuple(groups)
+    if len(groups) <= 1 or not is_material_field_label(label):
+        return groups
+    primary = {normalize_option(name) for name in primary_material_names(expected)}
+    chosen = tuple(
+        group for group in groups
+        if any(normalize_option(name) in primary for name in group)
+    )
+    return chosen[:1] or groups[:1]
 
 
 def parse_material_components(value: str) -> Tuple[Tuple[str, Optional[str]], ...]:
@@ -413,7 +395,7 @@ def selection_value_groups_for_control(
     if multi:
         return selection_value_groups(label, value)
     candidates = tuple(dict.fromkeys(
-        candidate for plan in excel_selection_plans(value, multi=False)
+        candidate for plan in excel_selection_plans(value, multi=False, field_label=label)
         for candidate in value_candidates(label, plan[0])
     ))
     return (candidates,) if candidates else ()
@@ -2428,7 +2410,7 @@ class TaobaoListing:
             self._excel_select_plans = {}
         self._excel_select_plans.pop(normalize_label(label), None)
         plans = tuple(tuple(value_candidates(label, member) for member in plan)
-                      for plan in excel_selection_plans(value, multi=multi))
+                      for plan in excel_selection_plans(value, multi=multi, field_label=label))
         options = await self._registered_vue_options(select)
         if not options:
             if not multi or all(len(plan) == 1 for plan in plans):
@@ -2992,6 +2974,8 @@ class TaobaoListing:
             multi = await select_supports_multiple(select)
             if exact_values is not None:
                 groups = material_value_groups(page_label, exact_values)
+                if not multi:
+                    groups = single_select_material_groups(page_label, expected, groups)
             else:
                 groups = await self._excel_groups_for_select(
                     select, page_label, str(expected), multi=multi

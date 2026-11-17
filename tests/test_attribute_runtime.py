@@ -280,6 +280,32 @@ class AttributeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             (),
         )
 
+    async def test_fabric_composition_selects_primary_material(self):
+        from attribute_runtime import _matched_excel_variants
+        cotton, poly = CandidateValue("cotton", "棉"), CandidateValue("poly", "涤纶")
+        self.assertEqual(
+            _matched_excel_variants("涤纶40%，棉60%", (cotton, poly),
+                                    control_type="select", field_label="面料"),
+            ((cotton,),),
+        )
+        # 主面料不是候选时转人工，不能退到含量更低的成分。
+        self.assertEqual(
+            _matched_excel_variants("棉60%，涤纶40%", (poly,),
+                                    control_type="select", field_label="面料"),
+            (),
+        )
+        self.assertEqual(
+            _matched_excel_variants("棉60%，涤纶40%", (cotton, poly),
+                                    control_type="multi_select", field_label="面料"),
+            ((cotton, poly),),
+        )
+        # 普通单选字段仍按逗号顺序回退。
+        self.assertEqual(
+            _matched_excel_variants("日常，休闲", (CandidateValue("leisure", "休闲"),),
+                                    control_type="select", field_label="适用场景")[0][0].label,
+            "休闲",
+        )
+
     async def test_excel_slash_uses_first_available_choice_across_platforms(self):
         for platform in ("douyin", "taobao", "tmall", "pdd", "wxsph", "xhs", "jd"):
             for control in ("select", "text"):

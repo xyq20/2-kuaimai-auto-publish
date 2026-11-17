@@ -6,10 +6,29 @@ from field_policies import (
     freight_alternatives,
     is_single_material_expression,
     match_option_candidates,
+    material_review_key,
+    primary_material_names,
 )
 
 
 class FieldPolicyTests(unittest.TestCase):
+    def test_single_select_material_takes_highest_percentage(self):
+        self.assertEqual(primary_material_names('涤纶40%，棉60%'), ('棉',))
+        self.assertEqual(primary_material_names('棉（60%）,涤纶/聚酯纤维（40%）'), ('棉',))
+        self.assertEqual(primary_material_names('涤纶/聚酯纤维95%，氨纶5%'), ('涤纶', '聚酯纤维'))
+        # 同含量或没有含量时取 Excel 中的第一个成分。
+        self.assertEqual(primary_material_names('棉50%，麻50%'), ('棉',))
+        self.assertEqual(primary_material_names('棉，涤纶'), ('棉',))
+        self.assertEqual(primary_material_names('羊皮'), ('羊皮',))
+        self.assertEqual(primary_material_names(''), ())
+
+    def test_material_review_key_ignores_ratio_and_order(self):
+        key = material_review_key('棉60%，涤纶40%')
+        self.assertEqual(key, material_review_key('棉55%,涤纶45%'))
+        self.assertEqual(key, material_review_key('涤纶40%；棉60%'))
+        self.assertNotEqual(key, material_review_key('棉95%，氨纶5%'))
+        self.assertNotEqual(key, material_review_key('棉100%'))
+
     def test_strict_material_match_does_not_invent_surface_treatment(self):
         self.assertEqual(match_option_candidates(('反绒皮',), ('高丝光反绒皮',), allow_component=False), ())
         self.assertEqual(match_option_candidates(('反绒皮',), ('高丝光反绒皮', '反绒皮'), allow_component=False), (1,))

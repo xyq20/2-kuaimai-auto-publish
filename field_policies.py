@@ -121,6 +121,83 @@ def is_single_material_expression(value: str) -> bool:
                for part in re.split(r"[/／]", value))
 
 
+MATERIAL_COMPONENT_SEPARATORS = r"[,，、;；]"
+_MATERIAL_PERCENTAGE = r"(\d+(?:\.\d+)?)\s*[%％]"
+
+
+def is_material_field_label(label: object) -> bool:
+    """Return whether the field is in the shared fabric/material scope."""
+    text = unicodedata.normalize("NFKC", "" if label is None else str(label))
+    normalized = re.sub(r"[\s*:：]+", "", text.replace("重要", "")).casefold()
+    return bool(
+        normalized
+        and "含量" not in normalized
+        and ("材质" in normalized or "面料" in normalized)
+    )
+
+
+def material_name_groups(value: object) -> Tuple[Tuple[str, ...], ...]:
+    """Parse material names: commas mean multiple values, slashes mean OR."""
+    groups = []
+    for raw_group in re.split(MATERIAL_COMPONENT_SEPARATORS, str(value or "")):
+        names = []
+        normalized_names = set()
+        for raw_candidate in re.split(r"[/／]", raw_group):
+            candidate = raw_candidate.strip()
+            if not candidate or re.fullmatch(_MATERIAL_PERCENTAGE, candidate):
+                continue
+            name = re.sub(
+                r"\s*[（(]?\s*\d+(?:\.\d+)?\s*[%％]\s*[）)]?\s*$",
+                "",
+                candidate,
+            ).strip()
+            normalized = _normalize_option_text(name)
+            if name and normalized not in normalized_names:
+                normalized_names.add(normalized)
+                names.append(name)
+        if names:
+            groups.append(tuple(names))
+    return tuple(groups)
+
+
+def primary_material_names(value: object) -> Tuple[str, ...]:
+    """Names of the one material a single-select field should receive.
+
+    Operator rule: a single-select fabric field takes the component with the
+    highest percentage; equal (or missing) percentages keep the first one in
+    Excel order.  Slash alternatives of that component stay ordered ORs.  The
+    caller still sends the field to review when none of them is a candidate,
+    rather than falling through to a lower-percentage component.
+    """
+    best_names: Tuple[str, ...] = ()
+    best_percentage = None
+    for raw_group in re.split(MATERIAL_COMPONENT_SEPARATORS, str(value or "")):
+        parsed = material_name_groups(raw_group)
+        if not parsed:
+            continue
+        match = re.search(_MATERIAL_PERCENTAGE, raw_group)
+        percentage = float(match.group(1)) if match else None
+        if not best_names or (
+            percentage is not None
+            and (best_percentage is None or percentage > best_percentage)
+        ):
+            best_names, best_percentage = parsed[0], percentage
+    return best_names
+
+
+def material_review_key(value: object) -> Tuple[str, ...]:
+    """Identify a fabric review by its set of materials, not its Excel text.
+
+    ``棉60%，涤纶40%``, ``棉55%，涤纶45%`` and ``涤纶40%，棉60%`` are the same
+    review question, so one human answer covers all of them.  A different set
+    of materials (for example cotton plus spandex) is a new question.
+    """
+    return tuple(sorted({
+        _normalize_option_text(names[0])
+        for names in material_name_groups(value)
+    }))
+
+
 def _normalize_option_text(value: object) -> str:
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
     return re.sub(r"[\s，,;；、・·\-_（）()]", "", text).casefold()

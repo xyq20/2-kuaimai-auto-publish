@@ -42,6 +42,7 @@ from taobao_listing import (
     parse_taobao_materials,
     TAOBAO_MATERIAL_OPTION_ALIASES,
     material_value_groups,
+    single_select_material_groups,
     selection_value_groups,
     selection_value_groups_for_control,
 )
@@ -2533,6 +2534,8 @@ class TmallFormListing(TaobaoListing):
                     groups = await self._excel_groups_for_select(
                         selects.first, label, expected, multi=multi
                     )
+                elif not multi:
+                    groups = single_select_material_groups(label, expected, groups)
                 if self.attribute_runtime is not None:
                     resolved_values = await self._resolve_learning_select_groups(
                         label, selects.first, groups,

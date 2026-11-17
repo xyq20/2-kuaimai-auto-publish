@@ -6,7 +6,12 @@ publish method: the common runner retains the final write gate.
 
 from __future__ import annotations
 
-from field_policies import listing_date_text_value, positional_listing_date_value, without_color_attributes
+from field_policies import (
+    listing_date_text_value,
+    positional_listing_date_value,
+    primary_material_names,
+    without_color_attributes,
+)
 
 import asyncio
 import re
@@ -41,6 +46,7 @@ from taobao_listing import (
     normalize_option,
     parse_taobao_materials,
     material_value_groups,
+    single_select_material_groups,
     selection_value_groups,
     selection_value_groups_for_control,
 )
@@ -1013,6 +1019,8 @@ class PddFormListing(TaobaoListing):
                     select, page_label, expected, multi=multi
                 )
             )
+            if exact_values is not None and not multi:
+                groups = single_select_material_groups(page_label, expected, groups)
             if not groups:
                 raise PddFormListingError("拼多多属性“{0}”期望值为空".format(page_label))
             current = tuple(
@@ -1316,12 +1324,22 @@ class PddFormListing(TaobaoListing):
                                 len(exact_values),
                             )
                         if not multi:
-                            # A single-select field can store only the first
-                            # material component, so review and verify one value.
-                            exact_values = exact_values[:1]
+                            # A single-select field can store only one material:
+                            # the highest percentage (first on a tie).
+                            primary = {
+                                normalize_option(name)
+                                for name in primary_material_names(expected)
+                            }
+                            exact_values = tuple(
+                                value for value in exact_values
+                                if any(
+                                    normalize_option(name) in primary
+                                    for name in value.split("/")
+                                )
+                            )[:1] or exact_values[:1]
                             if self.logger is not None:
                                 self.logger.info(
-                                    "拼多多属性“%s”为单选，按顺序使用第一个面料成分：%s",
+                                    "拼多多属性“%s”为单选，使用含量最高的面料成分：%s",
                                     page_label,
                                     exact_values[0],
                                 )

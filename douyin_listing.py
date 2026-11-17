@@ -1428,7 +1428,7 @@ class DouyinListing:
             control_type="multi_select" if multi else "select", field_label=label,
         )
         if not exact_alternatives:
-            for plan in excel_selection_plans(excel_value, multi=multi):
+            for plan in excel_selection_plans(excel_value, multi=multi, field_label=label):
                 chosen = []
                 for member in plan:
                     match = next((c for alias in value_candidates(label, member)
@@ -1974,7 +1974,7 @@ class DouyinListing:
         failure = None
         plans = (tuple(expected_values),)
         if review_alternatives and len(review_alternatives) > 1:
-            raw_plans = excel_selection_plans('/'.join(review_alternatives), multi=multi)
+            raw_plans = excel_selection_plans('/'.join(review_alternatives), multi=multi, field_label=label)
             remembered = getattr(self.attribute_runtime, '_resolved_attributes', {}).get(('douyin', _normalize_label(label)))
             approved = remembered and remembered[1].source in {'human_override', 'cross_product_human', 'review_learning'}
             if not approved and tuple(expected_values) in raw_plans:
@@ -2357,7 +2357,7 @@ class DouyinListing:
         if await selects.count():
             select = selects.first
             multi = await select_supports_multiple(select)
-            plans = excel_selection_plans(expected, multi=multi)
+            plans = excel_selection_plans(expected, multi=multi, field_label=label)
             alternatives = tuple(",".join(plan) for plan in plans)
             if not alternatives:
                 raise DouyinListingError(f"属性“{label}”期望值为空")

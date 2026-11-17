@@ -5,6 +5,7 @@ from collections import Counter
 from decimal import Decimal
 
 from canonical_fields import FieldMappingError, map_platform_field
+from field_policies import is_material_field_label, material_review_key
 
 MULTI_CONTROLS = {'multi_select', 'multi-select', 'multiselect'}
 FIELD_ALIASES = {
@@ -112,6 +113,9 @@ def choose_review_learning(request, records):
     waiting = {'reason_code': 'review_learning_insufficient', 'support_count': 0,
                'calibrated_acceptance_rate': 0.0}
     excel = tuple(normalized(v) for v in re.split(r'[/／]', request['excel_value']) if normalized(v))
+    # 面料按成分集合复用：同一组材质（不论比例、顺序）人工确认一次即可。
+    material_key = (material_review_key(request['excel_value'])
+                    if is_material_field_label(request['field_label']) else None)
     eligible = []
     seen = set()
     for row in records:
@@ -122,7 +126,10 @@ def choose_review_learning(request, records):
             continue
         if not _related_fields(request, row) or not _compatible_controls(request, row):
             continue
-        if tuple(normalized(v) for v in row.get('excel_candidates', [])) != excel:
+        if material_key:
+            if material_review_key('/'.join(row.get('excel_candidates', []))) != material_key:
+                continue
+        elif tuple(normalized(v) for v in row.get('excel_candidates', [])) != excel:
             continue
         same = row['product_version'] == request['product_version']
         if not same and (not excel or not request['category']
@@ -155,7 +162,7 @@ def choose_review_learning(request, records):
     stats = {'support_count': support, 'calibrated_acceptance_rate': rate}
     if len(counts) > 1 and (rate < .95 or any(v != chosen for v in list(votes.values())[:3])):
         return {**stats, 'reason_code': 'review_learning_conflict'}
-    if not same_product and support < 3:
+    if not same_product and support < (1 if material_key else 3):
         return {**waiting, **stats}
     if len(chosen) > 1 and request['control_type'].casefold() not in MULTI_CONTROLS:
         return {**stats, 'reason_code': 'review_learning_control_mismatch'}

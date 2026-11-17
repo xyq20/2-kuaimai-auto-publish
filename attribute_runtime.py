@@ -13,7 +13,14 @@ import uuid
 
 from attribute_decision import DecisionInput, DecisionStatus, validate_decision
 from canonical_fields import FieldMappingError, map_platform_field
-from field_policies import heel_height_option_matches, match_style_option_candidates, season_option_aliases
+from field_policies import (
+    heel_height_option_matches,
+    is_material_field_label,
+    match_style_option_candidates,
+    material_name_groups,
+    primary_material_names,
+    season_option_aliases,
+)
 from historical_readbacks import (
     VerifiedAttributeHistory,
     normalize_history_field_label,
@@ -85,7 +92,9 @@ def excel_alternative_set(excel_value: object) -> frozenset:
     )
 
 
-def excel_selection_plans(excel_value: object, *, multi: bool) -> Tuple[Tuple[str, ...], ...]:
+def excel_selection_plans(
+    excel_value: object, *, multi: bool, field_label: object = ""
+) -> Tuple[Tuple[str, ...], ...]:
     """Try complete slash-separated plans before a single-control comma fallback."""
     plans = tuple(
         tuple(part.strip() for part in re.split(MULTI_CHOICE_SEPARATORS, alternative)
@@ -93,6 +102,15 @@ def excel_selection_plans(excel_value: object, *, multi: bool) -> Tuple[Tuple[st
         for alternative in re.split(r"[/／]", str(excel_value or ""))
         if alternative.strip()
     )
+    if is_material_field_label(field_label) and material_name_groups(excel_value):
+        # 面料成分里的逗号是成分列表，百分比不是平台候选的一部分。单选只取
+        # 含量最高的成分（同含量取第一个），找不到再转人工，不能退到次要
+        # 成分；多选去掉百分比后同时选全部成分。完整原文仍最先尝试。
+        if multi:
+            fallback = (tuple(names[0] for names in material_name_groups(excel_value)),)
+        else:
+            fallback = tuple((name,) for name in primary_material_names(excel_value))
+        return tuple(dict.fromkeys((*plans, *fallback)))
     if not multi:
         # 单选先保留平台上可能存在的完整组合标签，及 / 后的备用方案。
         # 都无法匹配时，才依次尝试逗号项，不能让它们抢先于备用方案。
@@ -124,7 +142,8 @@ def _matched_excel_variants(
     if not text:
         return ()
     raw_variants = excel_selection_plans(
-        text, multi=str(control_type).casefold() in MULTI_SELECT_CONTROL_TYPES)
+        text, multi=str(control_type).casefold() in MULTI_SELECT_CONTROL_TYPES,
+        field_label=field_label)
 
     matched_variants = []
     for variant in raw_variants:

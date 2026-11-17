@@ -55,6 +55,7 @@ from taobao_listing import (
     parse_taobao_fabrics,
     parse_taobao_materials,
     material_value_groups,
+    single_select_material_groups,
     selection_value_groups,
     selection_value_groups_for_control,
 )
@@ -1617,6 +1618,8 @@ class XhsFormListing(TaobaoListing):
                 select, page_label, expected, multi=multi
             )
         )
+        if exact_values is not None and not multi:
+            groups = single_select_material_groups(page_label, expected, groups)
         if not groups:
             raise XhsFormListingError("小红书属性“{0}”期望值为空".format(page_label))
         if self.attribute_runtime is not None:

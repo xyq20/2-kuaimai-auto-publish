@@ -6,7 +6,12 @@ platform form and reads it back; publishing remains disabled by the registry.
 
 from __future__ import annotations
 
-from field_policies import listing_date_text_value, positional_listing_date_value, without_color_attributes
+from field_policies import (
+    listing_date_text_value,
+    positional_listing_date_value,
+    primary_material_names,
+    without_color_attributes,
+)
 
 from store_freight import sync_store_freight
 
@@ -1727,7 +1732,10 @@ class WxsphFormListing(YouzanFormListing):
             normalize_label("面料材质"),
             normalize_label("里料材质"),
         }:
+            # 含量最高的成分排最前（同含量保持 Excel 顺序），单选先命中主面料。
+            primary = "/".join(primary_material_names(expected))
             materials = _material_name_candidates(expected)
+            materials = tuple(sorted(materials, key=lambda value: value != primary))
             return "/".join(materials), None, "material_ordered_or"
 
         if normalized == normalize_label("材质成分") and not is_select:

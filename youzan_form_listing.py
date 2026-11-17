@@ -47,6 +47,7 @@ from taobao_listing import (
     normalize_option,
     parse_taobao_fabrics,
     material_value_groups,
+    single_select_material_groups,
     selection_value_groups,
     selection_value_groups_for_control,
 )
@@ -1055,6 +1056,8 @@ class YouzanFormListing(TaobaoListing):
                     select, page_label, expected, multi=multi
                 )
             )
+            if exact_values is not None and not multi:
+                groups = single_select_material_groups(page_label, expected, groups)
             if not groups:
                 raise YouzanFormListingError("有赞属性“{0}”候选分组无法用于当前控件".format(page_label))
             if (

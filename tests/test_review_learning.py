@@ -171,6 +171,25 @@ class ReviewLearningTests(unittest.TestCase):
         self.assertNotIn('value_ids', choose_review_learning(material_request, [different_attribute]))
 
 
+    def test_fabric_review_reused_once_per_material_set(self):
+        options = [{'value_id': 'cotton', 'label': '棉'}, {'value_id': 'poly', 'label': '涤纶'}]
+        request = self.request(field_label='面料', excel_value='涤纶45%，棉55%',
+                               control_type='select', options=options)
+        old = self.record('style-a', field_label='面料', excel_candidates=['棉60%，涤纶40%'],
+                          control_type='select', labels=['棉'])
+        result = choose_review_learning(request, [old])
+        self.assertEqual(result['value_ids'], ['cotton'])
+        self.assertEqual(result['support_count'], 1)
+        different_set = {**old, 'excel_candidates': ['棉95%，氨纶5%']}
+        self.assertNotIn('value_ids', choose_review_learning(request, [different_set]))
+        other_category = {**old, 'category': {'hints': ['牛仔裤']}}
+        self.assertNotIn('value_ids', choose_review_learning(request, [other_category]))
+        conflict = self.record('style-b', field_label='面料', excel_candidates=['棉50%，涤纶50%'],
+                               control_type='select', labels=['涤纶'])
+        self.assertEqual(choose_review_learning(request, [conflict, old])['reason_code'],
+                         'review_learning_conflict')
+
+
 class DouyinReviewControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_observed_select_preserves_actual_multiple_capability(self):
         from types import SimpleNamespace
